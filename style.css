@@ -1,0 +1,338 @@
+/* Corporate Workspace Theme Variables */
+:root {
+    --sidebar-bg: #060913;
+    --border-dark: #1E293B;
+    --border-light: #334155;
+    --corporate-blue: #1E3A8A;
+    --corporate-blue-hover: #1D4ED8;
+    --text-white: #FFFFFF;
+    --text-muted: #F8FAFC;
+    --text-slate: #0F172A;
+    --text-gray: #64748B;
+    --text-dark-gray: #475569;
+    --text-amber: #94A3B8;
+    --log-green: #34D399;
+    --bg-dark-panel: #1E293B;
+    --bg-alert-red: #2D1A24;
+    --border-alert-red: #7F1D1D;
+    --text-alert-red: #FCA5A5;
+}
+
+/* Base Page Padding Constraints */
+.block-container {
+    padding-top: 2.5rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 1200px !important;
+    margin: 0 auto !important;
+}
+
+/* Institutional Navigation Sidebar */
+div[data-testid="stSidebar"] {
+    background-color: var(--sidebar-bg) !important;
+    border-right: 2px solid var(--border-dark) !important;
+}
+
+div[data-testid="stSidebar"] .stRadio label {
+    color: var(--text-muted) !important;
+    font-weight: 500 !important;
+}
+
+/* Sidebar Headings */
+.sidebar-header {
+    color: #F8FAFC; 
+    padding-left: 10px; 
+    margin-bottom: 0; 
+    font-size: 16px;
+}
+
+.sidebar-subheader {
+    color: #475569; 
+    padding-left: 10px; 
+    font-size: 9px; 
+    margin-top: -3px; 
+    font-weight: 700; 
+    letter-spacing: 0.5px;
+}
+
+.sidebar-section-title {
+    color: #F8FAFC; 
+    padding-left: 10px; 
+    font-size: 13px; 
+    margin-bottom: 8px;
+}
+
+/* Action Button Core Styles */
+div.stButton > button:first-child {
+    border: 1px solid var(--corporate-blue) !important;
+    border-radius: 4px !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    padding: 0.5rem 1.5rem !important;
+    background-color: var(--corporate-blue) !important;
+    color: var(--text-white) !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
+}
+
+div.stButton > button:first-child:hover {
+    background-color: var(--corporate-blue-hover) !important;
+    border-color: var(--corporate-blue-hover) !important;
+    color: var(--text-white) !important;
+}
+
+/* Specific Corporate Download Override Placement */
+div[data-testid="stDownloadButton"] > button {
+    border: 1px solid var(--corporate-blue) !important;
+    border-radius: 4px !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    padding: 0.5rem 1.5rem !important;
+    background-color: var(--corporate-blue) !important;
+    color: var(--text-white) !important;
+}
+
+div[data-testid="stDownloadButton"] > button:hover {
+    background-color: var(--corporate-blue-hover) !important;
+    border-color: var(--corporate-blue-hover) !important;
+    color: var(--text-white) !important;
+}
+
+/* Matrix Table Frames */
+div[data-testid="stDataFrame"] {
+    border: 1px solid var(--border-light) !important;
+    border-radius: 4px !important;
+}
+
+/* Command Center Headers */
+.command-center-header {
+    margin-bottom: 22px;
+}
+
+.command-center-title {
+    font-size: 28px; 
+    margin-bottom: 2px; 
+    color: var(--text-slate); 
+    font-weight: 700;
+}
+
+.command-center-subtitle {
+    font-size: 13px; 
+    color: var(--text-gray); 
+    font-weight: 500;
+}
+
+/* Process Flow Tracker Steps */
+.process-flow-container {
+    display: flex; 
+    justify-content: space-between; 
+    align-items: center; 
+    gap: 8px; 
+    flex-wrap: wrap; 
+    margin-bottom: 24px; 
+    width: 100%;
+}
+
+.flow-step {
+    flex: 1; 
+    min-width: 220px; 
+    padding: 10px; 
+    border-radius: 4px; 
+    border: 1px solid; 
+    text-align: center;
+}
+
+.flow-arrow {
+    color: var(--text-dark-gray); 
+    font-weight: bold;
+}
+
+/* Pre-Execution Data Warning/Info Box */
+.info-panel-box {
+    background-color: var(--bg-dark-panel); 
+    border: 1px solid var(--border-light); 
+    padding: 24px; 
+    border-radius: 6px; 
+    color: var(--text-amber); 
+    font-size: 14px; 
+    text-align: center;
+}
+
+/* Table Card Panels */
+.table-card-panel {
+    background-color: var(--bg-dark-panel); 
+    border: 1px solid var(--border-light); 
+    padding: 24px; 
+    border-radius: 6px;
+}
+
+.table-card-panel-small {
+    background-color: var(--bg-dark-panel); 
+    border: 1px solid var(--border-light); 
+    padding: 16px; 
+    border-radius: 6px; 
+    min-height: 250px;
+}
+
+.panel-header-text {
+    color: var(--text-muted); 
+    margin-top: 0; 
+    font-weight: 600; 
+    font-size: 14px; 
+    text-transform: uppercase; 
+    letter-spacing: 0.5px;
+}
+
+.panel-subheader-text {
+    color: var(--text-amber); 
+    font-size: 13px; 
+    margin-bottom: 20px;
+}
+
+/* Financial Control Tables */
+.control-data-table {
+    width: 100%; 
+    color: #E2E8F0; 
+    font-size: 14px; 
+    text-align: left; 
+    border-collapse: collapse;
+}
+
+.control-table-header {
+    border-bottom: 2px solid var(--border-light); 
+    color: var(--text-amber); 
+    font-size: 12px;
+}
+
+.control-table-row {
+    border-bottom: 1px solid var(--border-light);
+}
+
+.control-table-row-alert {
+    background-color: var(--bg-alert-red); 
+    border-bottom: 1px solid var(--border-alert-red);
+}
+
+.control-table-cell-alert {
+    padding: 12px 8px; 
+    font-weight: 600; 
+    color: var(--text-alert-red);
+}
+
+.control-table-cell-alert-right {
+    padding: 12px 8px; 
+    text-align: right; 
+    font-weight: 600; 
+    color: var(--text-alert-red);
+}
+
+/* Variance Dashboard Banner */
+.variance-banner {
+    padding: 22px 28px; 
+    border-radius: 6px; 
+    margin-bottom: 20px;
+    text-align: center; 
+    color: var(--text-white);
+}
+
+.variance-banner-label {
+    font-size: 11px; 
+    font-weight: 700; 
+    letter-spacing: 0.8px; 
+    text-transform: uppercase; 
+    opacity: 0.75;
+}
+
+.variance-banner-amount {
+    font-size: 38px; 
+    font-weight: 800; 
+    margin-top: 6px;
+}
+
+.variance-banner-status {
+    font-size: 12px; 
+    font-weight: 600; 
+    margin-top: 2px; 
+    opacity: 0.80;
+}
+
+/* Nested Metrics */
+.nested-metric-card {
+    background-color: var(--bg-dark-panel); 
+    border: 1px solid var(--border-light); 
+    padding: 14px; 
+    border-radius: 4px;
+}
+
+.nested-metric-label {
+    font-size: 11px; 
+    font-weight: 600; 
+    color: var(--text-amber); 
+    text-transform: uppercase;
+}
+
+.nested-metric-value {
+    font-size: 26px; 
+    font-weight: 700; 
+    color: var(--text-muted); 
+    margin: 2px 0;
+}
+
+/* Drivers Bar Progress Rows */
+.driver-row-wrapper {
+    margin: 14px 0;
+}
+
+.driver-row-data {
+    display: flex; 
+    justify-content: space-between; 
+    font-size: 12px; 
+    color: #E2E8F0;
+}
+
+.driver-bar-track {
+    height: 10px; 
+    background: #0F172A; 
+    border-radius: 20px; 
+    margin-top: 6px; 
+    overflow: hidden;
+}
+
+.driver-bar-fill {
+    height: 10px; 
+    background: #3B82F6; 
+    border-radius: 20px;
+}
+
+/* Quick Note Entry Title */
+.quick-entry-note-title {
+    margin-top: 12px; 
+    margin-bottom: 8px;
+}
+
+/* Resolution Confirmation Lock Profile */
+.resolution-profile-lockbox {
+    background-color: #065F46; 
+    border: 1px solid #047857; 
+    padding: 12px;
+    border-radius: 4px; 
+    margin-top: 15px; 
+    color: #FFFFFF; 
+    font-size: 12px;
+}
+
+/* SOC Compliance Terminal Log View */
+.system-log-container {
+    background-color: #0F172A; 
+    border: 1px solid var(--border-light); 
+    padding: 15px; 
+    border-radius: 6px; 
+    max-height: 500px; 
+    overflow-y: auto;
+}
+
+.system-log-line {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 13px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-dark);
+    color: var(--log-green);
+}
