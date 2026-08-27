@@ -1,338 +1,309 @@
 /* Corporate Workspace Theme Variables */
 :root {
     --sidebar-bg: #060913;
-    --border-dark: #1E293B;
-    --border-light: #334155;
-    --corporate-blue: #1E3A8A;
-    --corporate-blue-hover: #1D4ED8;
-    --text-white: #FFFFFF;
-    --text-muted: #F8FAFC;
-    --text-slate: #0F172A;
-    --text-gray: #64748B;
-    --text-dark-gray: #475569;
-    --text-amber: #94A3B8;
-    --log-green: #34D399;
+    --bg-dark: #0F172A;
     --bg-dark-panel: #1E293B;
-    --bg-alert-red: #2D1A24;
-    --border-alert-red: #7F1D1D;
-    --text-alert-red: #FCA5A5;
+    --bg-light: #F8FAFC; 
+    --panel-white: #FFFFFF; 
+
+    --border-dark: #1E293B;
+    --border-light: #E2E8F0; 
+
+    --corporate-blue: #1E3A8A; 
+    --corporate-blue-hover: #2563EB;
+
+    --text-on-dark: #FFFFFF;
+    --text-on-dark-secondary: #E2E8F0;
+    --text-on-dark-muted: #CBD5E1;
+
+    --text-on-light: #0F172A; 
+    --text-on-light-secondary: #334155;
+    --text-on-light-muted: #64748B;
+
+    --success-green: #059669;
+    --success-bg: #E6F4EA;
+    --warning-amber: #D97706;
+    --alert-red: #DC2626;
+    --alert-bg: #FEF2F2;
+    
+    --global-radius: 8px;
 }
 
-/* Base Page Padding Constraints */
+/* Base Canvas & Padding Grid Constraints */
+.stApp {
+    background-color: var(--bg-light) !important;
+}
+
 .block-container {
-    padding-top: 2.5rem !important;
+    padding-top: 1.75rem !important;
     padding-bottom: 2rem !important;
-    max-width: 1200px !important;
+    max-width: 1350px !important;
     margin: 0 auto !important;
 }
 
-/* Institutional Navigation Sidebar */
+/* Premium Card & Grid Architecture */
+.enterprise-card {
+    background-color: var(--panel-white) !important;
+    border: 1px solid var(--border-light) !important;
+    border-radius: var(--global-radius) !important;
+    padding: 20px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02), 0 1px 2px rgba(0, 0, 0, 0.04) !important;
+    margin-bottom: 16px !important;
+}
+
+/* Institutional Navigation Sidebar Adjustments */
 div[data-testid="stSidebar"] {
     background-color: var(--sidebar-bg) !important;
     border-right: 2px solid var(--border-dark) !important;
 }
-
-div[data-testid="stSidebar"] .stRadio label {
-    color: var(--text-muted) !important;
-    font-weight: 500 !important;
+div[data-testid="stSidebar"] * {
+    color: var(--text-on-dark-secondary) !important;
 }
 
-/* Sidebar Headings */
-.sidebar-header {
-    color: #F8FAFC; 
-    padding-left: 10px; 
-    margin-bottom: 0; 
-    font-size: 16px;
-}
-
-.sidebar-subheader {
-    color: #475569; 
-    padding-left: 10px; 
-    font-size: 9px; 
-    margin-top: -3px; 
-    font-weight: 700; 
-    letter-spacing: 0.5px;
-}
-
-.sidebar-section-title {
-    color: #F8FAFC; 
-    padding-left: 10px; 
-    font-size: 13px; 
-    margin-bottom: 8px;
-}
-
-/* Action Button Core Styles */
+/* Action Rows & Button Alignment Hierarchy */
 div.stButton > button:first-child {
-    border: 1px solid var(--corporate-blue) !important;
-    border-radius: 4px !important;
-    font-weight: 600 !important;
+    border-radius: 6px !important;
+    font-weight: 700 !important;
     font-size: 13px !important;
-    padding: 0.5rem 1.5rem !important;
-    background-color: var(--corporate-blue) !important;
-    color: var(--text-white) !important;
+    padding: 0.55rem 1.6rem !important;
     box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
+    transition: all 0.15s ease;
 }
 
-div.stButton > button:first-child:hover {
-    background-color: var(--corporate-blue-hover) !important;
-    border-color: var(--corporate-blue-hover) !important;
-    color: var(--text-white) !important;
-}
-
-/* Specific Corporate Download Override Placement */
-div[data-testid="stDownloadButton"] > button {
-    border: 1px solid var(--corporate-blue) !important;
-    border-radius: 4px !important;
-    font-weight: 600 !important;
-    font-size: 13px !important;
-    padding: 0.5rem 1.5rem !important;
+/* Primary Execution Button */
+div.stButton > button[kind="primary"] {
     background-color: var(--corporate-blue) !important;
-    color: var(--text-white) !important;
+    border-color: var(--corporate-blue) !important;
+    color: var(--text-on-dark) !important;
 }
-
-div[data-testid="stDownloadButton"] > button:hover {
+div.stButton > button[kind="primary"]:hover {
     background-color: var(--corporate-blue-hover) !important;
     border-color: var(--corporate-blue-hover) !important;
-    color: var(--text-white) !important;
 }
 
-/* Matrix Table Frames */
-div[data-testid="stDataFrame"] {
+/* Secondary Reset Button - De-emphasized & Narrower Layout footprint */
+div.stButton > button[kind="secondary"] {
+    background-color: transparent !important;
     border: 1px solid var(--border-light) !important;
-    border-radius: 4px !important;
+    color: var(--text-on-light-muted) !important;
+    font-weight: 600 !important;
+    padding: 0.55rem 1rem !important;
+}
+div.stButton > button[kind="secondary"]:hover {
+    border-color: var(--text-on-light-secondary) !important;
+    color: var(--text-on-light) !important;
+    background-color: #F8FAFC !important;
 }
 
-/* Command Center Headers */
-.command-center-header {
-    margin-bottom: 22px;
+/* Refined Compact Progress Tracker Grid */
+.process-flow-container {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    margin-bottom: 18px;
 }
-
-.command-center-title {
-    font-size: 28px; 
-    margin-bottom: 2px; 
-    color: var(--text-slate); 
+.flow-step {
+    flex: 1;
+    padding: 10px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border-light);
+    background-color: var(--panel-white);
+    text-align: left;
+    font-size: 13px;
+    color: var(--text-on-light-muted);
+}
+.flow-step b {
+    color: var(--text-on-light-secondary);
     font-weight: 700;
 }
-
-.command-center-subtitle {
-    font-size: 13px; 
-    color: var(--text-gray); 
-    font-weight: 500;
+.flow-step.complete {
+    background-color: var(--success-bg);
+    border-color: #A7F3D0;
+    color: var(--success-green);
+}
+.flow-step.complete b {
+    color: #065F46;
 }
 
-/* Process Flow Tracker Steps */
-.process-flow-container {
-    display: flex; 
-    justify-content: space-between; 
-    align-items: center; 
-    gap: 8px; 
-    flex-wrap: wrap; 
-    margin-bottom: 24px; 
-    width: 100%;
+/* Enhanced Active State: Vibrant Blue Border with Soft Ice Blue Fill Accent Glow */
+.flow-step.active {
+    border: 1px solid #2563EB !important;
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12) !important;
+    background-color: #EFF6FF !important;
+    color: #2563EB !important;
+}
+.flow-step.active b {
+    color: #1E3A8A !important;
+}
+.flow-connector-line {
+    flex: 0 0 16px;
+    height: 2px;
+    background-color: var(--border-light);
 }
 
-.flow-step {
-    flex: 1; 
-    min-width: 220px; 
-    padding: 10px; 
-    border-radius: 4px; 
-    border: 1px solid; 
-    text-align: center;
+/* Premium Verification KPI Blocks */
+.verification-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
 }
-
-.flow-arrow {
-    color: var(--text-dark-gray); 
-    font-weight: bold;
-}
-
-/* Pre-Execution Data Warning/Info Box */
-.info-panel-box {
-    background-color: var(--bg-dark-panel); 
-    border: 1px solid var(--border-light); 
-    padding: 24px; 
-    border-radius: 6px; 
-    color: var(--text-amber); 
-    font-size: 14px; 
-    text-align: center;
-}
-
-/* Table Card Panels */
-.table-card-panel {
-    background-color: var(--bg-dark-panel); 
-    border: 1px solid var(--border-light); 
-    padding: 24px; 
+.verification-tile {
+    background-color: var(--bg-light);
+    border: 1px solid var(--border-light);
     border-radius: 6px;
+    padding: 12px 14px;
+}
+.verification-tile-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-on-light-muted);
+}
+.verification-tile-value {
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--text-on-light);
+    margin-top: 2px;
+}
+.verification-tile.alert {
+    background-color: var(--alert-bg);
+    border-color: #FCA5A5;
+}
+.verification-tile.alert .verification-tile-value {
+    color: var(--alert-red);
 }
 
-.table-card-panel-small {
-    background-color: var(--bg-dark-panel); 
-    border: 1px solid var(--border-light); 
-    padding: 16px; 
-    border-radius: 6px; 
-    min-height: 250px;
+/* Application-like Headers & Status Badges */
+.header-with-badge {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 0;
+    margin-bottom: 14px;
 }
-
-.panel-header-text {
-    color: var(--text-muted); 
-    margin-top: 0; 
-    font-weight: 600; 
-    font-size: 14px; 
-    text-transform: uppercase; 
+.app-status-badge {
+    font-size: 10px;
+    font-weight: 800;
+    padding: 3px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
     letter-spacing: 0.5px;
 }
-
-.panel-subheader-text {
-    color: var(--text-amber); 
-    font-size: 13px; 
-    margin-bottom: 20px;
+.badge-validated {
+    background-color: #EFF6FF;
+    color: #2563EB;
+    border: 1px solid #BFDBFE;
+}
+.badge-out-of-balance {
+    background-color: var(--alert-bg);
+    color: var(--alert-red);
+    border: 1px solid #FCA5A5;
 }
 
-/* Financial Control Tables */
+/* Modernized Data Table Layouts */
 .control-data-table {
-    width: 100%; 
-    color: #E2E8F0; 
-    font-size: 14px; 
-    text-align: left; 
+    width: 100%;
     border-collapse: collapse;
+    font-size: 13px;
+    color: var(--text-on-light);
+    text-align: left;
 }
-
-.control-table-header {
-    border-bottom: 2px solid var(--border-light); 
-    color: var(--text-amber); 
-    font-size: 12px;
+.control-data-table th {
+    font-weight: 700;
+    color: var(--text-on-light-muted);
+    padding: 8px;
+    border-bottom: 2px solid var(--border-light);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
 }
-
-.control-table-row {
+.control-data-table td {
+    padding: 10px 8px;
     border-bottom: 1px solid var(--border-light);
 }
-
-.control-table-row-alert {
-    background-color: var(--bg-alert-red); 
-    border-bottom: 1px solid var(--border-alert-red);
+.control-data-table tr:last-child td {
+    border-bottom: none;
+}
+/* Navy Blue KPI Summary Cards */
+.navy-kpi-card {
+    background-color: #1B365D !important;
+    border: 1px solid #11223E !important;
+    color: #FFFFFF !important;
+    min-height: 102px !important;
+    border-radius: 6px !important;
+    padding: 12px !important;
 }
 
-.control-table-cell-alert {
-    padding: 12px 8px; 
-    font-weight: 600; 
-    color: var(--text-alert-red);
+.navy-kpi-card .nested-metric-label {
+    color: #BACAD6 !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    display: block !important;
 }
 
-.control-table-cell-alert-right {
-    padding: 12px 8px; 
-    text-align: right; 
-    font-weight: 600; 
-    color: var(--text-alert-red);
+.navy-kpi-card .nested-metric-value {
+    color: #FFFFFF !important;
+    font-size: 24px !important;
+    font-weight: 800 !important;
+    margin: 2px 0 !important;
 }
 
-/* Variance Dashboard Banner */
-.variance-banner {
-    padding: 22px 28px; 
-    border-radius: 6px; 
-    margin-bottom: 20px;
-    text-align: center; 
-    color: var(--text-white);
+.navy-kpi-card .nested-metric-subtitle {
+    color: #BACAD6 !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    margin-top: 2px !important;
 }
 
-.variance-banner-label {
-    font-size: 11px; 
-    font-weight: 700; 
-    letter-spacing: 0.8px; 
-    text-transform: uppercase; 
-    opacity: 0.75;
-}
-
-.variance-banner-amount {
-    font-size: 38px; 
-    font-weight: 800; 
-    margin-top: 6px;
-}
-
-.variance-banner-status {
-    font-size: 12px; 
-    font-weight: 600; 
-    margin-top: 2px; 
-    opacity: 0.80;
-}
-
-/* Nested Metrics */
+/* Light Standard KPI Summary Cards */
 .nested-metric-card {
-    background-color: var(--bg-dark-panel); 
-    border: 1px solid var(--border-light); 
-    padding: 14px; 
-    border-radius: 4px;
+    background-color: var(--panel-white) !important;
+    border: 1px solid var(--border-light) !important;
+    color: var(--text-on-light) !important;
+    min-height: 102px !important;
+    border-radius: 6px !important;
+    padding: 12px !important;
 }
 
-.nested-metric-label {
-    font-size: 11px; 
-    font-weight: 600; 
-    color: var(--text-amber); 
-    text-transform: uppercase;
+.nested-metric-card .nested-metric-label {
+    color: var(--text-on-light-muted) !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    display: block !important;
 }
 
-.nested-metric-value {
-    font-size: 26px; 
-    font-weight: 700; 
-    color: var(--text-muted); 
-    margin: 2px 0;
+.nested-metric-card .nested-metric-value {
+    color: var(--text-on-light) !important;
+    font-size: 24px !important;
+    font-weight: 800 !important;
+    margin: 2px 0 !important;
 }
 
-/* Drivers Bar Progress Rows */
-.driver-row-wrapper {
-    margin: 14px 0;
+.nested-metric-card .nested-metric-subtitle {
+    color: var(--text-on-light-muted) !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    margin-top: 2px !important;
 }
 
-.driver-row-data {
-    display: flex; 
-    justify-content: space-between; 
-    font-size: 12px; 
-    color: #E2E8F0;
+/* Page Optimization Compact Overrides */
+.enterprise-card {
+    padding: 12px !important;
+    margin-bottom: 10px !important;
 }
 
-.driver-bar-track {
-    height: 10px; 
-    background: #0F172A; 
-    border-radius: 20px; 
-    margin-top: 6px; 
-    overflow: hidden;
+.control-data-table th, 
+.control-data-table td {
+    padding: 5px 6px !important;
 }
 
-.driver-bar-fill {
-    height: 10px; 
-    background: #3B82F6; 
-    border-radius: 20px;
-}
-
-/* Quick Note Entry Title */
-.quick-entry-note-title {
-    margin-top: 12px; 
-    margin-bottom: 8px;
-}
-
-/* Resolution Confirmation Lock Profile */
-.resolution-profile-lockbox {
-    background-color: #065F46; 
-    border: 1px solid #047857; 
-    padding: 12px;
-    border-radius: 4px; 
-    margin-top: 15px; 
-    color: #FFFFFF; 
-    font-size: 12px;
-}
-
-/* SOC Compliance Terminal Log View */
-.system-log-container {
-    background-color: #0F172A; 
-    border: 1px solid var(--border-light); 
-    padding: 15px; 
-    border-radius: 6px; 
-    max-height: 500px; 
-    overflow-y: auto;
-}
-
-.system-log-line {
-    font-family: "Consolas", "Courier New", monospace;
-    font-size: 13px;
-    padding: 6px 12px;
-    border-bottom: 1px solid var(--border-dark);
-    color: var(--log-green);
+.process-flow-container {
+    margin-top: 6px !important;
+    margin-bottom: 6px !important;
 }

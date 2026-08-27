@@ -35,7 +35,7 @@ def load_external_css(css_file_path: str) -> None:
             st.markdown(f"<style>{css_file.read()}</style>", unsafe_allow_html=True)
     except FileNotFoundError:
         st.error(
-            f" Core Asset Missing: Could not find workspace sheet layout rules at '{css_file_path}'"
+            f"âš ï¸ Core Asset Missing: Could not find workspace sheet layout rules at '{css_file_path}'"
         )
 
 
@@ -371,13 +371,13 @@ admin_panel = st.sidebar.radio(
     label_visibility="collapsed",
 )
 
-if st.sidebar.button(" Route to Selected Admin Panel", use_container_width=True):
+if st.sidebar.button("ðŸ”“ Route to Selected Admin Panel", use_container_width=True):
     st.session_state.active_panel = admin_panel
     st.rerun()
 
 current_panel = st.session_state.active_panel
 
-with st.sidebar.expander(" Schema Field Mapping", expanded=False):
+with st.sidebar.expander("âš™ï¸ Schema Field Mapping", expanded=False):
     qb_po = st.text_input("QB PO Column", value="P.O. NUMBER")
     qb_inv = st.text_input("QB Invoice Column", value="NUM")
     qb_amt = st.text_input("QB Amount Column", value="AMOUNT")
@@ -388,7 +388,7 @@ with st.sidebar.expander(" Schema Field Mapping", expanded=False):
     inf_amt = st.text_input("Infinium Amount Column", value="OHTOTA")
 
 st.sidebar.markdown("<hr style='border-top:1px solid #1E293B; margin:15px 0;'>", unsafe_allow_html=True)
-st.sidebar.markdown("<h4 class='sidebar-section-title'> Data Source Feeds</h4>", unsafe_allow_html=True)
+st.sidebar.markdown("<h4 class='sidebar-section-title'>ðŸ“¥ Data Source Feeds</h4>", unsafe_allow_html=True)
 
 file_qb = st.sidebar.file_uploader("QuickBooks Export (.xlsx)", type=["xlsx"])
 file_inf = st.sidebar.file_uploader("Infinium Data Pull (.xlsx)", type=["xlsx"])
@@ -481,7 +481,7 @@ if current_panel == "Dashboard Workspace":
         st.markdown(
             f"""
             <div class='global-alert-strip'>
-                 {variance_label}: {safe_currency(st.session_state.net_variance)}
+                âš ï¸ {variance_label}: {safe_currency(st.session_state.net_variance)}
             </div>
             """,
             unsafe_allow_html=True,
@@ -499,7 +499,7 @@ if current_panel == "Dashboard Workspace":
             <div style='margin-bottom: 6px;'>
                 <h2 style='font-size: 18px; font-weight: 800; color: var(--text-on-light); margin: 0;'>Sales Reconciliation Command Center</h2>
                 <div style='font-size: 11px; font-weight: 600; color: var(--text-on-light-muted); margin-top: 1px;'>
-                    Period {st.session_state.parsed_period} Close &nbsp;  &nbsp; QuickBooks Online  Infinium AS400
+                    Period {st.session_state.parsed_period} Close &nbsp; â€¢ &nbsp; QuickBooks Online â†” Infinium AS400
                 </div>
             </div>
             """,
@@ -534,11 +534,11 @@ if current_panel == "Dashboard Workspace":
         f"""
         <div class='process-flow-container'>
             <div class='flow-step {cls_step1}'>
-                <b>1. Ingest QuickBooks</b><br><span>{" Ingested" if file_qb else "Current Step"}</span>
+                <b>1. Ingest QuickBooks</b><br><span>{"âœ”ï¸ Ingested" if file_qb else "Current Step"}</span>
             </div>
             <div class='flow-connector-line'></div>
             <div class='flow-step {cls_step2}'>
-                <b>2. Ingest Infinium</b><br><span>{" Ingested" if file_inf else ("Current Step" if file_qb else "Upcoming")}</span>
+                <b>2. Ingest Infinium</b><br><span>{"âœ”ï¸ Ingested" if file_inf else ("Current Step" if file_qb else "Upcoming")}</span>
             </div>
             <div class='flow-connector-line'></div>
             <div class='flow-step {cls_step3}'>
@@ -765,7 +765,7 @@ if current_panel == "Dashboard Workspace":
                     </tbody>
                 </table>
                 <div style='margin-top: 8px; padding: 8px; background-color: #FFFBEB; border-radius: 4px; border: 1px solid #FDE68A; font-size: 12px; color: #B45309; font-weight:600;'>
-                     <b>Operational Conclusion:</b> Infinium exceeds QuickBooks by {safe_currency(abs(st.session_state.net_variance))} across {abs(qb_rows - inf_rows)} net rows. Verification adjustments required.
+                    ðŸ’¡ <b>Operational Conclusion:</b> Infinium exceeds QuickBooks by {safe_currency(abs(st.session_state.net_variance))} across {abs(qb_rows - inf_rows)} net rows. Verification adjustments required.
                 </div>
                 </div>
                 """,
@@ -1001,7 +1001,7 @@ if current_panel == "Dashboard Workspace":
         st.markdown("<h5 style='color: var(--text-on-light); font-weight:700; margin-top:4px;'>System Package Actions</h5>", unsafe_allow_html=True)
         st.markdown("<div class='enterprise-card' style='padding: 6px; margin-top: 4px;'>", unsafe_allow_html=True)
         if st.download_button(
-            label=" Generate Institutional Audit Package (.XLSX)",
+            label="ðŸ“¥ Generate Institutional Audit Package (.XLSX)",
             data=pkg_buffer.getvalue(),
             file_name="Sales_Reconciliation_Master_Package.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1016,9 +1016,9 @@ if current_panel == "Dashboard Workspace":
 # -----------------------------------------------------------------
 elif current_panel == "Exception Workbench [Review]":
     if not st.session_state.processing_complete or st.session_state.exceptions_df.empty:
-        st.warning(" Access Denied: Execute close processes on the dashboard panel to load open subledger items.")
+        st.warning("âš ï¸ Access Denied: Execute close processes on the dashboard panel to load open subledger items.")
     else:
-        st.markdown("<h3 style='color: var(--text-on-light); font-weight:700;'> Exception Review Workbench</h3>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color: var(--text-on-light); font-weight:700;'>ðŸ” Exception Review Workbench</h3>", unsafe_allow_html=True)
 
         st.markdown("<div class='enterprise-card'>", unsafe_allow_html=True)
         list_col, work_col = st.columns([2, 2])
@@ -1034,7 +1034,7 @@ elif current_panel == "Exception Workbench [Review]":
             ]
 
             if not selection_options:
-                st.success(" Zero exceptions detected. All ledger lines cleared autonomously.")
+                st.success("ðŸŽ‰ Zero exceptions detected. All ledger lines cleared autonomously.")
             else:
                 default_sel_idx = 0
                 if st.session_state.selected_workbench_idx in exceptions_df_raw.index:
@@ -1053,7 +1053,7 @@ elif current_panel == "Exception Workbench [Review]":
                 selected_idx = int(selected_item_str.split(" | ")[0].replace("Row ", ""))
                 st.session_state.selected_workbench_idx = selected_idx
 
-                st.markdown("<div class='quick-entry-note-title'><b> Quick Entry Item Note:</b></div>", unsafe_allow_html=True)
+                st.markdown("<div class='quick-entry-note-title'><b>ðŸ“ Quick Entry Item Note:</b></div>", unsafe_allow_html=True)
 
                 existing_quick_note = st.session_state.workbench_comments.get(selected_idx, "")
                 updated_note = st.text_input(
@@ -1163,7 +1163,7 @@ elif current_panel == "Exception Workbench [Review]":
                         append_system_event(
                             f"MITIGATION: Override status locked on index row #{st.session_state.selected_workbench_idx} [Status: {resolution_type}]."
                         )
-                        st.success(f" Resolution assigned to row #{st.session_state.selected_workbench_idx}.")
+                        st.success(f"âœ“ Resolution assigned to row #{st.session_state.selected_workbench_idx}.")
 
                 with w_btn2:
                     if st.button("Clear Selection", use_container_width=True):
@@ -1174,9 +1174,9 @@ elif current_panel == "Exception Workbench [Review]":
                     st.markdown(
                         f"""
                         <div class='resolution-profile-lockbox'>
-                            <b> Documented Resolution Profile:</b><br>
-                             Status Type: {st.session_state.workbench_resolutions[st.session_state.selected_workbench_idx]}<br>
-                             Comment: "{st.session_state.workbench_comments.get(st.session_state.selected_workbench_idx, '')}"
+                            <b>ðŸ”’ Documented Resolution Profile:</b><br>
+                            â€¢ Status Type: {st.session_state.workbench_resolutions[st.session_state.selected_workbench_idx]}<br>
+                            â€¢ Comment: "{st.session_state.workbench_comments.get(st.session_state.selected_workbench_idx, '')}"
                         </div>
                         """,
                         unsafe_allow_html=True,
@@ -1188,7 +1188,7 @@ elif current_panel == "Exception Workbench [Review]":
 # System Audit Log View
 # -----------------------------------------------------------------
 elif current_panel == "System Audit Log":
-    st.markdown("<h3 style='color: var(--text-on-light); font-weight:700;'> AS400 System Event Log & Security Audit Trail</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color: var(--text-on-light); font-weight:700;'>ðŸ“‹ AS400 System Event Log & Security Audit Trail</h3>", unsafe_allow_html=True)
     st.markdown(
         "<p style='color:#64748B; font-size:14px; margin-bottom:20px;'>SOC 1/2 Compliance Stream: Verifiable platform orchestration and system matching execution logs:</p>",
         unsafe_allow_html=True,
@@ -1204,11 +1204,11 @@ elif current_panel == "System Audit Log":
 # Mapping Configuration View
 # -----------------------------------------------------------------
 elif current_panel == "Mapping Configuration":
-    st.markdown("<h3 style='color: var(--text-on-light); font-weight:700;'> Mapping Configuration Settings</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color: var(--text-on-light); font-weight:700;'>âš™ï¸ Mapping Configuration Settings</h3>", unsafe_allow_html=True)
     st.markdown(
         """
         <div class='enterprise-card'>
-            <h5 style='color: var(--corporate-blue); margin-top:0; font-weight:800; text-transform:uppercase;'> Environment Execution Constants</h5>
+            <h5 style='color: var(--corporate-blue); margin-top:0; font-weight:800; text-transform:uppercase;'>ðŸ”’ Environment Execution Constants</h5>
             <table class='control-data-table' style='font-size:13px; color: var(--text-on-light) !important;'>
                 <tr style='border-bottom: 1px solid var(--border-light);'><td style='padding:12px 0; font-weight:600; width:40%;'>System Hosting Stack:</td><td>Local Port Server Endpoint</td></tr>
                 <tr style='border-bottom: 1px solid var(--border-light);'><td style='padding:12px 0; font-weight:600;'>Array Engine Driver:</td><td>Multi-Pass Dataframe Matching Engine</td></tr>
@@ -1219,4 +1219,3 @@ elif current_panel == "Mapping Configuration":
         """,
         unsafe_allow_html=True,
     )
-
