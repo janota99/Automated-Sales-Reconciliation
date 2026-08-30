@@ -44,8 +44,27 @@
     background-color: var(--sidebar-bg) !important;
 }
 
-[data-testid="stSidebar"] * {
-    color: var(--text-on-dark-secondary) !important;
+[data-testid="stSidebar"] {
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--border-dark);
+    color: var(--text-on-dark-secondary);
+}
+
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] :is(
+    h1, h2, h3, h4, p, strong
+) {
+    color: var(--text-on-dark-secondary);
+}
+
+[data-testid="stSidebar"] label {
+    color: var(--text-on-dark-secondary);
+}
+
+[data-testid="stSidebar"] input,
+[data-testid="stSidebar"] textarea,
+[data-testid="stSidebar"] [data-baseweb="select"] > div {
+    color: var(--text-on-light);
+    -webkit-text-fill-color: var(--text-on-light);
 }
 
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
@@ -138,14 +157,52 @@ div.stButton > button[kind="primary"]:hover {
     border-color: var(--corporate-blue-hover) !important;
 }
 
-.stTabs [data-baseweb="tab-list"] button[aria-selected="true"] {
+/* Streamlit tabs */
+
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    gap: 0;
+    border-bottom: 1px solid var(--border-light);
+}
+
+/* Inactive tabs */
+[data-testid="stTabs"] button[role="tab"] {
+    padding: 0.75rem 1rem;
+    color: #64748B !important;
+    background: transparent !important;
+    font-weight: 500 !important;
+}
+
+/* Force nested label elements to inherit the readable color */
+[data-testid="stTabs"] button[role="tab"] * {
+    color: inherit !important;
+    -webkit-text-fill-color: currentColor !important;
+}
+
+/* Hover state */
+[data-testid="stTabs"] button[role="tab"]:hover {
     color: var(--corporate-blue) !important;
+    background: #F1F5F9 !important;
+}
+
+/* Active tab */
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+    color: var(--corporate-navy) !important;
+    background: transparent !important;
     font-weight: 700 !important;
 }
 
-.stTabs [data-baseweb="tab-highlight"] {
-    background-color: var(--corporate-blue) !important;
+/* Active underline */
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+    height: 3px !important;
+    background-color: var(--corporate-navy) !important;
 }
+
+/* Keyboard accessibility */
+[data-testid="stTabs"] button[role="tab"]:focus-visible {
+    outline: 2px solid rgba(37, 99, 235, 0.35);
+    outline-offset: -2px;
+}
+
 
 /* Application header */
 .rec-title {
@@ -374,4 +431,71 @@ div.stButton > button[kind="primary"]:hover {
     .ingestion-flow {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+}
+/* =========================================================
+   ACTIVE TAB EMPHASIS
+   ========================================================= */
+
+[data-testid="stTabs"]
+button[role="tab"][aria-selected="true"] {
+    color: var(--corporate-navy) !important;
+    font-weight: 700 !important;
+}
+
+[data-testid="stTabs"]
+button[role="tab"][aria-selected="true"] * {
+    color: var(--corporate-navy) !important;
+    -webkit-text-fill-color: var(--corporate-navy) !important;
+    font-weight: 700 !important;
+}
+
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+    height: 3px !important;
+    background-color: var(--corporate-navy) !important;
+}
+
+
+/* =========================================================
+   DOWNLOAD BUTTONS
+   ========================================================= */
+
+[data-testid="stDownloadButton"] button {
+    min-height: 42px;
+    padding: 0.55rem 1.25rem !important;
+    background-color: #374151 !important;
+    border: 1px solid #374151 !important;
+    border-radius: 6px !important;
+    color: #FFFFFF !important;
+    font-size: 13px !important;
+    font-weight: 700 !important;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.14);
+    transition:
+        background-color 150ms ease,
+        border-color 150ms ease,
+        box-shadow 150ms ease,
+        transform 150ms ease;
+}
+
+[data-testid="stDownloadButton"] button * {
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    font-weight: inherit !important;
+}
+
+[data-testid="stDownloadButton"] button:hover {
+    background-color: #1F2937 !important;
+    border-color: #1F2937 !important;
+    box-shadow: 0 3px 8px rgba(15, 23, 42, 0.20);
+    transform: translateY(-1px);
+}
+
+[data-testid="stDownloadButton"] button:active {
+    background-color: #111827 !important;
+    border-color: #111827 !important;
+    transform: translateY(0);
+}
+
+[data-testid="stDownloadButton"] button:focus-visible {
+    outline: 3px solid rgba(71, 85, 105, 0.30);
+    outline-offset: 2px;
 }

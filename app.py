@@ -33,6 +33,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from functools import lru_cache
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -48,9 +49,17 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
 
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.9.0-VERIFIED-JE"
 MATCHING_RULE_VERSION = "2026.08-STRICT-1TO1"
 CENTRAL_TIMEZONE = ZoneInfo("America/Chicago")
+
+REPORT_TIMESTAMP_PATTERN = re.compile(
+    r"^(?:MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\s*,\s*"
+    r"(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+"
+    r"\d{1,2}\s*,\s*\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s+(?:AM|PM)\s+"
+    r"(?:GMT|UTC)(?:[+-]\d{2}:?\d{2})?$",
+    re.IGNORECASE,
+)
 
 QB_ID = "__REC_QB_ID"
 INF_ID = "__REC_INF_ID"
@@ -204,13 +213,9 @@ def clean_po(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", text)
 
 
-def parse_amount_cents(value: Any) -> Optional[int]:
-    """Return exact signed cents, or None when the source amount is invalid."""
-    if value is None or pd.isna(value):
-        return None
-    if isinstance(value, bool):
-        return None
-    text = str(value).strip()
+@lru_cache(maxsize=32768)
+def _parse_amount_text(text: str) -> Optional[int]:
+    """Parse one normalized source representation with a bounded cache."""
     if not text:
         return None
     negative_parentheses = text.startswith("(") and text.endswith(")")
@@ -224,6 +229,13 @@ def parse_amount_cents(value: Any) -> Optional[int]:
         return int(amount * 100)
     except (InvalidOperation, ValueError, TypeError):
         return None
+
+
+def parse_amount_cents(value: Any) -> Optional[int]:
+    """Return exact signed cents, or None when the source amount is invalid."""
+    if value is None or pd.isna(value) or isinstance(value, bool):
+        return None
+    return _parse_amount_text(str(value).strip())
 
 
 def cents_to_float(value: Any) -> float:
@@ -248,15 +260,22 @@ def numeric_quantity_sum(series: pd.Series) -> float:
     return float(pd.to_numeric(series, errors="coerce").fillna(0).sum())
 
 
+@lru_cache(maxsize=1)
+def _fallback_product_lookup() -> dict[str, str]:
+    """Build the fallback lexicon once instead of once per source row."""
+    lookup: dict[str, str] = {}
+    for standard, variants in PRODUCT_LEXICON.items():
+        lookup[clean_alphanumeric(standard)] = standard
+        for variant in variants:
+            lookup[clean_alphanumeric(variant)] = standard
+    return lookup
+
+
 def fallback_product_match(value: Any) -> Optional[str]:
     cleaned = clean_alphanumeric(value)
     if not cleaned:
         return None
-    exact: dict[str, str] = {}
-    for standard, variants in PRODUCT_LEXICON.items():
-        exact[clean_alphanumeric(standard)] = standard
-        for variant in variants:
-            exact[clean_alphanumeric(variant)] = standard
+    exact = _fallback_product_lookup()
     if cleaned in exact:
         return exact[cleaned]
     # Conservative containment only. Product classification never determines
@@ -269,13 +288,20 @@ def fallback_product_match(value: Any) -> Optional[str]:
     return max(candidates, default=(0, None))[1]
 
 
-def product_match(value: Any) -> Optional[str]:
+@lru_cache(maxsize=8192)
+def _cached_product_match(text: str) -> Optional[str]:
     if _engine_product_match is not None:
         try:
-            return _engine_product_match(value)
+            return _engine_product_match(text)
         except Exception:
             pass
-    return fallback_product_match(value)
+    return fallback_product_match(text)
+
+
+def product_match(value: Any) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+    return _cached_product_match(str(value))
 
 
 def parse_fiscal_period(value: Any, default_year: int) -> tuple[Optional[int], Optional[int]]:
@@ -362,13 +388,20 @@ def _header_score(values: Iterable[Any], source: str) -> int:
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def detect_header_row(file_bytes: bytes, filename: str, source: str) -> int:
+def read_raw_source(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Parse an uploaded source once and reuse it for detection and cleanup."""
     suffix = Path(filename).suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        raise ValueError("Only CSV and XLSX source files are supported.")
     stream = io.BytesIO(file_bytes)
     if suffix == ".csv":
-        probe = pd.read_csv(stream, header=None, nrows=25, dtype=object)
-    else:
-        probe = pd.read_excel(stream, header=None, nrows=25, dtype=object)
+        return pd.read_csv(stream, header=None, dtype=object)
+    return pd.read_excel(stream, header=None, dtype=object)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def detect_header_row(file_bytes: bytes, filename: str, source: str) -> int:
+    probe = read_raw_source(file_bytes, filename).head(25)
     if probe.empty:
         return 0
     scores = [_header_score(probe.iloc[row].tolist(), source) for row in range(len(probe))]
@@ -391,6 +424,20 @@ def _substantive_cells(frame: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(False, index=frame.index, columns=frame.columns)
     text_present = frame.astype("string").apply(lambda column: column.str.strip().ne(""))
     return (frame.notna() & text_present.fillna(False)).astype(bool)
+
+
+def _standalone_report_timestamp_mask(frame: pd.DataFrame) -> pd.Series:
+    """Identify nontransaction report metadata rows such as stale export tags."""
+    if frame.empty:
+        return pd.Series(False, index=frame.index, dtype=bool)
+    populated = _substantive_cells(frame)
+    single_value = populated.sum(axis=1).eq(1)
+    row_text = frame.astype("string").fillna("").agg(
+        lambda row: " ".join(value.strip() for value in row if value.strip()),
+        axis=1,
+    )
+    timestamp_text = row_text.str.fullmatch(REPORT_TIMESTAMP_PATTERN, na=False)
+    return (single_value & timestamp_text).astype(bool)
 
 
 def _unique_source_headers(values: list[Any]) -> tuple[list[str], list[str], list[str]]:
@@ -417,14 +464,7 @@ def _unique_source_headers(values: list[Any]) -> tuple[list[str], list[str], lis
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def read_source_file(file_bytes: bytes, filename: str, header_row: int) -> pd.DataFrame:
-    suffix = Path(filename).suffix.lower()
-    if suffix not in {".csv", ".xlsx"}:
-        raise ValueError("Only CSV and XLSX source files are supported.")
-    stream = io.BytesIO(file_bytes)
-    if suffix == ".csv":
-        raw = pd.read_csv(stream, header=None, dtype=object)
-    else:
-        raw = pd.read_excel(stream, header=None, dtype=object)
+    raw = read_raw_source(file_bytes, filename)
     if raw.empty or header_row < 0 or header_row >= len(raw):
         raise ValueError("The selected header row is outside the populated source data.")
 
@@ -435,6 +475,10 @@ def read_source_file(file_bytes: bytes, filename: str, header_row: int) -> pd.Da
     populated = _substantive_cells(frame)
     blank_rows_removed = int((~populated.any(axis=1)).sum())
     frame = frame.loc[populated.any(axis=1)].copy()
+
+    standalone_timestamp_mask = _standalone_report_timestamp_mask(frame)
+    standalone_timestamp_rows_removed = int(standalone_timestamp_mask.sum())
+    frame = frame.loc[~standalone_timestamp_mask].copy()
 
     tokenized = frame.apply(lambda column: column.map(_header_token))
     expected = pd.Series([_header_token(value) for value in original_headers], index=headers)
@@ -457,6 +501,7 @@ def read_source_file(file_bytes: bytes, filename: str, header_row: int) -> pd.Da
         "blank_columns_removed": blank_columns,
         "duplicate_headers_renamed": duplicate_renames,
         "repeated_header_rows_removed": repeated_header_rows_removed,
+        "standalone_timestamp_rows_removed": standalone_timestamp_rows_removed,
         "blank_rows_removed": blank_rows_removed,
     }
     return frame
@@ -613,6 +658,12 @@ def build_source_validation_report(
         "Repeated header-row cleanup", "PASS",
         f"Ignored {repeated_headers:,} repeated header row(s) found inside the data."
         if repeated_headers else "No repeated header rows were found inside the data.",
+    )
+    timestamp_rows = int(audit.get("standalone_timestamp_rows_removed", 0) or 0)
+    add(
+        "Standalone report timestamp cleanup", "PASS",
+        f"Ignored {timestamp_rows:,} standalone legacy report timestamp row(s)."
+        if timestamp_rows else "No standalone legacy report timestamp rows were found.",
     )
     duplicate_headers = list(audit.get("duplicate_headers_renamed", []))
     add(
@@ -909,37 +960,41 @@ def build_normalization_detail(
     qb_mapping: dict[str, Optional[str]],
     inf_mapping: dict[str, Optional[str]],
 ) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for source, frame, mapping, id_col in (
-        ("QuickBooks", qb, qb_mapping, QB_ID),
-        ("Infinium", inf, inf_mapping, INF_ID),
-    ):
-        for idx, row in frame.iterrows():
-            record = {
+    def base_detail(
+        source: str,
+        frame: pd.DataFrame,
+        mapping: dict[str, Optional[str]],
+        id_col: str,
+    ) -> pd.DataFrame:
+        amount_cents = pd.to_numeric(frame[AMOUNT_CENTS], errors="coerce")
+        return pd.DataFrame(
+            {
                 "Dataset": source,
-                "Source Row ID": row[id_col],
-                "Original PO": row[mapping["po"]],
-                "Normalized PO": row[NORM_PO],
-                "Original Invoice": row[mapping["invoice"]],
-                "Normalized Invoice": row[NORM_INV],
-                "Original Amount": row[mapping["amount"]],
-                "Normalized Amount": cents_to_float(row[AMOUNT_CENTS])
-                if valid_cents(row[AMOUNT_CENTS]) else None,
-                "Amount Valid": valid_cents(row[AMOUNT_CENTS]),
+                "Source Row ID": frame[id_col].to_numpy(copy=False),
+                "Original PO": frame[str(mapping["po"])].to_numpy(copy=False),
+                "Normalized PO": frame[NORM_PO].to_numpy(copy=False),
+                "Original Invoice": frame[str(mapping["invoice"])].to_numpy(copy=False),
+                "Normalized Invoice": frame[NORM_INV].to_numpy(copy=False),
+                "Original Amount": frame[str(mapping["amount"])].to_numpy(copy=False),
+                "Normalized Amount": amount_cents.div(100).to_numpy(copy=False),
+                "Amount Valid": amount_cents.notna().to_numpy(copy=False),
             }
-            if source == "QuickBooks":
-                product_col = mapping.get("product")
-                period_col = mapping.get("period")
-                record.update(
-                    {
-                        "Original Product Description": row[product_col] if product_col else None,
-                        "Standardized Product": row[PRODUCT_STANDARD],
-                        "Original Fiscal Period": row[period_col] if period_col else None,
-                        "Fiscal Period Label": row[FISCAL_LABEL],
-                    }
-                )
-            records.append(record)
-    return pd.DataFrame(records)
+        )
+
+    qb_detail = base_detail("QuickBooks", qb, qb_mapping, QB_ID)
+    product_col = qb_mapping.get("product")
+    period_col = qb_mapping.get("period")
+    qb_detail["Original Product Description"] = (
+        qb[product_col].to_numpy(copy=False) if product_col else None
+    )
+    qb_detail["Standardized Product"] = qb[PRODUCT_STANDARD].to_numpy(copy=False)
+    qb_detail["Original Fiscal Period"] = (
+        qb[period_col].to_numpy(copy=False) if period_col else None
+    )
+    qb_detail["Fiscal Period Label"] = qb[FISCAL_LABEL].to_numpy(copy=False)
+
+    inf_detail = base_detail("Infinium", inf, inf_mapping, INF_ID)
+    return pd.concat([qb_detail, inf_detail], ignore_index=True, sort=False)
 
 
 def build_match_assessments(
@@ -1161,7 +1216,7 @@ def build_rules_and_config(
             "Setting": "Fiscal Period Treatment",
             "Value": (
                 "Selected period is classified as current; all other valid periods are urgent prior-period exceptions "
-                "exceptions. Fiscal period never changes strict matching."
+                "Fiscal period never changes strict matching."
             ),
         },
     ]
@@ -1179,6 +1234,10 @@ def build_rules_and_config(
                 {
                     "Setting": f"{source_name} repeated header rows removed",
                     "Value": int(audit.get("repeated_header_rows_removed", 0) or 0),
+                },
+                {
+                    "Setting": f"{source_name} standalone report timestamp rows removed",
+                    "Value": int(audit.get("standalone_timestamp_rows_removed", 0) or 0),
                 },
                 {
                     "Setting": f"{source_name} duplicate headers renamed",
@@ -1440,8 +1499,13 @@ def _set_widths(
         ws.column_dimensions[get_column_letter(col)].width = min(max(max(lengths, default=0) + 2, minimum), maximum)
 
 
-def _autofit_workbook_columns(wb: Workbook, minimum: float = 10, maximum: float = 52) -> None:
-    """Auto-size every used worksheet column while respecting merged layout bands."""
+def _autofit_workbook_columns(
+    wb: Workbook,
+    minimum: float = 10,
+    maximum: float = 52,
+    sample_rows: int = 750,
+) -> None:
+    """Auto-size columns from a bounded sample instead of rescanning every cell."""
     for ws in wb.worksheets:
         merged_coordinates: set[str] = set()
         for merged_range in ws.merged_cells.ranges:
@@ -1453,11 +1517,15 @@ def _autofit_workbook_columns(wb: Workbook, minimum: float = 10, maximum: float 
             ):
                 merged_coordinates.update(cell.coordinate for cell in row)
 
+        sampled_row_numbers = list(range(1, min(ws.max_row, sample_rows) + 1))
+        if ws.max_row > sample_rows:
+            sampled_row_numbers.append(ws.max_row)
+
         for column_index in range(1, ws.max_column + 1):
             letter = get_column_letter(column_index)
             maximum_length = 0
             has_unmerged_value = False
-            for row_index in range(1, ws.max_row + 1):
+            for row_index in sampled_row_numbers:
                 cell = ws.cell(row_index, column_index)
                 if cell.coordinate in merged_coordinates or cell.value is None:
                     continue
@@ -1849,34 +1917,57 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     je_caption_row = je_title_row + 1
     je_header_row = je_title_row + 2
     je_data_row = je_header_row + 1
-    je_headers = ["Account", "Debit", "Credit", "Entry Basis"]
+    je_headers = [
+        "Entry Name", "GL Account", "Account Name", "Debit", "Credit", "Entry Basis",
+    ]
     je_frame = pd.DataFrame(
         [
-            ["Accrued Expenses", journal_amount, 0.0, "Unresolved QuickBooks net exception support"],
-            ["Manufactured Sales", 0.0, journal_amount, "Balanced offset"],
+            [
+                "AC001 Sales Accrual",
+                "017-00000-110160.0",
+                "Accrued Income",
+                journal_amount,
+                0.0,
+                "Unresolved QuickBooks net exception support",
+            ],
+            [
+                "AC001 Sales Accrual",
+                "017-91000-400000-0",
+                "Income-Manufacturing",
+                0.0,
+                journal_amount,
+                "Balanced offset",
+            ],
         ],
         columns=je_headers,
     )
-    _write_title_band(ws, je_title_row, 1, end_col, "PROPOSED JOURNAL ENTRY", SLATE)
+    _write_title_band(
+        ws, je_title_row, 1, end_col,
+        "PROPOSED JOURNAL ENTRY | AC001 SALES ACCRUAL",
+        SLATE,
+    )
     _write_caption_band(
         ws, je_caption_row, 1, end_col,
-        "Post only after review and approval. Debit Accrued Expenses and credit Manufactured Sales for the "
-        "absolute unresolved net amount; evaluate reversals and negative source values before posting.",
+        "Post only after review and approval. Debit 017-00000-110160.0 Accrued Income and credit "
+        "017-91000-400000-0 Income-Manufacturing for the absolute unresolved net amount; evaluate "
+        "reversals and negative source values before posting.",
         SLATE,
     )
     _write_dataframe_values(ws, je_frame, je_header_row, 1)
     _format_header(ws, je_header_row, 1, len(je_headers), SLATE)
     _format_body_block(ws, je_data_row, je_data_row + len(je_frame) - 1, 1, len(je_headers), SLATE_LIGHT)
     for row in range(je_data_row, je_data_row + len(je_frame)):
-        ws.cell(row, 2).number_format = '$#,##0.00;[Red]($#,##0.00);-'
-        ws.cell(row, 3).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+        ws.cell(row, 4).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+        ws.cell(row, 5).number_format = '$#,##0.00;[Red]($#,##0.00);-'
     je_total_row = je_data_row + len(je_frame)
     _write_total_row(
         ws, je_total_row, 1, len(je_headers),
         {"Debit": journal_amount, "Credit": journal_amount}, je_headers, "BALANCED TOTAL",
     )
-    ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width or 0, 26)
-    ws.column_dimensions["D"].width = max(ws.column_dimensions["D"].width or 0, 52)
+    ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width or 0, 24)
+    ws.column_dimensions["B"].width = max(ws.column_dimensions["B"].width or 0, 23)
+    ws.column_dimensions["C"].width = max(ws.column_dimensions["C"].width or 0, 28)
+    ws.column_dimensions["F"].width = max(ws.column_dimensions["F"].width or 0, 52)
 
     duplicate_frame = result.duplicate_analysis
     duplicate_headers = list(duplicate_frame.columns)
@@ -2262,6 +2353,11 @@ def load_app_css() -> None:
     css_path = Path(__file__).resolve().with_name("style.css")
     try:
         css = css_path.read_text(encoding="utf-8")
+        css = (
+            css.replace("\u00a0", " ")
+            .replace("\u2007", " ")
+            .replace("\u202f", " ")
+        )
     except OSError as exc:
         st.warning(f"The application stylesheet could not be loaded: {exc}")
         return
@@ -2294,6 +2390,40 @@ def display_primary_preview(result: ReconciliationResult) -> pd.DataFrame:
     return pd.concat(
         [qb_display, pd.DataFrame({"Match Result": methods}), inf_display], axis=1
     )
+
+
+def render_limited_dataframe(
+    frame: pd.DataFrame,
+    *,
+    height: Optional[int] = None,
+    row_limit: int = 2000,
+) -> None:
+    """Keep browser previews responsive while preserving full Excel outputs."""
+    displayed = frame.head(row_limit)
+    kwargs: dict[str, Any] = {
+        "use_container_width": True,
+        "hide_index": True,
+    }
+    if height is not None:
+        kwargs["height"] = height
+    st.dataframe(displayed, **kwargs)
+    if len(frame) > row_limit:
+        st.caption(
+            f"Showing the first {row_limit:,} of {len(frame):,} rows. "
+            "The complete population is retained in the downloadable workbook."
+        )
+
+
+def show_toast_once(state_key: str, message: str, icon: str = "✅") -> None:
+    """Show a native toast once without repeating it on every app rerun."""
+    if not st.session_state.get(state_key, False):
+        st.toast(message, icon=icon)
+        st.session_state[state_key] = True
+
+
+def attention_tab_label(label: str, count: int) -> str:
+    """Add a compatible text badge only when a tab has review items."""
+    return f"{label} ({count:,})" if count > 0 else label
 
 
 def run_id_for_inputs(qb_hash: str, inf_hash: str) -> tuple[str, datetime]:
@@ -2475,16 +2605,40 @@ def render_pre_execution_controls(
     )
 
 
-def render_result(result: ReconciliationResult, primary_bytes: bytes, analytics_bytes: bytes) -> None:
+def render_result(result: ReconciliationResult) -> None:
     metrics = result.metrics
     control_status = metrics["Control Status"]
     if control_status == "PASS":
-        st.success(f"Reconciliation complete. All workbook completeness and value matching controls passed. Run ID: {result.run_id}")
+        show_toast_once(
+            f"reconciliation_complete_{result.run_id}",
+            f"Reconciliation complete. All controls passed. Run ID: {result.run_id}",
+        )
     else:
         st.error("Reconciliation completed with failed controls. Downloads are withheld until controls pass.")
 
+    failed_controls = int(result.controls["Status"].ne("PASS").sum())
+    invalid_amount_rows = int(
+        metrics["Invalid QuickBooks Amounts"] + metrics["Invalid Infinium Amounts"]
+    )
+    unmatched_qb = int(metrics["Unresolved QuickBooks Rows"])
+    unmatched_inf = int(metrics["Unmatched Infinium Rows"])
+    unresolved_duplicate_groups = 0
+    if not result.duplicate_analysis.empty:
+        unresolved_duplicate_groups = int(
+            result.duplicate_analysis["Reconciliation Status"]
+            .ne("All rows matched through a more specific unique key")
+            .sum()
+        )
+
+    tab_labels = [
+        attention_tab_label("Overview", failed_controls + invalid_amount_rows),
+        attention_tab_label("Reconciled View", unmatched_qb + unmatched_inf),
+        attention_tab_label("Exception Review", unmatched_qb),
+        attention_tab_label("Analytics", unresolved_duplicate_groups),
+        "Downloads",
+    ]
     overview_tab, reconciled_tab, exceptions_tab, analytics_tab, downloads_tab = st.tabs(
-        ["Overview", "Reconciled View", "Exception Review", "Analytics", "Downloads"]
+        tab_labels
     )
     with overview_tab:
         cols = st.columns(4)
@@ -2528,7 +2682,7 @@ def render_result(result: ReconciliationResult, primary_bytes: bytes, analytics_
             "Matched rows appear first. Unmatched QuickBooks and unmatched Infinium rows are kept in separate "
             "sections so unrelated exceptions are never displayed as a pair."
         )
-        st.dataframe(display_primary_preview(result), use_container_width=True, hide_index=True, height=520)
+        render_limited_dataframe(display_primary_preview(result), height=520)
 
     with exceptions_tab:
         unresolved = result.qb_work.loc[result.unmatched_qb, list(result.qb_raw.columns)].copy()
@@ -2547,9 +2701,9 @@ def render_result(result: ReconciliationResult, primary_bytes: bytes, analytics_
                 for idx in result.unmatched_qb
             ]
         if unresolved.empty:
-            st.success("No unresolved QuickBooks exceptions remain.")
+            st.caption("No unresolved QuickBooks exceptions remain.")
         else:
-            st.dataframe(unresolved, use_container_width=True, hide_index=True, height=440)
+            render_limited_dataframe(unresolved, height=440)
         st.metric("Proposed journal-entry support total", format_currency(metrics["Unresolved QuickBooks Amount"]))
         st.caption("This is the net signed amount of unresolved QuickBooks transactions. Review credits and reversals before posting.")
 
@@ -2566,23 +2720,50 @@ def render_result(result: ReconciliationResult, primary_bytes: bytes, analytics_
     with downloads_tab:
         st.markdown("#### Accounting workpaper")
         st.caption("Four sheets: Raw Data, Reconciled Data, Unresolved Exceptions, and Product Aggregate Summary.")
-        st.download_button(
-            "Download Sales Reconciliation",
-            data=primary_bytes,
-            file_name=f"Sales_Reconciliation_{result.run_id}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True,
-        )
+        if "primary_workbook" not in st.session_state:
+            if st.button(
+                "Prepare Sales Reconciliation",
+                type="primary",
+                use_container_width=True,
+                key=f"prepare_primary_{result.run_id}",
+            ):
+                try:
+                    with st.spinner("Preparing the accounting workpaper..."):
+                        st.session_state.primary_workbook = build_primary_workbook(result)
+                    st.toast("Accounting workpaper prepared.", icon="✅")
+                except Exception as exc:
+                    st.error(f"The accounting workpaper could not be prepared: {exc}")
+        if "primary_workbook" in st.session_state:
+            st.download_button(
+                "Download Sales Reconciliation",
+                data=st.session_state.primary_workbook,
+                file_name=f"Sales_Reconciliation_{result.run_id}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+            )
         st.markdown("#### Detailed analytics")
         st.caption("Optional evidence package with normalization, assessments, controls, and exact run configuration.")
-        st.download_button(
-            "Download Reconciliation Analytics",
-            data=analytics_bytes,
-            file_name=f"Sales_Reconciliation_Analytics_{result.run_id}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        if "analytics_workbook" not in st.session_state:
+            if st.button(
+                "Prepare Reconciliation Analytics",
+                use_container_width=True,
+                key=f"prepare_analytics_{result.run_id}",
+            ):
+                try:
+                    with st.spinner("Preparing the detailed analytics workbook..."):
+                        st.session_state.analytics_workbook = build_analytics_workbook(result)
+                    st.toast("Analytics workbook prepared.", icon="✅")
+                except Exception as exc:
+                    st.error(f"The analytics workbook could not be prepared: {exc}")
+        if "analytics_workbook" in st.session_state:
+            st.download_button(
+                "Download Reconciliation Analytics",
+                data=st.session_state.analytics_workbook,
+                file_name=f"Sales_Reconciliation_Analytics_{result.run_id}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
 
 def main() -> None:
@@ -2747,7 +2928,10 @@ def main() -> None:
             f"Source validation passed with {validation_warnings:,} review warning(s). Harmless blank columns and repeated header rows were ignored."
         )
     else:
-        st.success("Source validation passed. Both datasets are structurally ready for reconciliation.")
+        show_toast_once(
+            f"source_validation_{key_suffix}_{qb_header_number}_{inf_header_number}",
+            "Source validation passed. Both datasets are ready for reconciliation.",
+        )
     with st.expander("Source validation details", expanded=validation_failed):
         st.dataframe(validation_report, use_container_width=True, hide_index=True)
     if validation_failed:
@@ -2786,22 +2970,18 @@ def main() -> None:
                     qb_detail, inf_raw, qb_mapping, inf_mapping, metadata,
                     fiscal_year,
                 )
-                primary_bytes = build_primary_workbook(result)
-                analytics_bytes = build_analytics_workbook(result)
             st.session_state.reconciliation_result = result
-            st.session_state.primary_workbook = primary_bytes
-            st.session_state.analytics_workbook = analytics_bytes
+            # Workbook bytes are generated only from the Downloads tab. This
+            # keeps the reconciliation action focused on matching and controls.
+            st.session_state.pop("primary_workbook", None)
+            st.session_state.pop("analytics_workbook", None)
             st.rerun()
         except Exception as exc:
             st.error(f"Reconciliation stopped safely: {exc}")
             return
 
     if "reconciliation_result" in st.session_state:
-        render_result(
-            st.session_state.reconciliation_result,
-            st.session_state.primary_workbook,
-            st.session_state.analytics_workbook,
-        )
+        render_result(st.session_state.reconciliation_result)
 
 
 if __name__ == "__main__":
