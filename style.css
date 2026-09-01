@@ -327,32 +327,32 @@ div.stButton > button[kind="primary"]:hover {
     font-size: 11px;
 }
 
-/* Sidebar upload cards */
+/* Upload status cards */
 .source-status {
     margin: -4px 0 12px;
     padding: 8px 10px;
     border-radius: 7px;
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 700; /* This is already nice and bold */
     line-height: 1.35;
 }
 
 .source-status.complete {
     background: rgba(67, 153, 112, .18);
     border: 1px solid rgba(110, 231, 183, .35);
-    color: #D1FAE5 !important;
+    color: #27666B !important; /* Updated to Theme Teal for contrast */
 }
 
 .source-status.active {
     background: rgba(125, 211, 252, .15);
     border: 1px solid rgba(125, 211, 252, .35);
-    color: #E0F2FE !important;
+    color: #1B365D !important; /* Updated to Theme Navy for contrast */
 }
 
 .source-status.pending {
     background: rgba(148, 163, 184, .10);
     border: 1px solid rgba(148, 163, 184, .22);
-    color: var(--text-on-dark-muted) !important;
+    color: #475569 !important; /* Updated to Theme Slate for contrast */
 }
 
 .upload-source-heading {
