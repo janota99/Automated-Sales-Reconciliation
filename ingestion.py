@@ -21,6 +21,7 @@ import hashlib
 import io
 import re
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -58,6 +59,8 @@ REPORT_TIMESTAMP_PATTERN = re.compile(
     r"(?:GMT|UTC)(?:[+-]\d{2}:?\d{2})?$",
     re.IGNORECASE,
 )
+
+_RE_NON_ALNUM = re.compile(r"[^A-Z0-9]")
 
 NONE_OPTION = "(Not mapped)"
 SELECT_OPTION = "(Select a column)"
@@ -148,6 +151,11 @@ def detect_header_row(
     return int(max(range(len(scores)), key=lambda idx: scores[idx]))
 
 
+@lru_cache(maxsize=4096)
+def _cached_header_token(text: str) -> str:
+    return _RE_NON_ALNUM.sub("", text)
+
+
 def _header_token(value: Any) -> str:
     if value is None:
         return ""
@@ -156,28 +164,57 @@ def _header_token(value: Any) -> str:
             return ""
     except (TypeError, ValueError):
         pass
-    return re.sub(r"[^A-Z0-9]", "", str(value).strip().upper())
+    return _cached_header_token(str(value).strip().upper())
+
+
+def _stripped_text_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return one reusable, NA-safe string view of a source frame."""
+    if frame.empty:
+        return pd.DataFrame("", index=frame.index, columns=frame.columns, dtype="string")
+    return frame.astype("string").fillna("").apply(lambda column: column.str.strip())
 
 
 def _substantive_cells(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(False, index=frame.index, columns=frame.columns)
-    text_present = frame.astype("string").apply(lambda column: column.str.strip().ne(""))
-    return (frame.notna() & text_present.fillna(False)).astype(bool)
+    return _stripped_text_frame(frame).ne("").astype(bool)
 
 
-def _standalone_report_timestamp_mask(frame: pd.DataFrame) -> pd.Series:
+def _standalone_report_timestamp_mask(
+    frame: pd.DataFrame,
+    *,
+    stripped: Optional[pd.DataFrame] = None,
+    populated: Optional[pd.DataFrame] = None,
+) -> pd.Series:
     """Identify nontransaction report metadata rows such as stale export tags."""
     if frame.empty:
         return pd.Series(False, index=frame.index, dtype=bool)
-    populated = _substantive_cells(frame)
+
+    stripped = stripped if stripped is not None else _stripped_text_frame(frame)
+    populated = populated if populated is not None else stripped.ne("")
     single_value = populated.sum(axis=1).eq(1)
-    row_text = frame.astype("string").fillna("").agg(
-        lambda row: " ".join(value.strip() for value in row if value.strip()),
-        axis=1,
+    result = pd.Series(False, index=frame.index, dtype=bool)
+    if not single_value.any():
+        return result
+
+    # Only timestamp candidates have one populated cell, so stack just that
+    # small subset instead of joining every cell in every transaction row.
+    candidates = stripped.loc[single_value].where(populated.loc[single_value])
+    candidate_text = candidates.bfill(axis=1).iloc[:, 0]
+    result.loc[candidate_text.index] = candidate_text.str.fullmatch(
+        REPORT_TIMESTAMP_PATTERN,
+        na=False,
+    ).to_numpy(dtype=bool)
+    return result
+
+
+def _header_token_frame(stripped: pd.DataFrame) -> pd.DataFrame:
+    """Vectorized equivalent of applying ``_header_token`` cell by cell."""
+    if stripped.empty:
+        return stripped.copy()
+    return stripped.apply(
+        lambda column: column.str.upper().str.replace(_RE_NON_ALNUM, "", regex=True)
     )
-    timestamp_text = row_text.str.fullmatch(REPORT_TIMESTAMP_PATTERN, na=False)
-    return (single_value & timestamp_text).astype(bool)
 
 
 def _unique_source_headers(values: list[Any]) -> tuple[list[str], list[str], list[str]]:
@@ -217,27 +254,45 @@ def read_source_file(
     frame = raw.iloc[header_row + 1:].copy()
     frame.columns = headers
 
-    populated = _substantive_cells(frame)
-    blank_rows_removed = int((~populated.any(axis=1)).sum())
-    frame = frame.loc[populated.any(axis=1)].copy()
+    # Build the cleaned string representation once and keep its masks aligned
+    # with each filtering pass. This avoids rescanning the full frame three
+    # times during a normal import.
+    stripped = _stripped_text_frame(frame)
+    populated = stripped.ne("")
+    retained_rows = populated.any(axis=1)
+    blank_rows_removed = int((~retained_rows).sum())
+    frame = frame.loc[retained_rows].copy()
+    stripped = stripped.loc[retained_rows]
+    populated = populated.loc[retained_rows]
 
-    standalone_timestamp_mask = _standalone_report_timestamp_mask(frame)
-    standalone_timestamp_rows_removed = int(standalone_timestamp_mask.sum())
-    frame = frame.loc[~standalone_timestamp_mask].copy()
-
-    tokenized = frame.apply(lambda column: column.map(_header_token))
-    expected = pd.Series([_header_token(value) for value in original_headers], index=headers)
-    header_matches = tokenized.eq(expected, axis="columns") & expected.ne("")
-    nonblank_tokens = tokenized.ne("").sum(axis=1)
-    repeated_header_mask = (
-        nonblank_tokens.ge(2)
-        & header_matches.sum(axis=1).ge(2)
-        & header_matches.sum(axis=1).div(nonblank_tokens.where(nonblank_tokens.ne(0), 1)).ge(0.60)
+    standalone_timestamp_mask = _standalone_report_timestamp_mask(
+        frame,
+        stripped=stripped,
+        populated=populated,
     )
-    repeated_header_rows_removed = int(repeated_header_mask.sum())
-    frame = frame.loc[~repeated_header_mask].copy()
+    standalone_timestamp_rows_removed = int(standalone_timestamp_mask.sum())
+    retained_rows = ~standalone_timestamp_mask
+    frame = frame.loc[retained_rows].copy()
+    stripped = stripped.loc[retained_rows]
+    populated = populated.loc[retained_rows]
 
-    populated = _substantive_cells(frame)
+    expected = pd.Series([_header_token(value) for value in original_headers], index=headers)
+    repeated_header_mask = pd.Series(False, index=frame.index, dtype=bool)
+    header_candidates = populated.sum(axis=1).ge(2)
+    if header_candidates.any():
+        tokenized = _header_token_frame(stripped.loc[header_candidates])
+        header_matches = tokenized.eq(expected, axis="columns") & expected.ne("")
+        nonblank_tokens = tokenized.ne("").sum(axis=1)
+        candidate_matches = header_matches.sum(axis=1)
+        repeated_header_mask.loc[header_candidates] = (
+            candidate_matches.ge(2)
+            & candidate_matches.div(nonblank_tokens).ge(0.60)
+        ).to_numpy(dtype=bool)
+    repeated_header_rows_removed = int(repeated_header_mask.sum())
+    retained_rows = ~repeated_header_mask
+    frame = frame.loc[retained_rows].copy()
+    populated = populated.loc[retained_rows]
+
     blank_columns = [column for column in frame.columns if not populated[column].any()]
     frame = frame.drop(columns=blank_columns).reset_index(drop=True)
     frame.attrs["ingestion_audit"] = {
@@ -253,6 +308,7 @@ def read_source_file(
     return frame
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def filter_qb_subtotal_rows(
     frame: pd.DataFrame,
     mapping: dict[str, Optional[str]],
@@ -267,8 +323,10 @@ def filter_qb_subtotal_rows(
     if frame.empty:
         return frame.copy(), 0
 
+    stripped = _stripped_text_frame(frame)
+    populated = stripped.ne("")
     first_column = frame.columns[0]
-    first_values = frame[first_column].fillna("").astype(str).str.strip()
+    first_values = stripped[first_column]
     normalized_first = (
         first_values.str.upper()
         .str.replace(r"\s+", " ", regex=True)
@@ -285,7 +343,6 @@ def filter_qb_subtotal_rows(
         if column in frame.columns
     }
     other_columns = [column for column in frame.columns if column not in numeric_columns]
-    populated = _substantive_cells(frame)
     incomplete_non_numeric = (
         ~populated[other_columns].all(axis=1)
         if other_columns
@@ -341,15 +398,17 @@ def infer_qb_period_column(
     return None
 
 
-def infer_column(columns: list[str], patterns: list[str], optional: bool = False) -> Optional[str]:
-    normalized = {col: re.sub(r"[^A-Z0-9]", "", str(col).upper()) for col in columns}
+def _infer_from_normalized_headers(
+    normalized: dict[str, str],
+    patterns: Iterable[str],
+) -> Optional[str]:
     for pattern in patterns:
-        target = re.sub(r"[^A-Z0-9]", "", pattern.upper())
+        target = _cached_header_token(str(pattern).strip().upper())
         for column, cleaned in normalized.items():
             if cleaned == target:
                 return column
     for pattern in patterns:
-        target = re.sub(r"[^A-Z0-9]", "", pattern.upper())
+        target = _cached_header_token(str(pattern).strip().upper())
         for column, cleaned in normalized.items():
             # Short tokens such as NUM, PO, and PD are exact-only because
             # substring matching could map NUM to P.O. NUMBER or PO to PRODUCT.
@@ -358,6 +417,24 @@ def infer_column(columns: list[str], patterns: list[str], optional: bool = False
     # Never silently map a required accounting field to an unrelated first
     # column. A missing standard field must be selected deliberately.
     return None
+
+
+def _infer_pattern_map(
+    columns: list[str],
+    pattern_map: dict[str, list[str]],
+) -> dict[str, Optional[str]]:
+    """Infer several fields while normalizing the source headers only once."""
+    normalized = {col: _cached_header_token(str(col).strip().upper()) for col in columns}
+    return {
+        field: _infer_from_normalized_headers(normalized, patterns)
+        for field, patterns in pattern_map.items()
+    }
+
+
+def infer_column(columns: list[str], patterns: list[str], optional: bool = False) -> Optional[str]:
+    # ``optional`` remains in the public signature for backward compatibility.
+    normalized = {col: _cached_header_token(str(col).strip().upper()) for col in columns}
+    return _infer_from_normalized_headers(normalized, patterns)
 
 
 def select_column(label: str, columns: list[str], patterns: list[str], key: str,
@@ -506,14 +583,8 @@ def mapping_panel(
     """Render the sidebar column-mapping controls and return both mappings."""
     qb_columns = list(qb_raw.columns)
     inf_columns = list(inf_raw.columns)
-    qb_defaults = {
-        field: infer_column(qb_columns, patterns, optional=field in {"quantity", "product", "period"})
-        for field, patterns in QB_COLUMN_PATTERNS.items()
-    }
-    inf_defaults = {
-        field: infer_column(inf_columns, patterns)
-        for field, patterns in INF_COLUMN_PATTERNS.items()
-    }
+    qb_defaults = _infer_pattern_map(qb_columns, QB_COLUMN_PATTERNS)
+    inf_defaults = _infer_pattern_map(inf_columns, INF_COLUMN_PATTERNS)
     inf_defaults["period"] = inf_columns[0] if inf_columns else None
     standard_required_ready = all(
         qb_defaults.get(field) for field in ("po", "invoice", "amount")
@@ -586,25 +657,30 @@ def secondary_mapping_panel(
             return None
         columns = list(frame.columns)
         patterns = QB_COLUMN_PATTERNS if source == "QB" else INF_COLUMN_PATTERNS
+        defaults = _infer_pattern_map(columns, patterns)
         prefix = "qb_secondary" if source == "QB" else "inf_secondary"
         mapping: dict[str, Optional[str]] = {
             "po": select_column(
                 "PO", columns, patterns["po"],
                 f"{prefix}_map_po_{key_suffix}",
+                default_column=defaults["po"],
             ),
             "invoice": select_column(
                 "Invoice", columns, patterns["invoice"],
                 f"{prefix}_map_inv_{key_suffix}",
+                default_column=defaults["invoice"],
             ),
             "amount": select_column(
                 "Amount", columns, patterns["amount"],
                 f"{prefix}_map_amount_{key_suffix}",
+                default_column=defaults["amount"],
             ),
         }
         if source == "QB":
             mapping["quantity"] = select_column(
                 "Quantity", columns, patterns["quantity"],
                 f"{prefix}_map_quantity_{key_suffix}", optional=True,
+                default_column=defaults["quantity"],
             )
         return mapping
 

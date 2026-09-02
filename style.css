@@ -22,7 +22,9 @@
     --global-radius: 8px;
 }
 
-/* Base canvas */
+/* =========================================================
+   BASE CANVAS
+   ========================================================= */
 .stApp {
     background-color: var(--bg-light) !important;
 }
@@ -30,56 +32,59 @@
 .block-container {
     max-width: 1350px !important;
     margin: 0 auto !important;
-    padding-top: 1.75rem !important;
-    padding-bottom: 2rem !important;
+    padding: 1.75rem 0 2rem !important;
 }
 
-/* Sidebar */
-[data-testid="stSidebar"] {
-    background-color: var(--sidebar-bg) !important;
-    border-right: 2px solid var(--border-dark) !important;
-}
-
+/* =========================================================
+   SIDEBAR
+   ========================================================= */
+[data-testid="stSidebar"],
 [data-testid="stSidebar"] > div:first-child {
     background-color: var(--sidebar-bg) !important;
-}
-
-[data-testid="stSidebar"] {
-    background: var(--sidebar-bg);
-    border-right: 1px solid var(--border-dark);
+    border-right: 2px solid var(--border-dark) !important;
     color: var(--text-on-dark-secondary);
 }
 
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] :is(
-    h1, h2, h3, h4, p, strong
-) {
-    color: var(--text-on-dark-secondary);
-}
-
+/* Sidebar Typography */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] :is(h1, h2, h3, h4, p, strong),
 [data-testid="stSidebar"] label {
     color: var(--text-on-dark-secondary);
-}
-
-[data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea,
-[data-testid="stSidebar"] [data-baseweb="select"] > div {
-    color: var(--text-on-light);
-    -webkit-text-fill-color: var(--text-on-light);
 }
 
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
     color: var(--text-on-dark-muted) !important;
 }
 
+/* Sidebar Inputs & Controls */
+[data-testid="stSidebar"] :is(input, textarea, [data-baseweb="select"] *, .stNumberInput button, .stNumberInput button *) {
+    color: var(--text-on-light) !important;
+    -webkit-text-fill-color: var(--text-on-light) !important;
+    opacity: 1 !important;
+}
+
+[data-testid="stSidebar"] :is([data-baseweb="input"], [data-baseweb="select"] > div) {
+    background: var(--panel-white) !important;
+    border-color: var(--text-on-light-muted) !important;
+}
+
+[data-testid="stSidebar"] [data-baseweb="input"] input::placeholder {
+    color: var(--text-on-light-muted) !important;
+    -webkit-text-fill-color: var(--text-on-light-muted) !important;
+}
+
+[data-testid="stSidebar"] .stNumberInput button {
+    background: #EEF2F6 !important;
+    border-color: var(--text-on-dark-muted) !important;
+}
+
+/* Sidebar File Uploader */
 [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {
     background: var(--bg-light) !important;
     border: 1px solid var(--text-on-dark-muted) !important;
     border-radius: var(--global-radius) !important;
 }
 
-[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
-[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] *,
-[data-testid="stSidebar"] [data-testid="stFileUploaderFileName"] {
+[data-testid="stSidebar"] :is([data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploaderFile"] *, [data-testid="stFileUploaderFileName"]) {
     color: var(--text-on-light) !important;
     -webkit-text-fill-color: var(--text-on-light) !important;
     opacity: 1 !important;
@@ -99,35 +104,10 @@
     font-weight: 700 !important;
 }
 
-[data-testid="stSidebar"] [data-baseweb="input"],
-[data-testid="stSidebar"] [data-baseweb="select"] > div {
-    background: var(--panel-white) !important;
-    border-color: var(--text-on-light-muted) !important;
-    color: var(--text-on-light) !important;
-}
-
-[data-testid="stSidebar"] [data-baseweb="input"] input,
-[data-testid="stSidebar"] [data-baseweb="select"] *,
-[data-testid="stSidebar"] .stNumberInput button,
-[data-testid="stSidebar"] .stNumberInput button * {
-    color: var(--text-on-light) !important;
-    -webkit-text-fill-color: var(--text-on-light) !important;
-    opacity: 1 !important;
-}
-
-[data-testid="stSidebar"] [data-baseweb="input"] input::placeholder {
-    color: var(--text-on-light-muted) !important;
-    -webkit-text-fill-color: var(--text-on-light-muted) !important;
-}
-
-[data-testid="stSidebar"] .stNumberInput button {
-    background: #EEF2F6 !important;
-    border-color: var(--text-on-dark-muted) !important;
-}
-
+/* Sidebar Expanders */
 [data-testid="stSidebar"] [data-testid="stExpander"] details {
-    background: rgba(30, 58, 91, .72) !important;
-    border: 1px solid rgba(148, 163, 184, .20) !important;
+    background: rgba(30, 58, 91, 0.72) !important;
+    border: 1px solid rgba(148, 163, 184, 0.20) !important;
     border-radius: var(--global-radius) !important;
 }
 
@@ -136,14 +116,16 @@
     -webkit-text-fill-color: var(--text-on-dark) !important;
 }
 
-/* Buttons and tabs */
+/* =========================================================
+   BUTTONS & TABS
+   ========================================================= */
 div.stButton > button:first-child {
     border-radius: 6px !important;
-    padding: .55rem 1.6rem !important;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, .05) !important;
+    padding: 0.55rem 1.6rem !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05) !important;
     font-size: 13px !important;
     font-weight: 700 !important;
-    transition: all .15s ease;
+    transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease !important;
 }
 
 div.stButton > button[kind="primary"] {
@@ -157,60 +139,96 @@ div.stButton > button[kind="primary"]:hover {
     border-color: var(--corporate-blue-hover) !important;
 }
 
-/* Streamlit tabs */
-
+/* Streamlit Tabs */
 [data-testid="stTabs"] [data-baseweb="tab-list"] {
     gap: 0;
     border-bottom: 1px solid var(--border-light);
 }
 
-/* Inactive tabs */
 [data-testid="stTabs"] button[role="tab"] {
     padding: 0.75rem 1rem;
-    color: #64748B !important;
+    color: var(--text-on-light-muted) !important;
     background: transparent !important;
     font-weight: 500 !important;
 }
 
-/* Force nested label elements to inherit the readable color */
 [data-testid="stTabs"] button[role="tab"] * {
     color: inherit !important;
     -webkit-text-fill-color: currentColor !important;
 }
 
-/* Hover state */
 [data-testid="stTabs"] button[role="tab"]:hover {
     color: var(--corporate-blue) !important;
     background: #F1F5F9 !important;
 }
 
-/* Active tab */
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"],
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] * {
     color: var(--corporate-navy) !important;
+    -webkit-text-fill-color: var(--corporate-navy) !important;
     background: transparent !important;
     font-weight: 700 !important;
 }
 
-/* Active underline */
 [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
     height: 3px !important;
     background-color: var(--corporate-navy) !important;
 }
 
-/* Keyboard accessibility */
 [data-testid="stTabs"] button[role="tab"]:focus-visible {
     outline: 2px solid rgba(37, 99, 235, 0.35);
     outline-offset: -2px;
 }
 
+/* Download Buttons */
+[data-testid="stDownloadButton"] button {
+    min-height: 42px;
+    padding: 0.55rem 1.25rem !important;
+    background-color: #374151 !important;
+    border: 1px solid #374151 !important;
+    border-radius: 6px !important;
+    color: var(--text-on-dark) !important;
+    font-size: 13px !important;
+    font-weight: 700 !important;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.14);
+    transition: background-color 150ms ease, border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
 
-/* Application header */
+[data-testid="stDownloadButton"] button * {
+    color: var(--text-on-dark) !important;
+    -webkit-text-fill-color: var(--text-on-dark) !important;
+    font-weight: inherit !important;
+}
+
+[data-testid="stDownloadButton"] button:hover {
+    background-color: #1F2937 !important;
+    border-color: #1F2937 !important;
+    box-shadow: 0 3px 8px rgba(15, 23, 42, 0.20);
+    transform: translateY(-1px);
+}
+
+[data-testid="stDownloadButton"] button:active {
+    background-color: #111827 !important;
+    border-color: #111827 !important;
+    transform: translateY(0);
+}
+
+[data-testid="stDownloadButton"] button:focus-visible {
+    outline: 3px solid rgba(71, 85, 105, 0.30);
+    outline-offset: 2px;
+}
+
+/* =========================================================
+   CUSTOM APPLICATION COMPONENTS
+   ========================================================= */
+
+/* Header */
 .rec-title {
     margin-bottom: 14px;
     padding: 20px 24px;
     background: linear-gradient(105deg, var(--corporate-navy) 0%, #234B72 60%, var(--corporate-teal) 100%);
     border-radius: 10px;
-    box-shadow: 0 4px 14px rgba(15, 35, 60, .10);
+    box-shadow: 0 4px 14px rgba(15, 35, 60, 0.10);
     color: var(--text-on-dark);
 }
 
@@ -222,23 +240,26 @@ div.stButton > button[kind="primary"]:hover {
 .rec-title p {
     margin: 0;
     font-size: 13px;
-    opacity: .88;
+    opacity: 0.88;
 }
 
-/* KPI cards */
+/* KPI Cards */
 .rec-card {
     padding: 14px 16px;
     background: var(--panel-white);
     border: 1px solid var(--border-light);
     border-radius: 9px;
-    box-shadow: 0 2px 7px rgba(15, 35, 60, .05);
+    box-shadow: 0 2px 7px rgba(15, 35, 60, 0.05);
+}
+
+.rec-kpi-label, .rec-kpi-sub {
+    color: var(--text-on-light-muted);
+    font-size: 11px;
 }
 
 .rec-kpi-label {
-    color: var(--text-on-light-muted);
-    font-size: 11px;
     font-weight: 700;
-    letter-spacing: .04em;
+    letter-spacing: 0.04em;
     text-transform: uppercase;
 }
 
@@ -251,16 +272,20 @@ div.stButton > button[kind="primary"]:hover {
 
 .rec-kpi-sub {
     margin-top: 2px;
-    color: var(--text-on-light-muted);
-    font-size: 11px;
 }
 
-/* Guided ingestion flow */
+/* Guided Ingestion Flow */
 .ingestion-flow {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 10px;
     margin: 2px 0 16px;
+}
+
+@media (max-width: 1000px) {
+    .ingestion-flow {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 
 .ingestion-step {
@@ -270,23 +295,16 @@ div.stButton > button[kind="primary"]:hover {
     background: var(--panel-white);
     border: 1px solid var(--border-light);
     border-radius: 9px;
-    box-shadow: 0 2px 6px rgba(15, 35, 60, .04);
+    box-shadow: 0 2px 6px rgba(15, 35, 60, 0.04);
 }
 
-.ingestion-step.complete {
-    border-top: 4px solid var(--corporate-teal);
-}
-
+.ingestion-step.complete { border-top: 4px solid var(--corporate-teal); }
+.ingestion-step.upcoming { background: var(--bg-light); border-top: 4px solid var(--text-on-dark-muted); }
 .ingestion-step.active {
     background: #F0F8FD;
     border: 1px solid #77BCE3;
     border-top: 4px solid #4E9DCC;
-    box-shadow: 0 0 0 3px rgba(125, 211, 252, .16);
-}
-
-.ingestion-step.upcoming {
-    background: var(--bg-light);
-    border-top: 4px solid var(--text-on-dark-muted);
+    box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.16);
 }
 
 .ingestion-number {
@@ -303,17 +321,9 @@ div.stButton > button[kind="primary"]:hover {
     font-weight: 800;
 }
 
-.ingestion-step.complete .ingestion-number {
-    background: var(--corporate-teal);
-}
-
-.ingestion-step.active .ingestion-number {
-    background: #4E9DCC;
-}
-
-.ingestion-step.upcoming .ingestion-number {
-    background: #94A3B8;
-}
+.ingestion-step.complete .ingestion-number { background: var(--corporate-teal); }
+.ingestion-step.active .ingestion-number { background: #4E9DCC; }
+.ingestion-step.upcoming .ingestion-number { background: #94A3B8; }
 
 .ingestion-title {
     color: var(--text-on-light-secondary);
@@ -327,32 +337,32 @@ div.stButton > button[kind="primary"]:hover {
     font-size: 11px;
 }
 
-/* Upload status cards */
+/* Upload Status Cards */
 .source-status {
     margin: -4px 0 12px;
     padding: 8px 10px;
     border-radius: 7px;
     font-size: 11px;
-    font-weight: 700; /* This is already nice and bold */
+    font-weight: 700;
     line-height: 1.35;
 }
 
 .source-status.complete {
-    background: rgba(67, 153, 112, .18);
-    border: 1px solid rgba(110, 231, 183, .35);
-    color: #27666B !important; /* Updated to Theme Teal for contrast */
+    background: rgba(67, 153, 112, 0.18);
+    border: 1px solid rgba(110, 231, 183, 0.35);
+    color: var(--corporate-teal) !important;
 }
 
 .source-status.active {
-    background: rgba(125, 211, 252, .15);
-    border: 1px solid rgba(125, 211, 252, .35);
-    color: #1B365D !important; /* Updated to Theme Navy for contrast */
+    background: rgba(125, 211, 252, 0.15);
+    border: 1px solid rgba(125, 211, 252, 0.35);
+    color: var(--corporate-navy) !important;
 }
 
 .source-status.pending {
-    background: rgba(148, 163, 184, .10);
-    border: 1px solid rgba(148, 163, 184, .22);
-    color: #475569 !important; /* Updated to Theme Slate for contrast */
+    background: rgba(148, 163, 184, 0.10);
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    color: var(--text-on-light-secondary) !important;
 }
 
 .upload-source-heading {
@@ -362,8 +372,8 @@ div.stButton > button[kind="primary"]:hover {
     min-height: 58px;
     margin: 4px 0 7px;
     padding: 7px 9px 7px 11px;
-    background: rgba(255, 255, 255, .06);
-    border: 1px solid rgba(148, 163, 184, .24);
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(148, 163, 184, 0.24);
     border-radius: 9px;
 }
 
@@ -388,9 +398,9 @@ div.stButton > button[kind="primary"]:hover {
 }
 
 .upload-source-title {
-    color: var(--text-on-dark) !important;
+    color: var(--text-on-light) !important; 
     font-size: 13px;
-    font-weight: 750;
+    font-weight: 900 !important;
 }
 
 .upload-source-logo {
@@ -410,10 +420,10 @@ div.stButton > button[kind="primary"]:hover {
     height: 46px;
     object-fit: cover;
     border-radius: 8px;
-    box-shadow: 0 2px 7px rgba(0, 0, 0, .18);
+    box-shadow: 0 2px 7px rgba(0, 0, 0, 0.18);
 }
 
-/* Data-quality warning */
+/* Data Quality Banner */
 .data-quality-banner {
     margin-top: 14px;
     padding: 12px 14px;
@@ -425,77 +435,4 @@ div.stButton > button[kind="primary"]:hover {
     font-size: 13px;
     font-weight: 700;
     line-height: 1.45;
-}
-
-@media (max-width: 1000px) {
-    .ingestion-flow {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-}
-/* =========================================================
-   ACTIVE TAB EMPHASIS
-   ========================================================= */
-
-[data-testid="stTabs"]
-button[role="tab"][aria-selected="true"] {
-    color: var(--corporate-navy) !important;
-    font-weight: 700 !important;
-}
-
-[data-testid="stTabs"]
-button[role="tab"][aria-selected="true"] * {
-    color: var(--corporate-navy) !important;
-    -webkit-text-fill-color: var(--corporate-navy) !important;
-    font-weight: 700 !important;
-}
-
-[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
-    height: 3px !important;
-    background-color: var(--corporate-navy) !important;
-}
-
-
-/* =========================================================
-   DOWNLOAD BUTTONS
-   ========================================================= */
-
-[data-testid="stDownloadButton"] button {
-    min-height: 42px;
-    padding: 0.55rem 1.25rem !important;
-    background-color: #374151 !important;
-    border: 1px solid #374151 !important;
-    border-radius: 6px !important;
-    color: #FFFFFF !important;
-    font-size: 13px !important;
-    font-weight: 700 !important;
-    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.14);
-    transition:
-        background-color 150ms ease,
-        border-color 150ms ease,
-        box-shadow 150ms ease,
-        transform 150ms ease;
-}
-
-[data-testid="stDownloadButton"] button * {
-    color: #FFFFFF !important;
-    -webkit-text-fill-color: #FFFFFF !important;
-    font-weight: inherit !important;
-}
-
-[data-testid="stDownloadButton"] button:hover {
-    background-color: #1F2937 !important;
-    border-color: #1F2937 !important;
-    box-shadow: 0 3px 8px rgba(15, 23, 42, 0.20);
-    transform: translateY(-1px);
-}
-
-[data-testid="stDownloadButton"] button:active {
-    background-color: #111827 !important;
-    border-color: #111827 !important;
-    transform: translateY(0);
-}
-
-[data-testid="stDownloadButton"] button:focus-visible {
-    outline: 3px solid rgba(71, 85, 105, 0.30);
-    outline-offset: 2px;
 }

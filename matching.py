@@ -1,7 +1,8 @@
-"""Strict QuickBooks-to-Infinium normalization and matching engine.
+"""Controlled QuickBooks-to-Infinium normalization and matching engine.
 
-Automatic matches must be unique, one-to-one, and exact at the signed-cent
-level. Grouped relationships and amount tolerances are intentionally excluded.
+Automatic matching first exhausts unique one-to-one relationships. A bounded,
+unambiguous one-to-many or many-to-one pass may then match rows sharing an exact
+normalized PO and/or invoice when their signed-cent totals agree exactly.
 """
 
 from __future__ import annotations
@@ -40,8 +41,14 @@ __all__ = [
 ]
 
 
-APP_VERSION = "2.9.0"
-MATCHING_RULE_VERSION = "2026.09-STRICT-1TO1-HISTORICAL-TRACE"
+APP_VERSION = "2.10.1"
+MATCHING_RULE_VERSION = "2026.09-1TO1-THEN-UNIQUE-GROUPED-HISTORICAL-TRACE"
+
+# Grouped matching is intentionally bounded to keep reconciliation runs
+# predictable. Larger or more complex reference pools remain unresolved for
+# human review instead of risking a slow or arbitrary automatic allocation.
+MAX_GROUP_POOL_ROWS = 20
+MAX_GROUP_SIZE = 8
 
 QB_ID = "__REC_QB_ID"
 INF_ID = "__REC_INF_ID"
@@ -85,6 +92,11 @@ PRODUCT_LEXICON = {
         "TOOT N TOTUM 24 CASE", "TOOTN TOTUM 24 CASE",
     ],
 }
+
+_RE_TRAILING_ZEROS = re.compile(r"^([0-9]+)\.0+$")
+_RE_NON_ALNUM = re.compile(r"[^A-Z0-9]")
+_RE_PO_PREFIX = re.compile(r"^P\.?\s*O\.?(?:\s*[#:\-]\s*|\s+|(?=\d))")
+_RE_FISCAL_PERIOD = re.compile(r"(?:PD|P|PERIOD)?\s*(\d{1,2})(?:\.0+)?(?:\s*[-/]\s*(\d{4}|\d{2}))?")
 
 
 @dataclass
@@ -135,21 +147,29 @@ class ReconciliationResult:
     duplicate_inf_rows: list[int] = field(default_factory=list)
 
 
+@lru_cache(maxsize=4096)
+def _cached_clean_alphanumeric(text: str) -> str:
+    text = _RE_TRAILING_ZEROS.sub(r"\1", text)
+    return _RE_NON_ALNUM.sub("", text)
+
+
 def clean_alphanumeric(value: Any) -> str:
     if value is None or pd.isna(value):
         return ""
-    text = str(value).strip().upper()
-    text = re.sub(r"^([0-9]+)\.0+$", r"\1", text)
-    return re.sub(r"[^A-Z0-9]", "", text)
+    return _cached_clean_alphanumeric(str(value).strip().upper())
+
+
+@lru_cache(maxsize=4096)
+def _cached_clean_po(text: str) -> str:
+    text = _RE_TRAILING_ZEROS.sub(r"\1", text)
+    text = _RE_PO_PREFIX.sub("", text)
+    return _RE_NON_ALNUM.sub("", text)
 
 
 def clean_po(value: Any) -> str:
     if value is None or pd.isna(value):
         return ""
-    text = str(value).strip().upper()
-    text = re.sub(r"^([0-9]+)\.0+$", r"\1", text)
-    text = re.sub(r"^P\.?\s*O\.?(?:\s*[#:\-]\s*|\s+|(?=\d))", "", text)
-    return re.sub(r"[^A-Z0-9]", "", text)
+    return _cached_clean_po(str(value).strip().upper())
 
 
 def parse_amount_cents(value: Any) -> Optional[int]:
@@ -188,6 +208,53 @@ def valid_cents(value: Any) -> bool:
     return value is not None and not pd.isna(value)
 
 
+def _amount_total(frame: pd.DataFrame, indexes: Any) -> int:
+    """Return an exact signed-cent total for the selected working rows."""
+    return sum(
+        cents_or_zero(frame.at[int(idx), AMOUNT_CENTS])
+        for idx in indexes
+    )
+
+
+def _gross_amount_total(frame: pd.DataFrame, indexes: Any) -> int:
+    """Return an exact absolute-cent total for the selected working rows."""
+    return sum(
+        abs(cents_or_zero(frame.at[int(idx), AMOUNT_CENTS]))
+        for idx in indexes
+    )
+
+
+def _matched_row_indexes(
+    matches: list[MatchGroup],
+    dataset: str,
+) -> list[int]:
+    """Return unique primary row indexes consumed by accepted match groups."""
+    attribute = "qb_rows" if dataset == "QB" else "inf_rows"
+    return sorted(
+        {
+            int(idx)
+            for group in matches
+            for idx in getattr(group, attribute)
+        }
+    )
+
+
+def _historical_row_indexes(
+    clearances: pd.DataFrame,
+    primary_dataset: str,
+    index_column: str,
+) -> list[int]:
+    """Return unique populated indexes from one historical-clearance side."""
+    if clearances.empty:
+        return []
+    values = clearances.loc[
+        clearances["Primary Dataset"].eq(primary_dataset)
+        & clearances[index_column].notna(),
+        index_column,
+    ]
+    return sorted({int(value) for value in values})
+
+
 def numeric_sum(series: pd.Series) -> float:
     return cents_to_float(sum(int(c) for c in series.map(parse_amount_cents) if valid_cents(c)))
 
@@ -206,32 +273,30 @@ def _product_lookup() -> dict[str, str]:
     return lookup
 
 
+@lru_cache(maxsize=1024)
+def _cached_fuzzy_match(cleaned: str) -> Optional[str]:
+    lookup = _product_lookup()
+    if cleaned in lookup:
+        return lookup[cleaned]
+    close = get_close_matches(cleaned, lookup.keys(), n=1, cutoff=0.82)
+    return lookup[close[0]] if close else None
+
+
 def get_fuzzy_lexicon_match(value: Any) -> Optional[str]:
     """Classify products for reporting without affecting financial matches."""
     cleaned = clean_alphanumeric(value)
     if not cleaned:
         return None
-
-    lookup = _product_lookup()
-    if cleaned in lookup:
-        return lookup[cleaned]
-
-    close = get_close_matches(cleaned, lookup.keys(), n=1, cutoff=0.82)
-    return lookup[close[0]] if close else None
+    return _cached_fuzzy_match(cleaned)
 
 
 def product_match(value: Any) -> Optional[str]:
     return get_fuzzy_lexicon_match(value)
 
 
-def parse_fiscal_period(value: Any, default_year: int) -> tuple[Optional[int], Optional[int]]:
-    if value is None or pd.isna(value):
-        return None, None
-    text = str(value).strip().upper()
-    match = re.fullmatch(
-        r"(?:PD|P|PERIOD)?\s*(\d{1,2})(?:\.0+)?(?:\s*[-/]\s*(\d{4}|\d{2}))?",
-        text,
-    )
+@lru_cache(maxsize=1024)
+def _cached_parse_fiscal_period(text: str, default_year: int) -> tuple[Optional[int], Optional[int]]:
+    match = _RE_FISCAL_PERIOD.fullmatch(text)
     if not match:
         return None, None
     period = int(match.group(1))
@@ -242,6 +307,12 @@ def parse_fiscal_period(value: Any, default_year: int) -> tuple[Optional[int], O
     if not 1 <= period <= 13 or not 1900 <= year <= 2199:
         return None, None
     return period, year
+
+
+def parse_fiscal_period(value: Any, default_year: int) -> tuple[Optional[int], Optional[int]]:
+    if value is None or pd.isna(value):
+        return None, None
+    return _cached_parse_fiscal_period(str(value).strip().upper(), default_year)
 
 
 def fiscal_label(value: Any, default_year: int) -> str:
@@ -275,11 +346,123 @@ def prepare_working_frame(
     return frame
 
 
+def _subset_solutions_for_target(
+    frame: pd.DataFrame,
+    indexes: list[int],
+    target_cents: int,
+    solution_limit: int = 2,
+) -> list[tuple[int, ...]]:
+    """Return up to ``solution_limit`` exact multi-row subsets.
+
+    Retaining at most two paths per subtotal is sufficient because grouped
+    matching only needs to distinguish a unique solution from an ambiguous
+    one. Pools outside the documented bounds are left for manual review.
+    """
+    usable = [
+        int(idx) for idx in indexes
+        if valid_cents(frame.at[idx, AMOUNT_CENTS])
+    ]
+    usable.sort(key=lambda idx: frame.at[idx, SOURCE_POS])
+    if len(usable) < 2 or len(usable) > MAX_GROUP_POOL_ROWS:
+        return []
+
+    states: dict[tuple[int, int], list[tuple[int, ...]]] = {(0, 0): [()]}
+    for idx in usable:
+        amount = int(frame.at[idx, AMOUNT_CENTS])
+        additions: dict[tuple[int, int], list[tuple[int, ...]]] = defaultdict(list)
+        for (subtotal, size), paths in list(states.items()):
+            if size >= MAX_GROUP_SIZE:
+                continue
+            key = (subtotal + amount, size + 1)
+            for path in paths:
+                candidate = (*path, idx)
+                if candidate not in additions[key]:
+                    additions[key].append(candidate)
+                if len(additions[key]) >= solution_limit:
+                    break
+        for key, paths in additions.items():
+            existing = states.setdefault(key, [])
+            for path in paths:
+                if path not in existing:
+                    existing.append(path)
+                if len(existing) >= solution_limit:
+                    break
+
+    solutions: list[tuple[int, ...]] = []
+    for size in range(2, MAX_GROUP_SIZE + 1):
+        for path in states.get((int(target_cents), size), []):
+            if path not in solutions:
+                solutions.append(path)
+            if len(solutions) >= solution_limit:
+                return solutions
+    return solutions
+
+
+def _reference_groups(
+    frame: pd.DataFrame,
+    remaining: set[int],
+    fields: tuple[str, ...],
+) -> dict[tuple[str, ...], list[int]]:
+    groups: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for idx in sorted(remaining, key=lambda row: frame.at[row, SOURCE_POS]):
+        if not valid_cents(frame.at[idx, AMOUNT_CENTS]):
+            continue
+        key = tuple(str(frame.at[idx, field]) for field in fields)
+        if any(not value for value in key):
+            continue
+        groups[key].append(int(idx))
+    return groups
+
+
+def _group_candidates(
+    qb: pd.DataFrame,
+    inf: pd.DataFrame,
+    remaining_q: set[int],
+    remaining_i: set[int],
+    fields: tuple[str, ...],
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Build exact one-to-many and many-to-one candidates for one rule pass."""
+    q_groups = _reference_groups(qb, remaining_q, fields)
+    i_groups = _reference_groups(inf, remaining_i, fields)
+    candidates: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
+
+    for key in sorted(set(q_groups).intersection(i_groups)):
+        q_indexes = q_groups[key]
+        i_indexes = i_groups[key]
+        q_solutions_by_target: dict[int, list[tuple[int, ...]]] = {}
+        i_solutions_by_target: dict[int, list[tuple[int, ...]]] = {}
+        for iidx in i_indexes:
+            target = int(inf.at[iidx, AMOUNT_CENTS])
+            if target not in q_solutions_by_target:
+                q_solutions_by_target[target] = _subset_solutions_for_target(
+                    qb, q_indexes, target
+                )
+            for q_subset in q_solutions_by_target[target]:
+                candidates.add((tuple(q_subset), (int(iidx),)))
+        for qidx in q_indexes:
+            target = int(qb.at[qidx, AMOUNT_CENTS])
+            if target not in i_solutions_by_target:
+                i_solutions_by_target[target] = _subset_solutions_for_target(
+                    inf, i_indexes, target
+                )
+            for i_subset in i_solutions_by_target[target]:
+                candidates.add(((int(qidx),), tuple(i_subset)))
+
+    return sorted(
+        candidates,
+        key=lambda pair: (
+            min(qb.at[idx, SOURCE_POS] for idx in pair[0]),
+            min(inf.at[idx, SOURCE_POS] for idx in pair[1]),
+            pair,
+        ),
+    )
+
+
 def perform_matching(
     qb: pd.DataFrame,
     inf: pd.DataFrame,
 ) -> tuple[list[MatchGroup], list[int], list[int], pd.DataFrame]:
-    """Perform strict one-to-one matching with vectorized uniqueness joins."""
+    """Match one-to-one first, then unique exact aggregate relationships."""
     remaining_q = set(qb.index)
     remaining_i = set(inf.index)
     matches: list[MatchGroup] = []
@@ -329,7 +512,66 @@ def perform_matching(
         remaining_q.difference_update(int(qidx) for qidx, _ in pair_indexes)
         remaining_i.difference_update(int(iidx) for _, iidx in pair_indexes)
 
-    matches.sort(key=lambda group: min(group.qb_rows) if group.qb_rows else 10**12)
+    grouped_passes = [
+        (
+            (NORM_PO, NORM_INV),
+            "PO + Invoice + Aggregate Amount (Grouped)",
+            "Moderate",
+            "After all one-to-one passes, one unique group shares the normalized "
+            "PO and invoice and agrees to the opposing row's exact signed-cent total.",
+        ),
+        (
+            (NORM_PO,),
+            "PO + Aggregate Amount (Grouped)",
+            "Moderate",
+            "After all one-to-one passes, one unique group shares the normalized PO "
+            "and agrees to the opposing row's exact signed-cent total.",
+        ),
+        (
+            (NORM_INV,),
+            "Invoice + Aggregate Amount (Grouped)",
+            "Moderate",
+            "After all one-to-one passes, one unique group shares the normalized "
+            "invoice and agrees to the opposing row's exact signed-cent total.",
+        ),
+    ]
+
+    for fields, method, confidence, explanation in grouped_passes:
+        while remaining_q and remaining_i:
+            possible = _group_candidates(
+                qb, inf, remaining_q, remaining_i, fields
+            )
+            if not possible:
+                break
+            q_occurrences = Counter(idx for q_rows, _ in possible for idx in q_rows)
+            i_occurrences = Counter(idx for _, i_rows in possible for idx in i_rows)
+            accepted = [
+                (q_rows, i_rows)
+                for q_rows, i_rows in possible
+                if all(q_occurrences[idx] == 1 for idx in q_rows)
+                and all(i_occurrences[idx] == 1 for idx in i_rows)
+            ]
+            if not accepted:
+                break
+            for q_rows, i_rows in accepted:
+                matches.append(
+                    MatchGroup(
+                        list(q_rows),
+                        list(i_rows),
+                        method,
+                        confidence,
+                        explanation,
+                        group_level=True,
+                    )
+                )
+                remaining_q.difference_update(q_rows)
+                remaining_i.difference_update(i_rows)
+
+    matches.sort(
+        key=lambda group: min(
+            qb.at[idx, SOURCE_POS] for idx in group.qb_rows
+        ) if group.qb_rows else 10**12
+    )
     for number, group in enumerate(matches, 1):
         group.match_id = f"M-{number:06d}"
 
@@ -408,6 +650,10 @@ def perform_matching(
 
 HISTORICAL_CLEARANCE_COLUMNS = [
     "Clearance ID",
+    "Group Sequence",
+    "Primary Row Count",
+    "Secondary Row Count",
+    "Group-Level Match",
     "Primary Dataset",
     "Primary Row ID",
     "Primary Row Index",
@@ -435,43 +681,109 @@ def build_historical_clearances(
 ) -> tuple[pd.DataFrame, list[int], list[int]]:
     """Clear opposing-primary exceptions with optional historical sources.
 
-    Historical rows never become exceptions themselves. Only accepted strict
-    one-to-one matches are retained as evidence; all unused historical rows are
-    discarded from the reconciliation population.
+    Historical rows never become exceptions themselves. Accepted one-to-one
+    and controlled grouped matches are retained as evidence; all unused
+    historical rows are discarded from the reconciliation population.
     """
     records: list[dict[str, Any]] = []
     cleared_qb: set[int] = set()
     cleared_inf: set[int] = set()
+    clearance_number = 0
+
+    def append_clearance(
+        group: MatchGroup,
+        primary_frame: pd.DataFrame,
+        secondary_frame: pd.DataFrame,
+        primary_indexes: list[int],
+        secondary_indexes: list[int],
+        primary_dataset: str,
+        secondary_dataset: str,
+        primary_id_column: str,
+        secondary_id_column: str,
+        method_prefix: str,
+        disposition: str,
+    ) -> None:
+        nonlocal clearance_number
+        clearance_number += 1
+        clearance_id = f"H-{clearance_number:06d}"
+        ordered_primary = sorted(
+            (int(idx) for idx in primary_indexes),
+            key=lambda idx: primary_frame.at[idx, SOURCE_POS],
+        )
+        ordered_secondary = sorted(
+            (int(idx) for idx in secondary_indexes),
+            key=lambda idx: secondary_frame.at[idx, SOURCE_POS],
+        )
+        primary_total = _amount_total(primary_frame, ordered_primary)
+        secondary_total = _amount_total(secondary_frame, ordered_secondary)
+        for sequence, (pidx, sidx) in enumerate(
+            zip_longest(ordered_primary, ordered_secondary), 1
+        ):
+            primary_amount = (
+                cents_or_zero(primary_frame.at[pidx, AMOUNT_CENTS])
+                if pidx is not None else 0
+            )
+            secondary_amount = (
+                cents_or_zero(secondary_frame.at[sidx, AMOUNT_CENTS])
+                if sidx is not None else 0
+            )
+            reference_frame = primary_frame if pidx is not None else secondary_frame
+            reference_index = pidx if pidx is not None else sidx
+            records.append(
+                {
+                    "Clearance ID": clearance_id,
+                    "Group Sequence": sequence,
+                    "Primary Row Count": len(ordered_primary),
+                    "Secondary Row Count": len(ordered_secondary),
+                    "Group-Level Match": group.group_level,
+                    "Primary Dataset": primary_dataset,
+                    "Primary Row ID": (
+                        primary_frame.at[pidx, primary_id_column]
+                        if pidx is not None else ""
+                    ),
+                    "Primary Row Index": int(pidx) if pidx is not None else None,
+                    "Secondary Dataset": secondary_dataset,
+                    "Secondary Row ID": (
+                        secondary_frame.at[sidx, secondary_id_column]
+                        if sidx is not None else ""
+                    ),
+                    "Secondary Row Index": int(sidx) if sidx is not None else None,
+                    "Match Method": f"{method_prefix} | {group.method}",
+                    "Confidence": group.confidence,
+                    "Normalized PO": reference_frame.at[reference_index, NORM_PO],
+                    "Normalized Invoice": reference_frame.at[reference_index, NORM_INV],
+                    "Primary Amount": cents_to_float(primary_amount),
+                    "Secondary Amount": cents_to_float(secondary_amount),
+                    "Amount Difference": cents_to_float(primary_amount - secondary_amount),
+                    "Disposition": disposition,
+                }
+            )
+        if primary_total != secondary_total:
+            raise ValueError(
+                "Historical clearance construction failure: aggregate amounts differ."
+            )
 
     if inf_secondary is not None and len(inf_secondary) and unmatched_qb:
         secondary_matches, _, _, _ = perform_matching(
             qb.loc[unmatched_qb].copy(), inf_secondary
         )
         for group in secondary_matches:
-            qidx, sidx = group.qb_rows[0], group.inf_rows[0]
-            cleared_qb.add(int(qidx))
-            primary_amount = cents_or_zero(qb.at[qidx, AMOUNT_CENTS])
-            secondary_amount = cents_or_zero(inf_secondary.at[sidx, AMOUNT_CENTS])
-            records.append(
-                {
-                    "Primary Dataset": "QuickBooks Primary",
-                    "Primary Row ID": qb.at[qidx, QB_ID],
-                    "Primary Row Index": int(qidx),
-                    "Secondary Dataset": "Infinium Secondary (Historical)",
-                    "Secondary Row ID": inf_secondary.at[sidx, INF_ID],
-                    "Secondary Row Index": int(sidx),
-                    "Match Method": f"QuickBooks primary ↔ Infinium prior-period match | {group.method}",
-                    "Confidence": group.confidence,
-                    "Normalized PO": qb.at[qidx, NORM_PO],
-                    "Normalized Invoice": qb.at[qidx, NORM_INV],
-                    "Primary Amount": cents_to_float(primary_amount),
-                    "Secondary Amount": cents_to_float(secondary_amount),
-                    "Amount Difference": cents_to_float(primary_amount - secondary_amount),
-                    "Disposition": (
-                        "QuickBooks primary item cleared by the displayed Infinium "
-                        "prior-period match"
-                    ),
-                }
+            cleared_qb.update(int(idx) for idx in group.qb_rows)
+            append_clearance(
+                group,
+                qb,
+                inf_secondary,
+                group.qb_rows,
+                group.inf_rows,
+                "QuickBooks Primary",
+                "Infinium Secondary (Historical)",
+                QB_ID,
+                INF_ID,
+                "QuickBooks primary ↔ Infinium prior-period match",
+                (
+                    "QuickBooks primary item(s) cleared by the displayed Infinium "
+                    "prior-period item(s)"
+                ),
             )
 
     if qb_secondary is not None and len(qb_secondary) and unmatched_inf:
@@ -479,34 +791,24 @@ def build_historical_clearances(
             qb_secondary, inf.loc[unmatched_inf].copy()
         )
         for group in secondary_matches:
-            sidx, iidx = group.qb_rows[0], group.inf_rows[0]
-            cleared_inf.add(int(iidx))
-            primary_amount = cents_or_zero(inf.at[iidx, AMOUNT_CENTS])
-            secondary_amount = cents_or_zero(qb_secondary.at[sidx, AMOUNT_CENTS])
-            records.append(
-                {
-                    "Primary Dataset": "Infinium Primary",
-                    "Primary Row ID": inf.at[iidx, INF_ID],
-                    "Primary Row Index": int(iidx),
-                    "Secondary Dataset": "QuickBooks Secondary (Historical)",
-                    "Secondary Row ID": qb_secondary.at[sidx, QB_ID],
-                    "Secondary Row Index": int(sidx),
-                    "Match Method": f"QuickBooks prior-period match ↔ Infinium primary | {group.method}",
-                    "Confidence": group.confidence,
-                    "Normalized PO": inf.at[iidx, NORM_PO],
-                    "Normalized Invoice": inf.at[iidx, NORM_INV],
-                    "Primary Amount": cents_to_float(primary_amount),
-                    "Secondary Amount": cents_to_float(secondary_amount),
-                    "Amount Difference": cents_to_float(primary_amount - secondary_amount),
-                    "Disposition": (
-                        "Infinium primary item cleared by the displayed QuickBooks "
-                        "prior-period match"
-                    ),
-                }
+            cleared_inf.update(int(idx) for idx in group.inf_rows)
+            append_clearance(
+                group,
+                inf,
+                qb_secondary,
+                group.inf_rows,
+                group.qb_rows,
+                "Infinium Primary",
+                "QuickBooks Secondary (Historical)",
+                INF_ID,
+                QB_ID,
+                "QuickBooks prior-period match ↔ Infinium primary",
+                (
+                    "Infinium primary item(s) cleared by the displayed QuickBooks "
+                    "prior-period item(s)"
+                ),
             )
 
-    for number, record in enumerate(records, 1):
-        record["Clearance ID"] = f"H-{number:06d}"
     clearances = pd.DataFrame(records, columns=HISTORICAL_CLEARANCE_COLUMNS)
     remaining_qb = sorted(set(unmatched_qb).difference(cleared_qb))
     remaining_inf = sorted(set(unmatched_inf).difference(cleared_inf))
@@ -538,24 +840,28 @@ def build_duplicate_analysis(
     historical_clearances: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Identify repeated accounting match keys in either source dataset."""
-    matched_qb = {idx for group in matches for idx in group.qb_rows}
-    matched_inf = {idx for group in matches for idx in group.inf_rows}
-    if historical_clearances is not None and not historical_clearances.empty:
+    matched_qb = set(_matched_row_indexes(matches, "QB"))
+    matched_inf = set(_matched_row_indexes(matches, "INF"))
+    if historical_clearances is not None:
         matched_qb.update(
-            int(idx)
-            for idx in historical_clearances.loc[
-                historical_clearances["Primary Dataset"].eq("QuickBooks Primary"),
+            _historical_row_indexes(
+                historical_clearances,
+                "QuickBooks Primary",
                 "Primary Row Index",
-            ]
+            )
         )
         matched_inf.update(
-            int(idx)
-            for idx in historical_clearances.loc[
-                historical_clearances["Primary Dataset"].eq("Infinium Primary"),
+            _historical_row_indexes(
+                historical_clearances,
+                "Infinium Primary",
                 "Primary Row Index",
-            ]
+            )
         )
     records: list[dict[str, Any]] = []
+    duplicate_indexes: dict[str, set[int]] = {
+        "QuickBooks": set(),
+        "Infinium": set(),
+    }
     for dataset, frame, id_column, matched_rows in (
         ("QuickBooks", qb, QB_ID, matched_qb),
         ("Infinium", inf, INF_ID, matched_inf),
@@ -571,6 +877,7 @@ def build_duplicate_analysis(
             work = work.loc[work.duplicated(subset=list(fields), keep=False)]
             if work.empty:
                 continue
+            duplicate_indexes[dataset].update(int(idx) for idx in work.index)
             grouped = work.groupby(list(fields), sort=True, dropna=False).agg(
                 occurrence_count=("__SOURCE_ID", "size"),
                 source_row_ids=("__SOURCE_ID", lambda values: "; ".join(values)),
@@ -601,7 +908,16 @@ def build_duplicate_analysis(
         "Dataset", "Duplicate Key Type", "Normalized PO", "Normalized Invoice",
         "Amount", "Occurrence Count", "Source Row IDs", "Reconciliation Status",
     ]
-    return pd.DataFrame(records, columns=columns)
+    result = pd.DataFrame(records, columns=columns)
+    result.attrs["duplicate_row_indexes"] = {
+        dataset: sorted(indexes)
+        for dataset, indexes in duplicate_indexes.items()
+    }
+    return result
+
+
+def _optional_index(value: Any) -> Optional[int]:
+    return None if value is None or pd.isna(value) else int(value)
 
 
 def build_paired_rows(
@@ -642,22 +958,26 @@ def build_paired_rows(
     if not historical_clearances.empty:
         for clearance in historical_clearances.to_dict("records"):
             primary_is_qb = clearance["Primary Dataset"] == "QuickBooks Primary"
+            primary_index = _optional_index(clearance["Primary Row Index"])
+            secondary_index = _optional_index(clearance["Secondary Row Index"])
+            qb_index = primary_index if primary_is_qb else secondary_index
+            inf_index = secondary_index if primary_is_qb else primary_index
             rows.append(
                 {
                     "Section": "01 Matched - Historical Clearance",
                     "Match ID": clearance["Clearance ID"],
                     "Match Result": clearance["Match Method"],
-                    "QB Index": (
-                        clearance["Primary Row Index"]
-                        if primary_is_qb else clearance["Secondary Row Index"]
+                    "QB Index": qb_index,
+                    "Infinium Index": inf_index,
+                    "QB Record Scope": (
+                        ("Primary" if primary_is_qb else "Historical")
+                        if qb_index is not None else None
                     ),
-                    "Infinium Index": (
-                        clearance["Secondary Row Index"]
-                        if primary_is_qb else clearance["Primary Row Index"]
+                    "Infinium Record Scope": (
+                        ("Historical" if primary_is_qb else "Primary")
+                        if inf_index is not None else None
                     ),
-                    "QB Record Scope": "Primary" if primary_is_qb else "Historical",
-                    "Infinium Record Scope": "Historical" if primary_is_qb else "Primary",
-                    "Group Sequence": 1,
+                    "Group Sequence": clearance.get("Group Sequence", 1),
                     "Confidence": clearance["Confidence"],
                     "Explanation": clearance["Disposition"],
                 }
@@ -750,8 +1070,8 @@ def build_match_assessments(
         i_po = {inf.at[idx, NORM_PO] for idx in group.inf_rows if inf.at[idx, NORM_PO]}
         q_inv = {qb.at[idx, NORM_INV] for idx in group.qb_rows if qb.at[idx, NORM_INV]}
         i_inv = {inf.at[idx, NORM_INV] for idx in group.inf_rows if inf.at[idx, NORM_INV]}
-        q_total = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in group.qb_rows)
-        i_total = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in group.inf_rows)
+        q_total = _amount_total(qb, group.qb_rows)
+        i_total = _amount_total(inf, group.inf_rows)
         records.append(
             {
                 "Match ID": group.match_id,
@@ -773,31 +1093,44 @@ def build_match_assessments(
             }
         )
     if not historical_clearances.empty:
-        for clearance in historical_clearances.to_dict("records"):
+        for _, clearance_group in historical_clearances.groupby(
+            "Clearance ID", sort=False, dropna=False
+        ):
+            clearance = clearance_group.iloc[0]
             primary_is_qb = clearance["Primary Dataset"] == "QuickBooks Primary"
+            primary_ids = [
+                str(value) for value in clearance_group["Primary Row ID"] if value
+            ]
+            secondary_ids = [
+                str(value) for value in clearance_group["Secondary Row ID"] if value
+            ]
+            primary_total = float(clearance_group["Primary Amount"].sum())
+            secondary_total = float(clearance_group["Secondary Amount"].sum())
             records.append(
                 {
                     "Match ID": clearance["Clearance ID"],
                     "Decision": "Matched - Historical Clearance",
                     "Match Method": clearance["Match Method"],
                     "Confidence": clearance["Confidence"],
-                    "QuickBooks Row Count": 1,
-                    "Infinium Row Count": 1,
-                    "QuickBooks Row IDs": (
-                        clearance["Primary Row ID"] if primary_is_qb
-                        else clearance["Secondary Row ID"]
+                    "QuickBooks Row Count": (
+                        len(primary_ids) if primary_is_qb else len(secondary_ids)
                     ),
-                    "Infinium Row IDs": (
-                        clearance["Secondary Row ID"] if primary_is_qb
-                        else clearance["Primary Row ID"]
+                    "Infinium Row Count": (
+                        len(secondary_ids) if primary_is_qb else len(primary_ids)
                     ),
-                    "PO Criterion": "Applied under strict historical pass",
-                    "Invoice Criterion": "Applied under strict historical pass",
+                    "QuickBooks Row IDs": "; ".join(
+                        primary_ids if primary_is_qb else secondary_ids
+                    ),
+                    "Infinium Row IDs": "; ".join(
+                        secondary_ids if primary_is_qb else primary_ids
+                    ),
+                    "PO Criterion": "Applied under controlled historical pass",
+                    "Invoice Criterion": "Applied under controlled historical pass",
                     "Signed Amount Criterion": "Agree",
-                    "QuickBooks Amount": clearance["Primary Amount"] if primary_is_qb else clearance["Secondary Amount"],
-                    "Infinium Amount": clearance["Secondary Amount"] if primary_is_qb else clearance["Primary Amount"],
-                    "Amount Difference": clearance["Amount Difference"],
-                    "Group-Level Match": False,
+                    "QuickBooks Amount": primary_total if primary_is_qb else secondary_total,
+                    "Infinium Amount": secondary_total if primary_is_qb else primary_total,
+                    "Amount Difference": float(clearance_group["Amount Difference"].sum()),
+                    "Group-Level Match": bool(clearance["Group-Level Match"]),
                     "Assessment Explanation": clearance["Disposition"],
                 }
             )
@@ -842,26 +1175,28 @@ def build_method_summary(
         bucket = buckets[group.method]
         bucket["QB Rows"] += len(group.qb_rows)
         bucket["Infinium Rows"] += len(group.inf_rows)
-        bucket["QB Cents"] += sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in group.qb_rows)
-        bucket["Infinium Cents"] += sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in group.inf_rows)
+        bucket["QB Cents"] += _amount_total(qb, group.qb_rows)
+        bucket["Infinium Cents"] += _amount_total(inf, group.inf_rows)
     if not historical_clearances.empty:
         for clearance in historical_clearances.to_dict("records"):
             bucket = buckets[str(clearance["Match Method"])]
             primary_cents = int(Decimal(str(clearance["Primary Amount"])) * 100)
             if clearance["Primary Dataset"] == "QuickBooks Primary":
-                bucket["QB Rows"] += 1
-                bucket["QB Cents"] += primary_cents
+                if _optional_index(clearance["Primary Row Index"]) is not None:
+                    bucket["QB Rows"] += 1
+                    bucket["QB Cents"] += primary_cents
             else:
-                bucket["Infinium Rows"] += 1
-                bucket["Infinium Cents"] += primary_cents
+                if _optional_index(clearance["Primary Row Index"]) is not None:
+                    bucket["Infinium Rows"] += 1
+                    bucket["Infinium Cents"] += primary_cents
     if unmatched_qb:
         bucket = buckets["Unmatched QuickBooks"]
         bucket["QB Rows"] = len(unmatched_qb)
-        bucket["QB Cents"] = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in unmatched_qb)
+        bucket["QB Cents"] = _amount_total(qb, unmatched_qb)
     if unmatched_inf:
         bucket = buckets["Unmatched Infinium"]
         bucket["Infinium Rows"] = len(unmatched_inf)
-        bucket["Infinium Cents"] = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in unmatched_inf)
+        bucket["Infinium Cents"] = _amount_total(inf, unmatched_inf)
     records = []
     for method, values in buckets.items():
         records.append(
@@ -936,7 +1271,7 @@ def build_exception_analysis(
                 "Analysis Type": "QuickBooks exceptions by source period",
                 "Dimension": label,
                 "Transaction Count": len(rows),
-                "Amount": cents_to_float(sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in rows)),
+                "Amount": cents_to_float(_amount_total(qb, rows)),
             }
         )
     reason_groups: dict[str, list[int]] = defaultdict(list)
@@ -948,7 +1283,7 @@ def build_exception_analysis(
                 "Analysis Type": "QuickBooks exceptions by reason",
                 "Dimension": reason,
                 "Transaction Count": len(rows),
-                "Amount": cents_to_float(sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in rows)),
+                "Amount": cents_to_float(_amount_total(qb, rows)),
             }
         )
     if unmatched_inf:
@@ -957,7 +1292,7 @@ def build_exception_analysis(
                 "Analysis Type": "Infinium exceptions",
                 "Dimension": "Unmatched Infinium",
                 "Transaction Count": len(unmatched_inf),
-                "Amount": cents_to_float(sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in unmatched_inf)),
+                "Amount": cents_to_float(_amount_total(inf, unmatched_inf)),
             }
         )
     return pd.DataFrame(records)
@@ -978,15 +1313,21 @@ def build_rules_and_config(
              "Requirement": "One unique remaining row per dataset; normalized PO and exact signed cents agree."},
             {"Priority": 3, "Rule": "Invoice + Amount", "Automatic": "Yes",
              "Requirement": "One unique remaining row per dataset; normalized invoice and exact signed cents agree."},
-            {"Priority": 4, "Rule": "Grouped transactions", "Automatic": "No",
-             "Requirement": "One-to-many, many-to-one, and many-to-many relationships remain unresolved."},
-            {"Priority": 5, "Rule": "Amount variance", "Automatic": "No",
+            {"Priority": 4, "Rule": "PO + Invoice + Aggregate Amount", "Automatic": "Yes, after one-to-one",
+             "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized PO and invoice and exact signed-cent totals agree."},
+            {"Priority": 5, "Rule": "PO + Aggregate Amount", "Automatic": "Yes, after one-to-one",
+             "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized PO and exact signed-cent totals agree."},
+            {"Priority": 6, "Rule": "Invoice + Aggregate Amount", "Automatic": "Yes, after one-to-one",
+             "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized invoice and exact signed-cent totals agree."},
+            {"Priority": 7, "Rule": "Ambiguous or many-to-many groups", "Automatic": "No",
+             "Requirement": "Overlapping combinations, many-to-many relationships, groups over the safety limits, and nonunique solutions remain unresolved."},
+            {"Priority": 8, "Rule": "Amount variance", "Automatic": "No",
              "Requirement": "Any nonzero cent difference is flagged as an exception; no tolerance is applied."},
-            {"Priority": 6, "Rule": "Fuzzy product classification", "Automatic": "No financial effect",
+            {"Priority": 9, "Rule": "Fuzzy product classification", "Automatic": "No financial effect",
              "Requirement": "Used only for Product Aggregate Summary; never determines transaction matching."},
-            {"Priority": 7, "Rule": "Secondary historical clearance", "Automatic": "Yes, second pass",
-             "Requirement": "After primary matching, a secondary row may clear one unresolved row from the opposing primary dataset using the same strict rules."},
-            {"Priority": 8, "Rule": "Unused secondary rows", "Automatic": "Excluded",
+            {"Priority": 10, "Rule": "Secondary historical clearance", "Automatic": "Yes, second pass",
+             "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence."},
+            {"Priority": 11, "Rule": "Unused secondary rows", "Automatic": "Excluded",
              "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
         ]
     )
@@ -1000,7 +1341,9 @@ def build_rules_and_config(
         {"Setting": "Infinium Filename", "Value": metadata["inf_filename"]},
         {"Setting": "Infinium SHA-256", "Value": metadata["inf_sha256"]},
         {"Setting": "Automatic Amount Tolerance", "Value": "$0.00; automatic matches require exact signed cents"},
-        {"Setting": "Match Cardinality", "Value": "Strict one-to-one only"},
+        {"Setting": "Match Cardinality", "Value": "One-to-one first; then unique one-to-many or many-to-one exact aggregates"},
+        {"Setting": "Maximum automatic grouped rows", "Value": MAX_GROUP_SIZE},
+        {"Setting": "Maximum rows evaluated per shared reference", "Value": MAX_GROUP_POOL_ROWS},
         {"Setting": "Selected Fiscal Year", "Value": metadata["fiscal_year"]},
         {"Setting": "Selected Fiscal Period", "Value": metadata["fiscal_period"]},
         {"Setting": "QuickBooks Secondary Filename", "Value": metadata.get("qb_secondary_filename") or "Not provided"},
@@ -1137,41 +1480,33 @@ def build_controls(
     unmatched_qb: list[int],
     unmatched_inf: list[int],
 ) -> pd.DataFrame:
-    matched_q = sorted({idx for group in matches for idx in group.qb_rows})
-    matched_i = sorted({idx for group in matches for idx in group.inf_rows})
-    qb_total = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in qb.index)
-    inf_total = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in inf.index)
-    matched_q_total = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in matched_q)
-    matched_i_total = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in matched_i)
-    historical_q_rows = (
-        historical_clearances.loc[
-            historical_clearances["Primary Dataset"].eq("QuickBooks Primary")
-        ]
-        if not historical_clearances.empty else historical_clearances
+    matched_q = _matched_row_indexes(matches, "QB")
+    matched_i = _matched_row_indexes(matches, "INF")
+    historical_q = _historical_row_indexes(
+        historical_clearances,
+        "QuickBooks Primary",
+        "Primary Row Index",
     )
-    historical_i_rows = (
-        historical_clearances.loc[
-            historical_clearances["Primary Dataset"].eq("Infinium Primary")
-        ]
-        if not historical_clearances.empty else historical_clearances
+    historical_i = _historical_row_indexes(
+        historical_clearances,
+        "Infinium Primary",
+        "Primary Row Index",
     )
-    historical_q_total = sum(
-        cents_or_zero(qb.at[int(idx), AMOUNT_CENTS])
-        for idx in historical_q_rows.get("Primary Row Index", pd.Series(dtype=int))
-    )
-    historical_i_total = sum(
-        cents_or_zero(inf.at[int(idx), AMOUNT_CENTS])
-        for idx in historical_i_rows.get("Primary Row Index", pd.Series(dtype=int))
-    )
-    unresolved_q_total = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in unmatched_qb)
-    unresolved_i_total = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in unmatched_inf)
+    qb_total = _amount_total(qb, qb.index)
+    inf_total = _amount_total(inf, inf.index)
+    matched_q_total = _amount_total(qb, matched_q)
+    matched_i_total = _amount_total(inf, matched_i)
+    historical_q_total = _amount_total(qb, historical_q)
+    historical_i_total = _amount_total(inf, historical_i)
+    unresolved_q_total = _amount_total(qb, unmatched_qb)
+    unresolved_i_total = _amount_total(inf, unmatched_inf)
     historical_difference = (
-        float(historical_clearances["Amount Difference"].sum())
+        round(float(historical_clearances["Amount Difference"].sum()), 2)
         if not historical_clearances.empty else 0.0
     )
     records = [
-        ("QuickBooks row completeness", len(qb), len(matched_q) + len(historical_q_rows) + len(unmatched_qb)),
-        ("Infinium row completeness", len(inf), len(matched_i) + len(historical_i_rows) + len(unmatched_inf)),
+        ("QuickBooks row completeness", len(qb), len(matched_q) + len(historical_q) + len(unmatched_qb)),
+        ("Infinium row completeness", len(inf), len(matched_i) + len(historical_i) + len(unmatched_inf)),
         ("QuickBooks amount roll-forward", cents_to_float(qb_total),
          cents_to_float(matched_q_total + historical_q_total + unresolved_q_total)),
         ("Infinium amount roll-forward", cents_to_float(inf_total),
@@ -1246,11 +1581,12 @@ def build_reconciliation(
         matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf
     )
     exception_analysis = build_exception_analysis(qb, inf, unmatched_qb, unmatched_inf, candidates)
-    duplicate_qb_rows = sorted(duplicate_row_indexes(qb))
-    duplicate_inf_rows = sorted(duplicate_row_indexes(inf))
     duplicate_analysis = build_duplicate_analysis(
         qb, inf, matches, historical_clearances
     )
+    duplicate_indexes = duplicate_analysis.attrs.get("duplicate_row_indexes", {})
+    duplicate_qb_rows = list(duplicate_indexes.get("QuickBooks", []))
+    duplicate_inf_rows = list(duplicate_indexes.get("Infinium", []))
     product_summary = build_product_summary(
         qb,
         qb_mapping,
@@ -1268,31 +1604,37 @@ def build_reconciliation(
         inf_secondary_mapping,
     )
 
-    matched_q = sorted({idx for group in matches for idx in group.qb_rows})
-    matched_i = sorted({idx for group in matches for idx in group.inf_rows})
-    qb_total_cents = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in qb.index)
-    historical_matched_q = sorted(
-        int(idx)
-        for idx in historical_clearances.loc[
-            historical_clearances["Primary Dataset"].eq("QuickBooks Primary"),
-            "Primary Row Index",
-        ].tolist()
-    ) if not historical_clearances.empty else []
-    historical_matched_i = sorted(
-        int(idx)
-        for idx in historical_clearances.loc[
-            historical_clearances["Primary Dataset"].eq("Infinium Primary"),
-            "Primary Row Index",
-        ].tolist()
-    ) if not historical_clearances.empty else []
-    inf_total_cents = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in inf.index)
-    unmatched_q_cents = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in unmatched_qb)
-    matched_q_cents = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in matched_q)
-    matched_i_cents = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in matched_i)
-    cleared_q_cents = sum(cents_or_zero(qb.at[idx, AMOUNT_CENTS]) for idx in historical_matched_q)
-    cleared_i_cents = sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in historical_matched_i)
-    qb_gross = sum(abs(cents_or_zero(qb.at[idx, AMOUNT_CENTS])) for idx in qb.index)
-    matched_q_gross = sum(abs(cents_or_zero(qb.at[idx, AMOUNT_CENTS])) for idx in matched_q)
+    matched_q = _matched_row_indexes(matches, "QB")
+    matched_i = _matched_row_indexes(matches, "INF")
+    historical_matched_q = _historical_row_indexes(
+        historical_clearances,
+        "QuickBooks Primary",
+        "Primary Row Index",
+    )
+    historical_matched_i = _historical_row_indexes(
+        historical_clearances,
+        "Infinium Primary",
+        "Primary Row Index",
+    )
+    qb_secondary_used = _historical_row_indexes(
+        historical_clearances,
+        "Infinium Primary",
+        "Secondary Row Index",
+    )
+    inf_secondary_used = _historical_row_indexes(
+        historical_clearances,
+        "QuickBooks Primary",
+        "Secondary Row Index",
+    )
+    qb_total_cents = _amount_total(qb, qb.index)
+    inf_total_cents = _amount_total(inf, inf.index)
+    unmatched_q_cents = _amount_total(qb, unmatched_qb)
+    matched_q_cents = _amount_total(qb, matched_q)
+    matched_i_cents = _amount_total(inf, matched_i)
+    cleared_q_cents = _amount_total(qb, historical_matched_q)
+    cleared_i_cents = _amount_total(inf, historical_matched_i)
+    qb_gross = _gross_amount_total(qb, qb.index)
+    matched_q_gross = _gross_amount_total(qb, matched_q)
     metrics = {
         "QuickBooks Rows": len(qb),
         "Infinium Rows": len(inf),
@@ -1306,28 +1648,29 @@ def build_reconciliation(
         "Matched Amount Difference": cents_to_float(matched_q_cents - matched_i_cents),
         "Historical QuickBooks Rows Cleared": len(historical_matched_q),
         "Historical Infinium Rows Cleared": len(historical_matched_i),
-        "Historical Clearances": len(historical_clearances),
+        "Historical Clearances": (
+            int(historical_clearances["Clearance ID"].nunique())
+            if not historical_clearances.empty else 0
+        ),
         "QuickBooks Secondary Rows": len(qb_secondary) if qb_secondary is not None else 0,
-        "QuickBooks Secondary Rows Used": len(historical_matched_i),
+        "QuickBooks Secondary Rows Used": len(qb_secondary_used),
         "QuickBooks Secondary Rows Ignored": (
-            len(qb_secondary) - len(historical_matched_i) if qb_secondary is not None else 0
+            len(qb_secondary) - len(qb_secondary_used) if qb_secondary is not None else 0
         ),
         "Infinium Secondary Rows": len(inf_secondary) if inf_secondary is not None else 0,
-        "Infinium Secondary Rows Used": len(historical_matched_q),
+        "Infinium Secondary Rows Used": len(inf_secondary_used),
         "Infinium Secondary Rows Ignored": (
-            len(inf_secondary) - len(historical_matched_q) if inf_secondary is not None else 0
+            len(inf_secondary) - len(inf_secondary_used) if inf_secondary is not None else 0
         ),
         "Unresolved QuickBooks Rows": len(unmatched_qb),
         "Unresolved QuickBooks Amount": cents_to_float(unmatched_q_cents),
         "Unmatched Infinium Rows": len(unmatched_inf),
-        "Unmatched Infinium Amount": cents_to_float(
-            sum(cents_or_zero(inf.at[idx, AMOUNT_CENTS]) for idx in unmatched_inf)
-        ),
+        "Unmatched Infinium Amount": cents_to_float(_amount_total(inf, unmatched_inf)),
         "QuickBooks Match Rate by Row": (
             (len(matched_q) + len(historical_matched_q)) / len(qb) if len(qb) else 0
         ),
         "QuickBooks Match Rate by Gross Amount": (
-            (matched_q_gross + sum(abs(cents_or_zero(qb.at[idx, AMOUNT_CENTS])) for idx in historical_matched_q))
+            (matched_q_gross + _gross_amount_total(qb, historical_matched_q))
             / qb_gross if qb_gross else 0
         ),
         "Invalid QuickBooks Amounts": int(qb[AMOUNT_CENTS].isna().sum()),
@@ -1380,18 +1723,67 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
     if result.controls["Status"].ne("PASS").any():
         failures = result.controls.loc[result.controls["Status"] != "PASS", "Check"].tolist()
         raise ValueError(f"Reconciliation control failure: {', '.join(failures)}")
-    if any(len(group.qb_rows) != 1 or len(group.inf_rows) != 1 for group in result.matches):
-        raise ValueError("Strict matching control failure: every accepted match must be one-to-one.")
+    for group in result.matches:
+        q_count = len(group.qb_rows)
+        i_count = len(group.inf_rows)
+        if group.group_level:
+            if not (
+                (q_count == 1 and 2 <= i_count <= MAX_GROUP_SIZE)
+                or (i_count == 1 and 2 <= q_count <= MAX_GROUP_SIZE)
+            ):
+                raise ValueError(
+                    "Grouped matching control failure: only bounded one-to-many "
+                    "or many-to-one relationships are permitted."
+                )
+        elif q_count != 1 or i_count != 1:
+            raise ValueError(
+                "One-to-one matching control failure: a non-group match has "
+                "unexpected cardinality."
+            )
+        q_total = _amount_total(result.qb_work, group.qb_rows)
+        i_total = _amount_total(result.inf_work, group.inf_rows)
+        if q_total != i_total:
+            raise ValueError(
+                "Matching control failure: accepted relationship totals do not agree."
+            )
     if not result.historical_clearances.empty:
-        if result.historical_clearances["Amount Difference"].ne(0).any():
-            raise ValueError("Historical clearance control failure: signed amounts must agree exactly.")
-        if result.historical_clearances["Primary Row ID"].duplicated().any():
+        clearance_differences = result.historical_clearances.groupby(
+            "Clearance ID", sort=False
+        )["Amount Difference"].sum().round(2)
+        if clearance_differences.ne(0).any():
+            raise ValueError(
+                "Historical clearance control failure: aggregate signed amounts "
+                "must agree exactly."
+            )
+        primary_rows = result.historical_clearances.loc[
+            result.historical_clearances["Primary Row Index"].notna(),
+            ["Primary Dataset", "Primary Row Index"],
+        ]
+        if primary_rows.duplicated().any():
             raise ValueError("Historical clearance control failure: a primary row was cleared more than once.")
-        duplicate_secondary = result.historical_clearances.duplicated(
-            subset=["Secondary Dataset", "Secondary Row ID"]
-        )
-        if duplicate_secondary.any():
+        secondary_rows = result.historical_clearances.loc[
+            result.historical_clearances["Secondary Row Index"].notna(),
+            ["Secondary Dataset", "Secondary Row Index"],
+        ]
+        if secondary_rows.duplicated().any():
             raise ValueError("Historical clearance control failure: a secondary row was used more than once.")
+        for _, clearance in result.historical_clearances.groupby(
+            "Clearance ID", sort=False
+        ):
+            primary_count = int(clearance["Primary Row Index"].notna().sum())
+            secondary_count = int(clearance["Secondary Row Index"].notna().sum())
+            group_level = bool(clearance["Group-Level Match"].iloc[0])
+            if group_level and not (
+                (primary_count == 1 and 2 <= secondary_count <= MAX_GROUP_SIZE)
+                or (secondary_count == 1 and 2 <= primary_count <= MAX_GROUP_SIZE)
+            ):
+                raise ValueError(
+                    "Historical grouped clearance has invalid cardinality."
+                )
+            if not group_level and (primary_count != 1 or secondary_count != 1):
+                raise ValueError(
+                    "Historical one-to-one clearance has invalid cardinality."
+                )
     qb_occurrences = Counter(
         row["QB Index"]
         for row in result.paired_rows
