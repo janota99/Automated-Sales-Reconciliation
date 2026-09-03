@@ -749,3 +749,16 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.source-status.complete)
         align-items: center;
     }
 }
+[data-testid="stTabs"] button[role="tab"],
+[data-testid="stTabs"] button[role="tab"] p,
+[data-testid="stTabs"] button[role="tab"] span {
+    color: var(--rec-text-secondary) !important;
+    font-weight: 650 !important;
+}
+
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"],
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p,
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] span {
+    color: var(--rec-navy) !important;
+    font-weight: 800 !important;
+}
