@@ -10,6 +10,7 @@ builders from the Downloads tab and displays the result.
 from __future__ import annotations
 
 import html
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,6 +20,32 @@ import streamlit as st
 from matching import QB_ID, ReconciliationResult, numeric_sum
 from utils import format_currency
 from workpapers import build_analytics_workbook, build_primary_workbook, paired_display_frames
+
+
+def _render_workbook_exception(label: str, exc: Exception) -> None:
+    """Show a concise failure plus reproducible module/version diagnostics."""
+    import excel_styles
+    import openpyxl
+    import workpapers
+
+    st.error(f"The {label} could not be prepared: {exc}")
+    details = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    )
+    with st.expander("Technical details", expanded=True):
+        st.code(
+            "\n".join(
+                [
+                    f"OpenPyXL version: {openpyxl.__version__}",
+                    f"OpenPyXL loaded from: {Path(openpyxl.__file__).resolve()}",
+                    f"workpapers.py loaded from: {Path(workpapers.__file__).resolve()}",
+                    f"excel_styles.py loaded from: {Path(excel_styles.__file__).resolve()}",
+                    "",
+                    details,
+                ]
+            ),
+            language="text",
+        )
 
 
 def load_app_css() -> None:
@@ -47,6 +74,45 @@ def render_kpi(label: str, value: str, subtitle: str = "") -> None:
             <div class="rec-kpi-sub">{subtitle}</div>
         </div>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_heading(title: str, subtitle: str = "") -> None:
+    """Render a consistent section heading with restrained supporting copy."""
+    subtitle_markup = (
+        f'<p class="rec-section-subtitle">{html.escape(subtitle)}</p>'
+        if subtitle else ""
+    )
+    st.markdown(
+        f'<div class="rec-section-heading">'
+        f'<h2>{html.escape(title)}</h2>'
+        f'{subtitle_markup}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_notice_panel(
+    title: str,
+    body: str,
+    *,
+    tone: str = "info",
+    icon: str = "i",
+    body_is_html: bool = False,
+) -> None:
+    """Render a neutral notice panel with a restrained semantic accent."""
+    allowed_tones = {"info", "success", "warning", "danger"}
+    safe_tone = tone if tone in allowed_tones else "info"
+    body_markup = body if body_is_html else html.escape(body)
+    st.markdown(
+        f'<div class="notice-panel {safe_tone}">'
+        f'<div class="notice-icon" aria-hidden="true">{html.escape(icon)}</div>'
+        f'<div class="notice-content">'
+        f'<div class="notice-title">{html.escape(title)}</div>'
+        f'<div class="notice-body">{body_markup}</div>'
+        f'</div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
@@ -94,33 +160,51 @@ def attention_tab_label(label: str, count: int) -> str:
     return f"{label} ({count:,})" if count > 0 else label
 
 
-def render_source_status(filename: Optional[str], next_step: str) -> None:
-    """Renders the file ingestion status directly beneath the file uploader in the main interface."""
+def render_source_status(
+    filename: Optional[str],
+    next_step: str,
+    *,
+    pending: bool = False,
+) -> None:
+    """Render file state and expose a stable hook for compact loaded cards."""
     if filename:
         st.markdown(
-            f'<div class="source-status complete">Loaded: {html.escape(filename)}</div>',
+            f'<div class="source-status complete"><span class="status-dot"></span>'
+            f'<span>Loaded: {html.escape(filename)}</span></div>',
             unsafe_allow_html=True,
         )
     else:
+        status_class = "pending" if pending else "active"
         st.markdown(
-            f'<div class="source-status active">Current step: {next_step}</div>',
+            f'<div class="source-status {status_class}"><span class="status-dot"></span>'
+            f'<span>{html.escape(next_step)}</span></div>',
             unsafe_allow_html=True,
         )
 
 
 def render_upload_source_heading(
-    step: int,
     label: str,
     logo_uri: str,
     logo_class: str,
+    *,
+    context: str = "Data source",
+    required: bool = False,
 ) -> None:
-    """Renders the file upload headings in the main interface columns."""
+    """Render an integrated brand heading for an upload card."""
+    requirement = (
+        '<span class="upload-requirement required">Required</span>'
+        if required else '<span class="upload-requirement optional">Optional</span>'
+    )
     st.markdown(
         f'<div class="upload-source-heading">'
-        f'<div class="upload-source-copy"><span class="upload-step-number">{step}</span>'
-        f'<span class="upload-source-title">{html.escape(label)}</span></div>'
+        f'<div class="upload-brand-group">'
         f'<img class="upload-source-logo {html.escape(logo_class)}" '
-        f'src="{logo_uri}" alt="{html.escape(label)} logo">'
+        f'src="{html.escape(logo_uri, quote=True)}" alt="{html.escape(label)} logo">'
+        f'<div class="upload-source-copy">'
+        f'<span class="upload-source-context">{html.escape(context)}</span>'
+        f'<span class="upload-source-title">{html.escape(label)}</span>'
+        f'</div></div>'
+        f'{requirement}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -162,18 +246,21 @@ def render_ingestion_flow(
         (3, "Run Reconciliation", step3_status, step3_class),
         (4, "Review Results", step4_status, step4_class),
     ]
-    # Keep this markup on one physical line. Markdown treats indented HTML
-    # after a blank line as a code block, which previously rendered card 1 but
-    # displayed cards 2-4 as literal <div> text.
-    cards = "".join(
-        f'<div class="ingestion-step {css_class}">'
-        f'<span class="ingestion-number">{number}</span>'
-        f'<span class="ingestion-title">{title}</span>'
-        f'<div class="ingestion-status">{status}</div>'
+    items = "".join(
+        f'<div class="stepper-item {css_class}">'
+        f'<span class="stepper-node">{"✓" if css_class == "complete" else number}</span>'
+        f'<span class="stepper-copy">'
+        f'<span class="stepper-title">{html.escape(title)}</span>'
+        f'<span class="stepper-status">{html.escape(status)}</span>'
+        f'</span>'
         f'</div>'
         for number, title, status, css_class in steps
     )
-    flow_html = f'<div class="ingestion-flow">{cards}</div>'
+    flow_html = (
+        f'<nav class="rec-stepper" aria-label="Reconciliation progress">'
+        f'{items}'
+        f'</nav>'
+    )
     st.markdown(flow_html, unsafe_allow_html=True)
 
 
@@ -185,7 +272,10 @@ def render_pre_execution_controls(
 ) -> None:
     qb_total = numeric_sum(qb_raw[qb_mapping["amount"]])
     inf_total = numeric_sum(inf_raw[inf_mapping["amount"]])
-    st.subheader("Source verification")
+    render_section_heading(
+        "Source verification",
+        "Confirm the retained row counts and source totals before running the reconciliation.",
+    )
     cols = st.columns(4)
     with cols[0]:
         render_kpi("QuickBooks rows", f"{len(qb_raw):,}", format_currency(qb_total))
@@ -265,11 +355,16 @@ def render_result(result: ReconciliationResult) -> None:
         st.markdown("#### Required controls")
         st.dataframe(result.controls, use_container_width=True, hide_index=True)
         if metrics.get("Historical Clearances", 0):
-            st.info(
-                f"Historical secondary data cleared {metrics['Historical Clearances']:,} opposing-primary "
-                "exception item(s). "
-                f"{metrics['QuickBooks Secondary Rows Ignored'] + metrics['Infinium Secondary Rows Ignored']:,} "
-                "unused secondary row(s) were excluded from exception reporting."
+            render_notice_panel(
+                "Historical timing differences cleared",
+                (
+                    f"Historical secondary data cleared {metrics['Historical Clearances']:,} "
+                    "opposing-primary exception item(s). "
+                    f"{metrics['QuickBooks Secondary Rows Ignored'] + metrics['Infinium Secondary Rows Ignored']:,} "
+                    "unused secondary row(s) were excluded from exception reporting."
+                ),
+                tone="success",
+                icon="✓",
             )
         if metrics["Invalid QuickBooks Amounts"] or metrics["Invalid Infinium Amounts"]:
             st.markdown(
@@ -337,7 +432,7 @@ def render_result(result: ReconciliationResult) -> None:
                         st.session_state.primary_workbook = build_primary_workbook(result)
                     st.toast("Accounting workpaper prepared.", icon="✅")
                 except Exception as exc:
-                    st.error(f"The accounting workpaper could not be prepared: {exc}")
+                    _render_workbook_exception("accounting workpaper", exc)
         if "primary_workbook" in st.session_state:
             st.download_button(
                 "Download Sales Reconciliation",
@@ -360,7 +455,7 @@ def render_result(result: ReconciliationResult) -> None:
                         st.session_state.analytics_workbook = build_analytics_workbook(result)
                     st.toast("Analytics workbook prepared.", icon="✅")
                 except Exception as exc:
-                    st.error(f"The analytics workbook could not be prepared: {exc}")
+                    _render_workbook_exception("analytics workbook", exc)
         if "analytics_workbook" in st.session_state:
             st.download_button(
                 "Download Reconciliation Analytics",

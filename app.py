@@ -28,8 +28,10 @@ The app produces two files from one controlled reconciliation run:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Any, Dict
 
 import pandas as pd
@@ -51,14 +53,67 @@ from matching import APP_VERSION, MATCHING_RULE_VERSION, build_reconciliation
 from ui_components import (
     load_app_css,
     render_ingestion_flow,
+    render_notice_panel,
     render_pre_execution_controls,
     render_result,
+    render_section_heading,
     render_source_status,
     render_upload_source_heading,
     show_toast_once,
 )
 from utils import clear_results_if_signature_changed, format_central_timestamp, run_id_for_inputs
 from assets.ui_assets import INFOR_LOGO_URI, QUICKBOOKS_LOGO_URI
+
+
+PPL_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "ppl_logo.jpg"
+
+
+def _resolve_ppl_logo_path() -> Optional[Path]:
+    """Find the brand image without depending on filename capitalization."""
+    if PPL_LOGO_PATH.is_file():
+        return PPL_LOGO_PATH
+
+    assets_dir = PPL_LOGO_PATH.parent
+    if not assets_dir.is_dir():
+        return None
+
+    supported_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+    for candidate in sorted(assets_dir.iterdir()):
+        if (
+            candidate.is_file()
+            and candidate.name.casefold().startswith("ppl_logo")
+            and candidate.suffix.casefold() in supported_suffixes
+        ):
+            return candidate
+    return None
+
+
+def _render_sidebar_brand() -> None:
+    """Render the sidebar logo in a high-contrast branded panel."""
+    logo_path = _resolve_ppl_logo_path()
+    if logo_path is None:
+        st.sidebar.warning(
+            "Logo not found. Expected an image named ppl_logo.jpg in the assets folder."
+        )
+        return
+
+    try:
+        logo_bytes = logo_path.read_bytes()
+        encoded_logo = base64.b64encode(logo_bytes).decode("ascii")
+        mime_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }.get(logo_path.suffix.casefold(), "image/png")
+        st.sidebar.markdown(
+            f'<div class="sidebar-brand-panel">'
+            f'<img src="data:{mime_type};base64,{encoded_logo}" '
+            f'alt="Panhandle Pure logo">'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    except (OSError, ValueError) as exc:
+        st.sidebar.warning(f"The logo file could not be displayed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -103,96 +158,145 @@ def cached_fiscal_period_column_profile(series: pd.Series) -> tuple[int, int, bo
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    st.set_page_config(page_title="Sales Reconciliation", layout="wide")
+    st.set_page_config(page_title="Panhandle Pure Sales Reconciliation", layout="wide")
     load_app_css()
     st.markdown(
         """
         <div class="rec-title">
-            <h1>Sales Reconciliation</h1>
+            <h1>Panhandle Pure Sales Reconciliation</h1>
             <p>QuickBooks-to-Infinium matching, data summarization, and reconciliation analytics</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Empty container placed at the top so we can dynamically inject the final ingestion flow state
+    # Keep the single progress indicator above every upload control even though
+    # its final state is determined later in the application run.
     progress_container = st.container()
 
-    st.markdown("### Upload Data Sources")
-    upload_col1, upload_col2 = st.columns(2)
+    render_section_heading(
+        "Upload data sources",
+        "Add the two current-period exports required for reconciliation.",
+    )
+    upload_col1, upload_col2 = st.columns(2, gap="large")
 
     with upload_col1:
-        render_upload_source_heading(1, "Import QuickBooks file", QUICKBOOKS_LOGO_URI, "quickbooks")
-        qb_file = st.file_uploader(
-            "Primary QuickBooks import",
-            type=["xlsx", "csv"],
-            key="qb_file",
-            help="Current QuickBooks sales import used as a primary reconciliation source.",
-        )
-        render_source_status(qb_file.name if qb_file else None, "Upload the QuickBooks import")
-
-    with upload_col2:
-        render_upload_source_heading(2, "Import Infinium file", INFOR_LOGO_URI, "infor")
-        inf_file = st.file_uploader(
-            "Primary Infinium import",
-            type=["xlsx", "csv"],
-            key="inf_file",
-            help="Current Infinium sales import used as a primary reconciliation source.",
-        )
-        if inf_file:
-            render_source_status(inf_file.name, "")
-        elif qb_file:
-            render_source_status(None, "Upload the Infinium import")
-        else:
+        with st.container(border=True):
+            render_upload_source_heading(
+                "QuickBooks sales export",
+                QUICKBOOKS_LOGO_URI,
+                "quickbooks",
+                context="Primary source",
+                required=True,
+            )
             st.markdown(
-                '<div class="source-status pending">Upcoming: Infinium upload</div>',
+                '<p class="upload-card-copy">Current-period sales detail used as the QuickBooks side of the reconciliation.</p>',
                 unsafe_allow_html=True,
             )
+            qb_file = st.file_uploader(
+                "Upload primary QuickBooks sales data",
+                type=["xlsx", "csv"],
+                key="qb_file",
+                help="Drag and drop or click to upload the current QuickBooks sales export.",
+                label_visibility="collapsed",
+            )
+            render_source_status(
+                qb_file.name if qb_file else None,
+                "Awaiting QuickBooks file",
+            )
 
-    qb_secondary_file = None
-    inf_secondary_file = None
+    with upload_col2:
+        with st.container(border=True):
+            render_upload_source_heading(
+                "Infinium sales export",
+                INFOR_LOGO_URI,
+                "infor",
+                context="Primary source",
+                required=True,
+            )
+            st.markdown(
+                '<p class="upload-card-copy">Current-period sales detail used as the Infinium side of the reconciliation.</p>',
+                unsafe_allow_html=True,
+            )
+            inf_file = st.file_uploader(
+                "Upload primary Infinium sales data",
+                type=["xlsx", "csv"],
+                key="inf_file",
+                help="Drag and drop or click to upload the current Infinium sales export.",
+                label_visibility="collapsed",
+            )
+            render_source_status(
+                inf_file.name if inf_file else None,
+                "Awaiting Infinium file" if qb_file else "Available after QuickBooks",
+                pending=not qb_file and not inf_file,
+            )
+
+    # These variables must exist on every Streamlit rerun, including before
+    # both primary files have been uploaded.
+    qb_secondary_file: Optional[Any] = None
+    inf_secondary_file: Optional[Any] = None
 
     if qb_file and inf_file:
-        st.markdown("<br>\n\n### Optional Historical / Secondary Data", unsafe_allow_html=True)
-        st.caption(
-            "Optional historical files are background matching data only. They may "
-            "clear timing differences in the opposing primary file, but unused rows "
-            "will never generate exceptions or appear as reconciliation items."
+        st.markdown('<div class="section-spacer"></div>', unsafe_allow_html=True)
+        render_section_heading(
+            "Optional historical data",
+            "Use prior-period files only to clear timing differences in the opposing primary source. Unused historical rows remain background data.",
         )
-        sec_col1, sec_col2 = st.columns(2)
+        sec_col1, sec_col2 = st.columns(2, gap="large")
 
         with sec_col1:
-            qb_secondary_file = st.file_uploader(
-                "Historical QuickBooks data",
-                type=["xlsx", "csv"],
-                key="qb_secondary_file",
-                help=(
-                    "Used only to match and clear unresolved items from the primary "
-                    "Infinium upload. Unused QuickBooks historical rows are ignored."
-                ),
-            )
-            if qb_secondary_file:
-                render_source_status(qb_secondary_file.name, "")
+            with st.container(border=True):
+                render_upload_source_heading(
+                    "Historical QuickBooks",
+                    QUICKBOOKS_LOGO_URI,
+                    "quickbooks",
+                    context="Optional prior-period source",
+                )
+                st.markdown(
+                    '<p class="upload-card-copy">May clear unresolved primary Infinium items; unused rows are excluded.</p>',
+                    unsafe_allow_html=True,
+                )
+                qb_secondary_file = st.file_uploader(
+                    "Upload historical QuickBooks data",
+                    type=["xlsx", "csv"],
+                    key="qb_secondary_file",
+                    help="Drag and drop or click to upload optional historical QuickBooks data.",
+                    label_visibility="collapsed",
+                )
+                if qb_secondary_file:
+                    render_source_status(qb_secondary_file.name, "")
 
         with sec_col2:
-            inf_secondary_file = st.file_uploader(
-                "Historical Infinium data",
-                type=["xlsx", "csv"],
-                key="inf_secondary_file",
-                help=(
-                    "Used only to match and clear unresolved items from the primary "
-                    "QuickBooks upload. Unused Infinium historical rows are ignored."
-                ),
-            )
-            if inf_secondary_file:
-                render_source_status(inf_secondary_file.name, "")
+            with st.container(border=True):
+                render_upload_source_heading(
+                    "Historical Infinium",
+                    INFOR_LOGO_URI,
+                    "infor",
+                    context="Optional prior-period source",
+                )
+                st.markdown(
+                    '<p class="upload-card-copy">May clear unresolved primary QuickBooks items; unused rows are excluded.</p>',
+                    unsafe_allow_html=True,
+                )
+                inf_secondary_file = st.file_uploader(
+                    "Upload historical Infinium data",
+                    type=["xlsx", "csv"],
+                    key="inf_secondary_file",
+                    help="Drag and drop or click to upload optional historical Infinium data.",
+                    label_visibility="collapsed",
+                )
+                if inf_secondary_file:
+                    render_source_status(inf_secondary_file.name, "")
 
-    st.markdown("---")
+    st.markdown('<div class="major-section-gap"></div>', unsafe_allow_html=True)
+
+    # Keep branding above the configuration controls.
+    _render_sidebar_brand()
 
     # Shift configuration cleanly into the sidebar
     st.sidebar.markdown("## Configuration Settings")
 
-    if not qb_file or not inf_file:
+    if qb_file is None or inf_file is None:
         for state_key in ("reconciliation_result", "primary_workbook", "analytics_workbook"):
             st.session_state.pop(state_key, None)
 
@@ -205,25 +309,44 @@ def main() -> None:
             )
 
         next_source = "Infinium" if qb_file else "QuickBooks"
-        st.info(
-            f"**Action Required:** Upload Panhandle Pure {next_source} sales export to continue. "
-            "Files are processed locally in the running application session."
+        render_notice_panel(
+            "Action required",
+            f"Upload the Panhandle Pure {next_source} sales export to continue. Files are processed within the active application session.",
+            tone="info",
+            icon="→",
         )
 
-        st.success(
-            "**Automatic matching sequence**\n\n"
-            "1. **Unique PO + invoice + exact signed amount**\n"
-            "2. **Unique PO + exact signed amount**\n"
-            "3. **Unique invoice + exact signed amount**\n\n"
-            "---\n"
-            "Every accepted match is one-to-one. Grouped relationships, amount differences of any size, "
-            "multiple candidates, and invalid amounts remain unresolved for review."
+        render_notice_panel(
+            "Automatic matching sequence",
+            (
+                '<ol class="notice-rule-list">'
+                '<li>Unique PO + invoice + exact signed amount</li>'
+                '<li>Unique PO + exact signed amount</li>'
+                '<li>Unique invoice + exact signed amount</li>'
+                '<li>Unique grouped aggregate by PO and/or invoice after one-to-one matching</li>'
+                '</ol>'
+                '<p class="notice-footnote">Amounts must agree exactly to the signed cent. Ambiguous combinations and invalid values remain unresolved for review.</p>'
+            ),
+            tone="success",
+            icon="✓",
+            body_is_html=True,
         )
         return
 
-    qb_bytes, inf_bytes = qb_file.getvalue(), inf_file.getvalue()
-    qb_secondary_bytes = qb_secondary_file.getvalue() if qb_secondary_file else None
-    inf_secondary_bytes = inf_secondary_file.getvalue() if inf_secondary_file else None
+    # The guard above guarantees that both required UploadedFile objects are
+    # available before any attempt is made to read their bytes.
+    qb_bytes = qb_file.getvalue()
+    inf_bytes = inf_file.getvalue()
+    qb_secondary_bytes = (
+        qb_secondary_file.getvalue()
+        if qb_secondary_file is not None
+        else None
+    )
+    inf_secondary_bytes = (
+        inf_secondary_file.getvalue()
+        if inf_secondary_file is not None
+        else None
+    )
     
     qb_hash = get_true_file_hash(qb_file)
     inf_hash = get_true_file_hash(inf_file)
@@ -552,8 +675,11 @@ def main() -> None:
             "Source validation failed. Correct the selected header row, required mappings, or malformed source data before matching."
         )
     elif validation_warnings:
-        st.info(
-            f"Source validation passed with {validation_warnings:,} review warning(s). Harmless blank columns and repeated header rows were ignored."
+        render_notice_panel(
+            "Validation completed with review items",
+            f"Source validation passed with {validation_warnings:,} review warning(s). Harmless blank columns and repeated header rows were ignored.",
+            tone="warning",
+            icon="!",
         )
     else:
         show_toast_once(

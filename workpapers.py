@@ -393,7 +393,6 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
                 name="Segoe UI", size=10, bold=True, color=TEAL
             )
         ws.cell(row, match_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        ws.row_dimensions[row].height = 30 if "group-level" in str(record["Match Result"]) else 21
 
     total_row = final_data_row + 1
     _write_total_row(ws, total_row, qb_start, qb_end,
@@ -717,11 +716,91 @@ def build_product_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     _prepare_sheet(ws, landscape=False)
 
 
-def _save_workbook_bytes(wb: Workbook) -> bytes:
+def _autofit_workbook_rows(wb: Workbook) -> None:
+    """
+    Dynamically calculates and explicitly sets row heights based on text wrapping 
+    and column widths. This forces Excel to auto-expand rows even when the 
+    workbook opens in Protected View.
+    """
+    for ws in wb.worksheets:
+        # Capture custom column widths to estimate text wrapping constraints
+        col_widths = {}
+        for col_letter, dim in ws.column_dimensions.items():
+            col_widths[col_letter] = dim.width or 15
+
+        for row in ws.iter_rows():
+            max_lines = 1
+            row_idx = row[0].row
+
+            # Row 2 is a controlled report caption band. Do not let its long
+            # merged-cell text enter the generic wrapping calculation, which
+            # can otherwise expand it to several times the requested height.
+            if row_idx == 2:
+                ws.row_dimensions[row_idx].height = (
+                    60 if ws.title == "Product Aggregate Summary" else 15
+                )
+                continue
+
+            for cell in row:
+                text = str(cell.value) if cell.value is not None else ""
+                if not text:
+                    continue
+
+                # Estimate character capacity based on column width
+                col_width = col_widths.get(cell.column_letter, 15)
+                # Approximation: ~1.1 to 1.2 chars fit per Excel width unit (10pt font)
+                chars_per_line = max(int(col_width * 1.1), 10)
+
+                cell_lines = 0
+                for line in text.split("\n"):
+                    # Calculate how many times this line will wrap
+                    cell_lines += max(1, (len(line) // chars_per_line) + 1)
+                
+                if cell_lines > max_lines:
+                    max_lines = cell_lines
+
+                # Enable wrap_text for cells taking up multiple lines
+                if cell_lines > 1:
+                    curr_align = cell.alignment
+                    if not curr_align or not curr_align.wrap_text:
+                        cell.alignment = Alignment(
+                            horizontal=curr_align.horizontal if curr_align else "left",
+                            vertical=curr_align.vertical if curr_align else "center",
+                            wrap_text=True,
+                            shrink_to_fit=curr_align.shrink_to_fit if curr_align else False,
+                            indent=curr_align.indent if curr_align else 0
+                        )
+
+            # Assign row height. (15 points per line is standard padding)
+            if max_lines > 1:
+                ws.row_dimensions[row_idx].height = max_lines * 15
+            elif row_idx in ws.row_dimensions:
+                # Let Excel manage the single-line rows natively
+                ws.row_dimensions[row_idx].height = None
+                
+
+def _apply_accountant_output_row_heights(wb: Workbook) -> None:
+    """Apply the controlled row-two presentation required by the workpaper."""
+    for ws in wb.worksheets:
+        ws.row_dimensions[2].height = (
+            60 if ws.title == "Product Aggregate Summary" else 15
+        )
+
+
+def _save_workbook_bytes(
+    wb: Workbook,
+    *,
+    apply_accountant_row_heights: bool = False,
+) -> bytes:
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.calculation.calcMode = "auto"
     _autofit_workbook_columns(wb)
+    _autofit_workbook_rows(wb)  # Dynamically auto-expand the row heights
+    # Apply fixed reporting requirements after autofit so they cannot be
+    # overwritten by content-dependent height calculations.
+    if apply_accountant_row_heights:
+        _apply_accountant_output_row_heights(wb)
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
@@ -761,7 +840,7 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     build_unresolved_sheet(wb, result)
     build_product_sheet(wb, result)
     _apply_workbook_run_metadata(wb, result)
-    return _save_workbook_bytes(wb)
+    return _save_workbook_bytes(wb, apply_accountant_row_heights=True)
 
 
 def detailed_ledger_dataframe(result: ReconciliationResult) -> pd.DataFrame:
@@ -835,7 +914,6 @@ def _add_standard_data_sheet(
             ws.column_dimensions[get_column_letter(col)].width = 42
             for row in range(4, 4 + len(frame)):
                 ws.cell(row, col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-                ws.row_dimensions[row].height = max(ws.row_dimensions[row].height or 20, 32)
     ws.freeze_panes = "A4"
     if len(frame):
         ws.auto_filter.ref = f"A3:{get_column_letter(len(frame.columns))}{3 + len(frame)}"
