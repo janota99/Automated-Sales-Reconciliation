@@ -182,6 +182,37 @@ def render_source_status(
         )
 
 
+def render_dataset_summary(summary: dict[str, Any]) -> None:
+    """Render a compact, pre-reconciliation summary for an uploaded dataset."""
+    items = [
+        ("Rows", f"{int(summary.get('rows', 0)):,}"),
+        ("Columns", f"{int(summary.get('columns', 0)):,}"),
+    ]
+
+    worksheet = summary.get("worksheet")
+    if worksheet:
+        items.append(("Worksheet", str(worksheet)))
+
+    date_start = summary.get("date_start")
+    date_end = summary.get("date_end")
+    if date_start and date_end:
+        date_value = date_start if date_start == date_end else f"{date_start}–{date_end}"
+        items.append(("Dates", date_value))
+
+    item_markup = "".join(
+        f'<span class="dataset-summary-item">'
+        f'<span class="dataset-summary-label">{html.escape(label)}</span>'
+        f'<strong>{html.escape(value)}</strong>'
+        f'</span>'
+        for label, value in items
+    )
+    st.markdown(
+        f'<div class="dataset-summary" aria-label="Uploaded dataset summary">'
+        f'{item_markup}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_upload_source_heading(
     label: str,
     logo_uri: str,

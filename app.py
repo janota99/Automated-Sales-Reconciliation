@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Any, Dict
@@ -65,7 +66,7 @@ from utils import clear_results_if_signature_changed, format_central_timestamp, 
 from assets.ui_assets import INFOR_LOGO_URI, QUICKBOOKS_LOGO_URI
 
 
-PPL_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "ppl_logo.jpg"
+PPL_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "ppl_logo.png"
 
 
 def _resolve_ppl_logo_path() -> Optional[Path]:
@@ -93,7 +94,7 @@ def _render_sidebar_brand() -> None:
     logo_path = _resolve_ppl_logo_path()
     if logo_path is None:
         st.sidebar.warning(
-            "Logo not found. Expected an image named ppl_logo.jpg in the assets folder."
+            "Logo not found. Expected an image named ppl_logo.png in the assets folder."
         )
         return
 
@@ -114,6 +115,37 @@ def _render_sidebar_brand() -> None:
         )
     except (OSError, ValueError) as exc:
         st.sidebar.warning(f"The logo file could not be displayed: {exc}")
+
+
+def render_dataset_summary(summary: dict[str, Any]) -> None:
+    """Render compact upload metadata without requiring a UI-module update."""
+    items = [
+        ("Rows", f"{int(summary.get('rows', 0)):,}"),
+        ("Columns", f"{int(summary.get('columns', 0)):,}"),
+    ]
+
+    worksheet = summary.get("worksheet")
+    if worksheet:
+        items.append(("Worksheet", str(worksheet)))
+
+    date_start = summary.get("date_start")
+    date_end = summary.get("date_end")
+    if date_start and date_end:
+        date_value = date_start if date_start == date_end else f"{date_start}–{date_end}"
+        items.append(("Dates", date_value))
+
+    item_markup = "".join(
+        f'<span class="dataset-summary-item">'
+        f'<span class="dataset-summary-label">{html.escape(label)}</span>'
+        f'<strong>{html.escape(value)}</strong>'
+        f'</span>'
+        for label, value in items
+    )
+    st.markdown(
+        f'<div class="dataset-summary" aria-label="Uploaded dataset summary">'
+        f'{item_markup}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +185,63 @@ def cached_fiscal_period_column_profile(series: pd.Series) -> tuple[int, int, bo
     return fiscal_period_column_profile(series)
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_dataset_summary(
+    file_bytes: bytes,
+    filename: str,
+    source: str,
+    selected_sheet: Optional[str] = None,
+) -> dict[str, Any]:
+    """Read one source once and return reliable pre-reconciliation metadata."""
+    sheets = list_source_sheets(file_bytes, filename)
+    worksheet = selected_sheet if selected_sheet in sheets else (sheets[0] if sheets else None)
+    header_row = detect_header_row(file_bytes, filename, source, worksheet)
+    frame = read_source_file(file_bytes, filename, header_row, worksheet)
+    frame = frame.dropna(how="all")
+
+    summary: dict[str, Any] = {
+        "rows": int(len(frame)),
+        "columns": int(len(frame.columns)),
+        "worksheet": worksheet if len(sheets) > 0 else None,
+    }
+
+    for column in frame.columns:
+        if "date" not in str(column).strip().casefold():
+            continue
+        parsed_dates = pd.to_datetime(frame[column], errors="coerce")
+        parsed_dates = parsed_dates.dropna()
+        if parsed_dates.empty:
+            continue
+        summary["date_start"] = parsed_dates.min().strftime("%b %d, %Y")
+        summary["date_end"] = parsed_dates.max().strftime("%b %d, %Y")
+        break
+
+    return summary
+
+
+def _render_uploaded_dataset_summary(
+    file_obj: Any,
+    source: str,
+    sheet_state_prefix: str,
+) -> None:
+    """Render metadata without allowing a preview issue to block an upload."""
+    if file_obj is None:
+        return
+
+    file_hash = get_true_file_hash(file_obj)
+    selected_sheet = st.session_state.get(f"{sheet_state_prefix}_{file_hash[:12]}")
+    try:
+        summary = cached_dataset_summary(
+            file_obj.getvalue(),
+            file_obj.name,
+            source,
+            selected_sheet,
+        )
+        render_dataset_summary(summary)
+    except Exception:
+        st.caption("Dataset summary will appear after the import settings are confirmed.")
+
+
 # ---------------------------------------------------------------------------
 # Main Application Flow
 # ---------------------------------------------------------------------------
@@ -178,12 +267,12 @@ def main() -> None:
         "Upload data sources",
         "Add the two current-period exports required for reconciliation.",
     )
-    upload_col1, upload_col2 = st.columns(2, gap="large")
+    upload_col1, upload_col2 = st.columns(2, gap="medium")
 
     with upload_col1:
         with st.container(border=True):
             render_upload_source_heading(
-                "QuickBooks sales export",
+                "Upload QuickBooks Data",
                 QUICKBOOKS_LOGO_URI,
                 "quickbooks",
                 context="Primary source",
@@ -204,11 +293,12 @@ def main() -> None:
                 qb_file.name if qb_file else None,
                 "Awaiting QuickBooks file",
             )
+            _render_uploaded_dataset_summary(qb_file, "QB", "qb_sheet")
 
     with upload_col2:
         with st.container(border=True):
             render_upload_source_heading(
-                "Infinium sales export",
+                "Upload Infinium Data",
                 INFOR_LOGO_URI,
                 "infor",
                 context="Primary source",
@@ -230,6 +320,7 @@ def main() -> None:
                 "Awaiting Infinium file" if qb_file else "Available after QuickBooks",
                 pending=not qb_file and not inf_file,
             )
+            _render_uploaded_dataset_summary(inf_file, "INF", "inf_sheet")
 
     # These variables must exist on every Streamlit rerun, including before
     # both primary files have been uploaded.
@@ -238,55 +329,64 @@ def main() -> None:
 
     if qb_file and inf_file:
         st.markdown('<div class="section-spacer"></div>', unsafe_allow_html=True)
-        render_section_heading(
-            "Optional historical data",
-            "Use prior-period files only to clear timing differences in the opposing primary source. Unused historical rows remain background data.",
-        )
-        sec_col1, sec_col2 = st.columns(2, gap="large")
+        with st.expander("Optional: Upload Historical Data", expanded=False):
+            st.markdown(
+                '<p class="historical-upload-intro">Use prior-period files only to clear '
+                'timing differences in the opposing primary source. Unused historical rows '
+                'remain background data and never generate exceptions.</p>',
+                unsafe_allow_html=True,
+            )
+            sec_col1, sec_col2 = st.columns(2, gap="medium")
 
-        with sec_col1:
-            with st.container(border=True):
-                render_upload_source_heading(
-                    "Historical QuickBooks",
-                    QUICKBOOKS_LOGO_URI,
-                    "quickbooks",
-                    context="Optional prior-period source",
-                )
-                st.markdown(
-                    '<p class="upload-card-copy">May clear unresolved primary Infinium items; unused rows are excluded.</p>',
-                    unsafe_allow_html=True,
-                )
-                qb_secondary_file = st.file_uploader(
-                    "Upload historical QuickBooks data",
-                    type=["xlsx", "csv"],
-                    key="qb_secondary_file",
-                    help="Drag and drop or click to upload optional historical QuickBooks data.",
-                    label_visibility="collapsed",
-                )
-                if qb_secondary_file:
-                    render_source_status(qb_secondary_file.name, "")
+            with sec_col1:
+                with st.container(border=True):
+                    render_upload_source_heading(
+                        "Historical QuickBooks",
+                        QUICKBOOKS_LOGO_URI,
+                        "quickbooks",
+                        context="Optional prior-period source",
+                    )
+                    st.markdown(
+                        '<p class="upload-card-copy">May clear unresolved primary Infinium items; unused rows are excluded.</p>',
+                        unsafe_allow_html=True,
+                    )
+                    qb_secondary_file = st.file_uploader(
+                        "Upload historical QuickBooks data",
+                        type=["xlsx", "csv"],
+                        key="qb_secondary_file",
+                        help="Drag and drop or click to upload optional historical QuickBooks data.",
+                        label_visibility="collapsed",
+                    )
+                    if qb_secondary_file:
+                        render_source_status(qb_secondary_file.name, "")
+                        _render_uploaded_dataset_summary(
+                            qb_secondary_file, "QB", "qb_secondary_sheet"
+                        )
 
-        with sec_col2:
-            with st.container(border=True):
-                render_upload_source_heading(
-                    "Historical Infinium",
-                    INFOR_LOGO_URI,
-                    "infor",
-                    context="Optional prior-period source",
-                )
-                st.markdown(
-                    '<p class="upload-card-copy">May clear unresolved primary QuickBooks items; unused rows are excluded.</p>',
-                    unsafe_allow_html=True,
-                )
-                inf_secondary_file = st.file_uploader(
-                    "Upload historical Infinium data",
-                    type=["xlsx", "csv"],
-                    key="inf_secondary_file",
-                    help="Drag and drop or click to upload optional historical Infinium data.",
-                    label_visibility="collapsed",
-                )
-                if inf_secondary_file:
-                    render_source_status(inf_secondary_file.name, "")
+            with sec_col2:
+                with st.container(border=True):
+                    render_upload_source_heading(
+                        "Historical Infinium",
+                        INFOR_LOGO_URI,
+                        "infor",
+                        context="Optional prior-period source",
+                    )
+                    st.markdown(
+                        '<p class="upload-card-copy">May clear unresolved primary QuickBooks items; unused rows are excluded.</p>',
+                        unsafe_allow_html=True,
+                    )
+                    inf_secondary_file = st.file_uploader(
+                        "Upload historical Infinium data",
+                        type=["xlsx", "csv"],
+                        key="inf_secondary_file",
+                        help="Drag and drop or click to upload optional historical Infinium data.",
+                        label_visibility="collapsed",
+                    )
+                    if inf_secondary_file:
+                        render_source_status(inf_secondary_file.name, "")
+                        _render_uploaded_dataset_summary(
+                            inf_secondary_file, "INF", "inf_secondary_sheet"
+                        )
 
     st.markdown('<div class="major-section-gap"></div>', unsafe_allow_html=True)
 

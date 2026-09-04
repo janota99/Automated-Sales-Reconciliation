@@ -215,6 +215,13 @@ p {
 
 /* Upload cards and integrated brand treatment */
 
+[data-testid="stHorizontalBlock"]:has(.upload-source-heading) {
+    max-width: 1120px;
+    margin-right: auto !important;
+    margin-left: auto !important;
+    gap: 1rem !important;
+}
+
 div[data-testid="stVerticalBlockBorderWrapper"]:has(.upload-source-heading) {
     height: 100%;
     padding: 1.25rem 1.3rem 1.15rem !important;
@@ -305,6 +312,46 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.upload-source-heading):hove
     line-height: 1.5 !important;
 }
 
+.historical-upload-intro {
+    max-width: 820px;
+    margin: 0 0 1rem !important;
+    color: var(--rec-text-secondary) !important;
+    font-size: 0.91rem !important;
+    line-height: 1.5 !important;
+}
+
+.dataset-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin-top: 0.65rem;
+    padding-top: 0.65rem;
+    border-top: 1px solid var(--rec-border);
+}
+
+.dataset-summary-item {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.28rem;
+    padding: 0.28rem 0.5rem;
+    border: 1px solid var(--rec-border);
+    border-radius: 7px;
+    background: var(--rec-surface-soft);
+    color: var(--rec-navy) !important;
+    font-size: 0.76rem !important;
+    line-height: 1.25;
+}
+
+.dataset-summary-label {
+    color: var(--rec-text-muted) !important;
+    font-weight: 600;
+}
+
+.dataset-summary-item strong {
+    color: var(--rec-navy) !important;
+    font-weight: 750;
+}
+
 /* Native Streamlit uploader restyled as a full drop target */
 
 [data-testid="stFileUploader"] {
@@ -343,10 +390,17 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.upload-source-heading):hove
     font-weight: 800;
 }
 
-[data-testid="stFileUploaderDropzoneInstructions"] span {
+[data-testid="stFileUploaderDropzoneInstructions"]::before {
+    content: "Drag and Drop Files Here";
+    display: block;
     color: var(--rec-text) !important;
     font-size: 0.88rem !important;
-    font-weight: 650 !important;
+    font-weight: 750 !important;
+    line-height: 1.35;
+}
+
+[data-testid="stFileUploaderDropzoneInstructions"] span {
+    display: none !important;
 }
 
 [data-testid="stFileUploaderDropzoneInstructions"] small {
@@ -681,16 +735,35 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.source-status.complete)
     border-bottom: 1px solid var(--rec-border);
 }
 
-[data-testid="stTabs"] button[role="tab"] {
+[data-testid="stTabs"] button[role="tab"],
+[data-testid="stTabs"] button[data-baseweb="tab"] {
     padding-right: 0.1rem !important;
     padding-left: 0.1rem !important;
-    color: var(--rec-text-secondary) !important;
-    font-weight: 650 !important;
+    color: var(--rec-navy) !important;
+    font-size: 1.05rem !important;
+    font-weight: 700 !important;
 }
 
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+[data-testid="stTabs"] button[role="tab"] p,
+[data-testid="stTabs"] button[role="tab"] span,
+[data-testid="stTabs"] button[data-baseweb="tab"] p,
+[data-testid="stTabs"] button[data-baseweb="tab"] span {
+    color: inherit !important;
+    font-size: inherit !important;
+    font-weight: inherit !important;
+}
+
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"],
+[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {
     color: var(--rec-navy) !important;
     font-weight: 800 !important;
+}
+
+[data-testid="stTabs"] button[role="tab"]:hover,
+[data-testid="stTabs"] button[role="tab"]:focus-visible,
+[data-testid="stTabs"] button[data-baseweb="tab"]:hover,
+[data-testid="stTabs"] button[data-baseweb="tab"]:focus-visible {
+    color: var(--rec-navy-hover) !important;
 }
 
 [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
@@ -716,6 +789,42 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.source-status.complete)
 [data-testid="stExpander"] summary {
     color: var(--rec-navy) !important;
     font-weight: 700 !important;
+}
+
+/* Main-page historical uploads: distinct but intentionally restrained */
+
+[data-testid="stExpander"]:has(.historical-upload-intro) {
+    overflow: hidden;
+    border: 2px solid rgba(25, 54, 93, 0.88) !important;
+    border-radius: 11px !important;
+    background: rgba(25, 54, 93, 0.045) !important;
+    box-shadow: 0 2px 8px rgba(25, 54, 93, 0.05) !important;
+}
+
+[data-testid="stExpander"]:has(.historical-upload-intro) > details,
+[data-testid="stExpander"]:has(.historical-upload-intro) summary {
+    background: rgba(25, 54, 93, 0.045) !important;
+}
+
+[data-testid="stExpander"]:has(.historical-upload-intro) summary {
+    color: var(--rec-navy) !important;
+    font-weight: 800 !important;
+}
+
+[data-testid="stExpander"]:has(.historical-upload-intro) summary p,
+[data-testid="stExpander"]:has(.historical-upload-intro) summary span {
+    color: var(--rec-navy) !important;
+    font-weight: 800 !important;
+}
+
+[data-testid="stExpander"]:has(.historical-upload-intro) summary svg {
+    color: var(--rec-navy) !important;
+    fill: var(--rec-navy) !important;
+}
+
+[data-testid="stExpander"]:has(.historical-upload-intro):hover {
+    border-color: var(--rec-navy) !important;
+    background: rgba(25, 54, 93, 0.065) !important;
 }
 
 @media (max-width: 900px) {
@@ -748,17 +857,4 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.source-status.complete)
     .upload-source-heading {
         align-items: center;
     }
-}
-[data-testid="stTabs"] button[role="tab"],
-[data-testid="stTabs"] button[role="tab"] p,
-[data-testid="stTabs"] button[role="tab"] span {
-    color: var(--rec-text-secondary) !important;
-    font-weight: 650 !important;
-}
-
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"],
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p,
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"] span {
-    color: var(--rec-navy) !important;
-    font-weight: 800 !important;
 }
