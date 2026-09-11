@@ -3,6 +3,12 @@
 Automatic matching first exhausts unique one-to-one relationships. A bounded,
 unambiguous one-to-many or many-to-one pass may then match rows sharing an exact
 normalized PO and/or invoice when their signed-cent totals agree exactly.
+
+Duplicate detection, exclusion, and reporting are handled entirely by
+``duplicates.py``. This module calls into it before matching so that no
+duplicate -- from a primary file or an optional historical file -- can ever
+be matched, clear an exception, or be folded into the accrual/journal-entry
+total.
 """
 
 from __future__ import annotations
@@ -18,6 +24,15 @@ from itertools import zip_longest
 from typing import Any, Optional
 
 import pandas as pd
+
+from duplicates import (
+    AMOUNT_CENTS,
+    NORM_INV,
+    NORM_PO,
+    SOURCE_POS,
+    combine_duplicate_reports,
+    screen_duplicates,
+)
 
 __all__ = [
     "AMOUNT_CENTS",
@@ -41,8 +56,8 @@ __all__ = [
 ]
 
 
-APP_VERSION = "2.10.1"
-MATCHING_RULE_VERSION = "2026.09-1TO1-THEN-UNIQUE-GROUPED-HISTORICAL-TRACE"
+APP_VERSION = "2.12.0"
+MATCHING_RULE_VERSION = "2026.09-1TO1-THEN-UNIQUE-GROUPED-HISTORICAL-TRACE-DUPSEPARATED"
 
 # Grouped matching is intentionally bounded to keep reconciliation runs
 # predictable. Larger or more complex reference pools remain unresolved for
@@ -52,10 +67,6 @@ MAX_GROUP_SIZE = 8
 
 QB_ID = "__REC_QB_ID"
 INF_ID = "__REC_INF_ID"
-SOURCE_POS = "__REC_SOURCE_POS"
-NORM_PO = "__REC_NORM_PO"
-NORM_INV = "__REC_NORM_INV"
-AMOUNT_CENTS = "__REC_AMOUNT_CENTS"
 PRODUCT_STANDARD = "__REC_PRODUCT_STANDARD"
 FISCAL_LABEL = "__REC_FISCAL_LABEL"
 PRODUCT_LEXICON = {
@@ -126,6 +137,7 @@ class ReconciliationResult:
     method_summary: pd.DataFrame
     exception_analysis: pd.DataFrame
     duplicate_analysis: pd.DataFrame
+    infinium_duplicate_analysis: pd.DataFrame
     product_summary: pd.DataFrame
     controls: pd.DataFrame
     metrics: dict[str, Any]
@@ -145,6 +157,8 @@ class ReconciliationResult:
     inf_secondary_mapping: Optional[dict[str, Optional[str]]] = None
     duplicate_qb_rows: list[int] = field(default_factory=list)
     duplicate_inf_rows: list[int] = field(default_factory=list)
+    duplicate_qb_secondary_rows: list[int] = field(default_factory=list)
+    duplicate_inf_secondary_rows: list[int] = field(default_factory=list)
 
 
 @lru_cache(maxsize=4096)
@@ -684,6 +698,12 @@ def build_historical_clearances(
     Historical rows never become exceptions themselves. Accepted one-to-one
     and controlled grouped matches are retained as evidence; all unused
     historical rows are discarded from the reconciliation population.
+
+    ``qb_secondary``/``inf_secondary`` must already be duplicate-screened by
+    the caller (see ``duplicates.screen_duplicates``) -- a duplicated
+    historical row is just as capable of improperly clearing a real primary
+    exception as a duplicated primary row is of misstating the accrual, so
+    neither may reach this function.
     """
     records: list[dict[str, Any]] = []
     cleared_qb: set[int] = set()
@@ -815,107 +835,6 @@ def build_historical_clearances(
     return clearances, remaining_qb, remaining_inf
 
 
-DUPLICATE_KEY_DEFINITIONS = [
-    ((NORM_PO, NORM_INV, AMOUNT_CENTS), "PO + Invoice + Amount"),
-    ((NORM_PO, AMOUNT_CENTS), "PO + Amount"),
-    ((NORM_INV, AMOUNT_CENTS), "Invoice + Amount"),
-]
-
-
-def duplicate_row_indexes(frame: pd.DataFrame) -> set[int]:
-    """Return source indexes participating in any repeated valid match key."""
-    duplicate_indexes: set[int] = set()
-    for fields, _ in DUPLICATE_KEY_DEFINITIONS:
-        work = frame.loc[:, list(fields)]
-        valid = work.notna().all(axis=1) & work.ne("").all(axis=1)
-        duplicate_mask = work.loc[valid].duplicated(subset=list(fields), keep=False)
-        duplicate_indexes.update(int(idx) for idx in duplicate_mask.index[duplicate_mask])
-    return duplicate_indexes
-
-
-def build_duplicate_analysis(
-    qb: pd.DataFrame,
-    inf: pd.DataFrame,
-    matches: list[MatchGroup],
-    historical_clearances: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-    """Identify repeated accounting match keys in either source dataset."""
-    matched_qb = set(_matched_row_indexes(matches, "QB"))
-    matched_inf = set(_matched_row_indexes(matches, "INF"))
-    if historical_clearances is not None:
-        matched_qb.update(
-            _historical_row_indexes(
-                historical_clearances,
-                "QuickBooks Primary",
-                "Primary Row Index",
-            )
-        )
-        matched_inf.update(
-            _historical_row_indexes(
-                historical_clearances,
-                "Infinium Primary",
-                "Primary Row Index",
-            )
-        )
-    records: list[dict[str, Any]] = []
-    duplicate_indexes: dict[str, set[int]] = {
-        "QuickBooks": set(),
-        "Infinium": set(),
-    }
-    for dataset, frame, id_column, matched_rows in (
-        ("QuickBooks", qb, QB_ID, matched_qb),
-        ("Infinium", inf, INF_ID, matched_inf),
-    ):
-        for fields, key_type in DUPLICATE_KEY_DEFINITIONS:
-            work = frame.loc[:, list(fields)].copy()
-            valid = work.notna().all(axis=1) & work.ne("").all(axis=1)
-            work = work.loc[valid]
-            if work.empty:
-                continue
-            work["__SOURCE_ID"] = frame.loc[work.index, id_column].astype(str)
-            work["__MATCHED"] = work.index.isin(matched_rows)
-            work = work.loc[work.duplicated(subset=list(fields), keep=False)]
-            if work.empty:
-                continue
-            duplicate_indexes[dataset].update(int(idx) for idx in work.index)
-            grouped = work.groupby(list(fields), sort=True, dropna=False).agg(
-                occurrence_count=("__SOURCE_ID", "size"),
-                source_row_ids=("__SOURCE_ID", lambda values: "; ".join(values)),
-                matched_count=("__MATCHED", "sum"),
-            ).reset_index()
-            for row in grouped.to_dict("records"):
-                occurrence_count = int(row["occurrence_count"])
-                matched_count = int(row["matched_count"])
-                if matched_count == occurrence_count:
-                    status = "All rows matched through a more specific unique key"
-                elif matched_count:
-                    status = "Mixed matched and unresolved rows"
-                else:
-                    status = "All rows unresolved"
-                records.append(
-                    {
-                        "Dataset": dataset,
-                        "Duplicate Key Type": key_type,
-                        "Normalized PO": row.get(NORM_PO, ""),
-                        "Normalized Invoice": row.get(NORM_INV, ""),
-                        "Amount": cents_to_float(row[AMOUNT_CENTS]),
-                        "Occurrence Count": occurrence_count,
-                        "Source Row IDs": row["source_row_ids"],
-                        "Reconciliation Status": status,
-                    }
-                )
-    columns = [
-        "Dataset", "Duplicate Key Type", "Normalized PO", "Normalized Invoice",
-        "Amount", "Occurrence Count", "Source Row IDs", "Reconciliation Status",
-    ]
-    result = pd.DataFrame(records, columns=columns)
-    result.attrs["duplicate_row_indexes"] = {
-        dataset: sorted(indexes)
-        for dataset, indexes in duplicate_indexes.items()
-    }
-    return result
-
-
 def _optional_index(value: Any) -> Optional[int]:
     return None if value is None or pd.isna(value) else int(value)
 
@@ -928,6 +847,8 @@ def build_paired_rows(
     qb: pd.DataFrame,
     inf: pd.DataFrame,
     candidates: pd.DataFrame,
+    duplicate_qb_rows: list[int],
+    duplicate_inf_rows: list[int],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     candidate_reason = (
@@ -1011,6 +932,45 @@ def build_paired_rows(
                 "Group Sequence": None,
                 "Confidence": "Review",
                 "Explanation": "No unique automatic QuickBooks match was established.",
+            }
+        )
+    for qidx in duplicate_qb_rows:
+        rows.append(
+            {
+                "Section": "04 Duplicate QuickBooks",
+                "Match ID": "",
+                "Match Result": "Duplicate QuickBooks entry",
+                "QB Index": qidx,
+                "Infinium Index": None,
+                "QB Record Scope": "Primary",
+                "Infinium Record Scope": None,
+                "Group Sequence": None,
+                "Confidence": "Duplicate",
+                "Explanation": (
+                    "Matches another QuickBooks row under the duplicate criteria in "
+                    "duplicates.py. Excluded from matching and from the accrual total "
+                    "and proposed journal entry; listed here as a separate item."
+                ),
+            }
+        )
+    for iidx in duplicate_inf_rows:
+        rows.append(
+            {
+                "Section": "05 Duplicate Infinium",
+                "Match ID": "",
+                "Match Result": "Duplicate Infinium entry",
+                "QB Index": None,
+                "Infinium Index": iidx,
+                "QB Record Scope": None,
+                "Infinium Record Scope": "Primary",
+                "Group Sequence": None,
+                "Confidence": "Duplicate",
+                "Explanation": (
+                    "Matches another Infinium row under the duplicate criteria in "
+                    "duplicates.py. Excluded from matching; kept on a separate "
+                    "Infinium duplicates worksheet because its treatment is "
+                    "entirely different from QuickBooks duplicates."
+                ),
             }
         )
     return rows
@@ -1167,6 +1127,8 @@ def build_method_summary(
     unmatched_inf: list[int],
     qb: pd.DataFrame,
     inf: pd.DataFrame,
+    duplicate_qb_rows: list[int],
+    duplicate_inf_rows: list[int],
 ) -> pd.DataFrame:
     buckets: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"QB Rows": 0, "Infinium Rows": 0, "QB Cents": 0, "Infinium Cents": 0}
@@ -1197,6 +1159,14 @@ def build_method_summary(
         bucket = buckets["Unmatched Infinium"]
         bucket["Infinium Rows"] = len(unmatched_inf)
         bucket["Infinium Cents"] = _amount_total(inf, unmatched_inf)
+    if duplicate_qb_rows:
+        bucket = buckets["Duplicate QuickBooks (excluded from accrual)"]
+        bucket["QB Rows"] = len(duplicate_qb_rows)
+        bucket["QB Cents"] = _amount_total(qb, duplicate_qb_rows)
+    if duplicate_inf_rows:
+        bucket = buckets["Duplicate Infinium (separate worksheet)"]
+        bucket["Infinium Rows"] = len(duplicate_inf_rows)
+        bucket["Infinium Cents"] = _amount_total(inf, duplicate_inf_rows)
     records = []
     for method, values in buckets.items():
         records.append(
@@ -1329,6 +1299,31 @@ def build_rules_and_config(
              "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence."},
             {"Priority": 11, "Rule": "Unused secondary rows", "Automatic": "Excluded",
              "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
+            {"Priority": 12, "Rule": "Exact duplicate exclusion (see duplicates.py)", "Automatic": "Yes, before matching",
+             "Requirement": (
+                 "A row whose amount matches another row exactly, and whose populated PO and/or "
+                 "invoice reference also matches exactly, is a duplicate. Duplicates are removed "
+                 "from the working population before any matching or clearance pass runs and are "
+                 "excluded from the accrual total and the proposed journal entry amount. Each "
+                 "duplicate item is listed separately by dataset: QuickBooks duplicates on their "
+                 "own report, Infinium duplicates on a separate worksheet, since their treatment "
+                 "is entirely different."
+             )},
+            {"Priority": 13, "Rule": "Shared PO/invoice with differing amounts is not a duplicate", "Automatic": "N/A",
+             "Requirement": (
+                 "Rows sharing only a PO or only an invoice, with different amounts, are never assumed "
+                 "to be duplicates. They remain eligible for the grouped aggregate matching passes "
+                 "(Priorities 4-6), which test whether several such rows sum exactly to one matching "
+                 "opposing entry."
+             )},
+            {"Priority": 14, "Rule": "Historical/secondary duplicate exclusion", "Automatic": "Yes, before clearance",
+             "Requirement": (
+                 "Optional historical QuickBooks and Infinium files are screened for exact duplicates "
+                 "the same way as the primary files, before they are used to clear a primary exception. "
+                 "A duplicated historical row can never clear a primary exception; it is itemized "
+                 "alongside that dataset's primary duplicates, tagged with a separate 'Historical "
+                 "(Secondary)' scope."
+             )},
         ]
     )
     config_records = [
@@ -1357,6 +1352,14 @@ def build_rules_and_config(
             "Value": (
                 "Selected period filters the Product Aggregate Summary and classifies exception urgency. "
                 "Fiscal period never changes strict transaction matching."
+            ),
+        },
+        {
+            "Setting": "Duplicate Treatment",
+            "Value": (
+                "Exact duplicates (see duplicates.py) are excluded from matching and from the "
+                "accrual/journal entry total for every dataset, including optional historical files. "
+                "QuickBooks duplicates and Infinium duplicates are itemized on two separate reports."
             ),
         },
     ]
@@ -1479,6 +1482,8 @@ def build_controls(
     historical_clearances: pd.DataFrame,
     unmatched_qb: list[int],
     unmatched_inf: list[int],
+    duplicate_qb_rows: list[int],
+    duplicate_inf_rows: list[int],
 ) -> pd.DataFrame:
     matched_q = _matched_row_indexes(matches, "QB")
     matched_i = _matched_row_indexes(matches, "INF")
@@ -1500,21 +1505,27 @@ def build_controls(
     historical_i_total = _amount_total(inf, historical_i)
     unresolved_q_total = _amount_total(qb, unmatched_qb)
     unresolved_i_total = _amount_total(inf, unmatched_inf)
+    duplicate_q_total = _amount_total(qb, duplicate_qb_rows)
+    duplicate_i_total = _amount_total(inf, duplicate_inf_rows)
     historical_difference = (
         round(float(historical_clearances["Amount Difference"].sum()), 2)
         if not historical_clearances.empty else 0.0
     )
     records = [
-        ("QuickBooks row completeness", len(qb), len(matched_q) + len(historical_q) + len(unmatched_qb)),
-        ("Infinium row completeness", len(inf), len(matched_i) + len(historical_i) + len(unmatched_inf)),
+        ("QuickBooks row completeness", len(qb),
+         len(matched_q) + len(historical_q) + len(unmatched_qb) + len(duplicate_qb_rows)),
+        ("Infinium row completeness", len(inf),
+         len(matched_i) + len(historical_i) + len(unmatched_inf) + len(duplicate_inf_rows)),
         ("QuickBooks amount roll-forward", cents_to_float(qb_total),
-         cents_to_float(matched_q_total + historical_q_total + unresolved_q_total)),
+         cents_to_float(matched_q_total + historical_q_total + unresolved_q_total + duplicate_q_total)),
         ("Infinium amount roll-forward", cents_to_float(inf_total),
-         cents_to_float(matched_i_total + historical_i_total + unresolved_i_total)),
+         cents_to_float(matched_i_total + historical_i_total + unresolved_i_total + duplicate_i_total)),
         ("Primary-to-primary matched totals", cents_to_float(matched_q_total), cents_to_float(matched_i_total)),
         ("Historical clearance amount difference", 0.0, historical_difference),
         ("Unresolved JE support", cents_to_float(unresolved_q_total),
-         cents_to_float(qb_total - matched_q_total - historical_q_total)),
+         cents_to_float(qb_total - matched_q_total - historical_q_total - duplicate_q_total)),
+        ("Duplicate QuickBooks items excluded from JE", cents_to_float(duplicate_q_total),
+         cents_to_float(duplicate_q_total)),
     ]
     output = []
     for check, expected, actual in records:
@@ -1561,32 +1572,78 @@ def build_reconciliation(
         if inf_secondary_raw is not None and inf_secondary_mapping is not None
         else None
     )
-    matches, initially_unmatched_qb, initially_unmatched_inf, candidates = perform_matching(qb, inf)
+
+    # Screen every dataset -- both primary files and any optional historical
+    # (secondary) files -- for exact duplicates before any matching or
+    # clearance pass runs. A duplicated historical row is just as capable of
+    # improperly clearing a real primary exception as a duplicated primary
+    # row is of misstating the accrual, so neither may participate; both are
+    # itemized separately instead. See duplicates.py for the matching rules.
+    qb_screen = screen_duplicates(
+        qb, QB_ID, "QuickBooks", "Primary",
+        "Excluded from the accrual total and the proposed journal entry amount; listed separately.",
+    )
+    inf_screen = screen_duplicates(
+        inf, INF_ID, "Infinium", "Primary",
+        "Kept on a separate worksheet; Infinium duplicates are reviewed independently and never "
+        "feed the QuickBooks accrual or journal entry.",
+    )
+    qb_secondary_screen = (
+        screen_duplicates(
+            qb_secondary, QB_ID, "QuickBooks", "Historical (Secondary)",
+            "Excluded from historical clearance matching; a duplicated historical row could "
+            "otherwise improperly clear a real primary exception. Historical rows never feed "
+            "the accrual or journal entry regardless.",
+        )
+        if qb_secondary is not None else None
+    )
+    inf_secondary_screen = (
+        screen_duplicates(
+            inf_secondary, INF_ID, "Infinium", "Historical (Secondary)",
+            "Excluded from historical clearance matching; a duplicated historical row could "
+            "otherwise improperly clear a real primary exception. Historical rows never feed "
+            "the accrual or journal entry regardless.",
+        )
+        if inf_secondary is not None else None
+    )
+
+    qb_active = qb_screen.active_frame
+    inf_active = inf_screen.active_frame
+    qb_secondary_active = qb_secondary_screen.active_frame if qb_secondary_screen else qb_secondary
+    inf_secondary_active = inf_secondary_screen.active_frame if inf_secondary_screen else inf_secondary
+
+    matches, initially_unmatched_qb, initially_unmatched_inf, candidates = perform_matching(
+        qb_active, inf_active
+    )
     historical_clearances, unmatched_qb, unmatched_inf = build_historical_clearances(
         qb,
         inf,
         initially_unmatched_qb,
         initially_unmatched_inf,
-        qb_secondary,
-        inf_secondary,
+        qb_secondary_active,
+        inf_secondary_active,
     )
     paired_rows = build_paired_rows(
-        matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf, candidates
+        matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf, candidates,
+        qb_screen.duplicate_rows, inf_screen.duplicate_rows,
     )
     normalization = build_normalization_detail(qb, inf, qb_mapping, inf_mapping)
     assessments = build_match_assessments(
         matches, historical_clearances, unmatched_qb, qb, inf, candidates
     )
     method_summary = build_method_summary(
-        matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf
+        matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf,
+        qb_screen.duplicate_rows, inf_screen.duplicate_rows,
     )
     exception_analysis = build_exception_analysis(qb, inf, unmatched_qb, unmatched_inf, candidates)
-    duplicate_analysis = build_duplicate_analysis(
-        qb, inf, matches, historical_clearances
+    duplicate_analysis = combine_duplicate_reports(
+        qb_screen.report,
+        qb_secondary_screen.report if qb_secondary_screen else None,
     )
-    duplicate_indexes = duplicate_analysis.attrs.get("duplicate_row_indexes", {})
-    duplicate_qb_rows = list(duplicate_indexes.get("QuickBooks", []))
-    duplicate_inf_rows = list(duplicate_indexes.get("Infinium", []))
+    infinium_duplicate_analysis = combine_duplicate_reports(
+        inf_screen.report,
+        inf_secondary_screen.report if inf_secondary_screen else None,
+    )
     product_summary = build_product_summary(
         qb,
         qb_mapping,
@@ -1594,7 +1651,8 @@ def build_reconciliation(
         fiscal_year,
     )
     controls = build_controls(
-        qb, inf, matches, historical_clearances, unmatched_qb, unmatched_inf
+        qb, inf, matches, historical_clearances, unmatched_qb, unmatched_inf,
+        qb_screen.duplicate_rows, inf_screen.duplicate_rows,
     )
     rules, config = build_rules_and_config(
         qb_mapping,
@@ -1666,6 +1724,16 @@ def build_reconciliation(
         "Unresolved QuickBooks Amount": cents_to_float(unmatched_q_cents),
         "Unmatched Infinium Rows": len(unmatched_inf),
         "Unmatched Infinium Amount": cents_to_float(_amount_total(inf, unmatched_inf)),
+        "Duplicate QuickBooks Rows": len(qb_screen.duplicate_rows),
+        "Duplicate QuickBooks Amount": cents_to_float(_amount_total(qb, qb_screen.duplicate_rows)),
+        "Duplicate Infinium Rows": len(inf_screen.duplicate_rows),
+        "Duplicate Infinium Amount": cents_to_float(_amount_total(inf, inf_screen.duplicate_rows)),
+        "Duplicate QuickBooks Secondary Rows Excluded": (
+            len(qb_secondary_screen.duplicate_rows) if qb_secondary_screen else 0
+        ),
+        "Duplicate Infinium Secondary Rows Excluded": (
+            len(inf_secondary_screen.duplicate_rows) if inf_secondary_screen else 0
+        ),
         "QuickBooks Match Rate by Row": (
             (len(matched_q) + len(historical_matched_q)) / len(qb) if len(qb) else 0
         ),
@@ -1676,7 +1744,13 @@ def build_reconciliation(
         "Invalid QuickBooks Amounts": int(qb[AMOUNT_CENTS].isna().sum()),
         "Invalid Infinium Amounts": int(inf[AMOUNT_CENTS].isna().sum()),
         "QuickBooks Subtotal Rows Excluded": int(metadata.get("qb_subtotal_rows_excluded", 0)),
-        "Duplicate Key Groups": len(duplicate_analysis),
+        "Duplicate QuickBooks Item Groups": (
+            int(duplicate_analysis["Source Row ID"].nunique()) if not duplicate_analysis.empty else 0
+        ),
+        "Duplicate Infinium Item Groups": (
+            int(infinium_duplicate_analysis["Source Row ID"].nunique())
+            if not infinium_duplicate_analysis.empty else 0
+        ),
         "Control Status": "PASS" if controls["Status"].eq("PASS").all() else "FAIL",
     }
 
@@ -1695,6 +1769,7 @@ def build_reconciliation(
         method_summary=method_summary,
         exception_analysis=exception_analysis,
         duplicate_analysis=duplicate_analysis,
+        infinium_duplicate_analysis=infinium_duplicate_analysis,
         product_summary=product_summary,
         controls=controls,
         metrics=metrics,
@@ -1712,8 +1787,10 @@ def build_reconciliation(
         inf_secondary_work=inf_secondary,
         qb_secondary_mapping=qb_secondary_mapping,
         inf_secondary_mapping=inf_secondary_mapping,
-        duplicate_qb_rows=duplicate_qb_rows,
-        duplicate_inf_rows=duplicate_inf_rows,
+        duplicate_qb_rows=qb_screen.duplicate_rows,
+        duplicate_inf_rows=inf_screen.duplicate_rows,
+        duplicate_qb_secondary_rows=qb_secondary_screen.duplicate_rows if qb_secondary_screen else [],
+        duplicate_inf_secondary_rows=inf_secondary_screen.duplicate_rows if inf_secondary_screen else [],
     )
     validate_reconciliation(result)
     return result
@@ -1723,9 +1800,16 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
     if result.controls["Status"].ne("PASS").any():
         failures = result.controls.loc[result.controls["Status"] != "PASS", "Check"].tolist()
         raise ValueError(f"Reconciliation control failure: {', '.join(failures)}")
+    duplicate_qb = set(result.duplicate_qb_rows)
+    duplicate_inf = set(result.duplicate_inf_rows)
     for group in result.matches:
         q_count = len(group.qb_rows)
         i_count = len(group.inf_rows)
+        if duplicate_qb.intersection(group.qb_rows) or duplicate_inf.intersection(group.inf_rows):
+            raise ValueError(
+                "Duplicate exclusion control failure: a duplicate row was included in an "
+                "accepted match."
+            )
         if group.group_level:
             if not (
                 (q_count == 1 and 2 <= i_count <= MAX_GROUP_SIZE)
@@ -1746,6 +1830,11 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
             raise ValueError(
                 "Matching control failure: accepted relationship totals do not agree."
             )
+    if duplicate_qb.intersection(result.unmatched_qb) or duplicate_inf.intersection(result.unmatched_inf):
+        raise ValueError(
+            "Duplicate exclusion control failure: a duplicate row remained in the "
+            "unresolved population used for the accrual/journal entry total."
+        )
     if not result.historical_clearances.empty:
         clearance_differences = result.historical_clearances.groupby(
             "Clearance ID", sort=False
@@ -1767,6 +1856,25 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
         ]
         if secondary_rows.duplicated().any():
             raise ValueError("Historical clearance control failure: a secondary row was used more than once.")
+        duplicate_qb_secondary = set(result.duplicate_qb_secondary_rows)
+        duplicate_inf_secondary = set(result.duplicate_inf_secondary_rows)
+        used_qb_secondary = {
+            int(value) for value in result.historical_clearances.loc[
+                result.historical_clearances["Secondary Dataset"] == "QuickBooks Secondary (Historical)",
+                "Secondary Row Index",
+            ].dropna()
+        }
+        used_inf_secondary = {
+            int(value) for value in result.historical_clearances.loc[
+                result.historical_clearances["Secondary Dataset"] == "Infinium Secondary (Historical)",
+                "Secondary Row Index",
+            ].dropna()
+        }
+        if duplicate_qb_secondary.intersection(used_qb_secondary) or duplicate_inf_secondary.intersection(used_inf_secondary):
+            raise ValueError(
+                "Duplicate exclusion control failure: a duplicated historical row was used to "
+                "clear a primary exception."
+            )
         for _, clearance in result.historical_clearances.groupby(
             "Clearance ID", sort=False
         ):

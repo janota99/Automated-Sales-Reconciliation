@@ -20,9 +20,10 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
 from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.table import Table, TableColumn, TableFormula, TableStyleInfo
 
 from config import (
     AMBER,
@@ -74,6 +75,71 @@ def _write_dataframe_values(ws, frame: pd.DataFrame, start_row: int, start_col: 
     for row_offset, row in enumerate(frame.values.tolist(), 1):
         for col_offset, value in enumerate(row):
             ws.cell(start_row + row_offset, start_col + col_offset, excel_safe(value))
+
+
+def _table_column_formula(table_name: str, one_based_column_index: int) -> str:
+    """Return a structured formula that expands and contracts with an Excel table."""
+    return f"SUM(INDEX({table_name},0,{one_based_column_index}))"
+
+
+def _add_exception_table(
+    ws,
+    *,
+    table_name: str,
+    headers: list[str],
+    header_row: int,
+    total_row: int,
+    start_col: int,
+    total_label: str,
+    summed_headers: set[str],
+    style_name: str,
+) -> dict[str, int]:
+    """Create a filterable exception table with protected, dynamic SUM totals."""
+    end_col = start_col + len(headers) - 1
+    table = Table(
+        displayName=table_name,
+        ref=(
+            f"{get_column_letter(start_col)}{header_row}:"
+            f"{get_column_letter(end_col)}{total_row}"
+        ),
+        totalsRowCount=1,
+        totalsRowShown=True,
+    )
+    table.tableStyleInfo = TableStyleInfo(
+        name=style_name,
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+
+    formula_columns: dict[str, int] = {}
+    table.tableColumns = []
+    for offset, header in enumerate(headers, start=1):
+        column = TableColumn(id=offset, name=str(header))
+        if offset == 1:
+            column.totalsRowLabel = total_label
+        if header in summed_headers:
+            formula_text = _table_column_formula(table_name, offset)
+            column.totalsRowFunction = "custom"
+            column.totalsRowFormula = TableFormula(attr_text=formula_text)
+            formula_columns[header] = start_col + offset - 1
+            formula_cell = ws.cell(total_row, start_col + offset - 1)
+            formula_cell.value = f"={formula_text}"
+            formula_cell.protection = Protection(locked=True)
+        table.tableColumns.append(column)
+
+    ws.add_table(table)
+
+    # Users may add, remove, classify, and annotate exception rows. The totals
+    # row and every other report formula remain locked by worksheet protection.
+    for row in range(header_row + 1, total_row):
+        for col in range(start_col, end_col + 1):
+            ws.cell(row, col).protection = Protection(locked=False)
+
+    for col in range(start_col, end_col + 1):
+        ws.cell(total_row, col).protection = Protection(locked=True)
+    return formula_columns
 
 
 def _source_totals(frame: pd.DataFrame, mapping: dict[str, Optional[str]]) -> dict[str, float]:
@@ -419,6 +485,10 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
 
 def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws = wb.create_sheet("Unresolved Exceptions")
+
+    # Keep the two source systems in distinct review areas. QuickBooks is the
+    # accounting/accrual basis on the left; Infinium is an independent
+    # operational exception list on the right and never feeds the proposed JE.
     source_headers = list(result.qb_raw.columns)
     headers = source_headers + ["Exception Status", "Reference Amount Difference", "Reviewer Note"]
     candidate_map = result.candidates.set_index("QuickBooks Row ID").to_dict("index") if not result.candidates.empty else {}
@@ -439,28 +509,80 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     frame = pd.DataFrame(records, columns=headers)
     end_col = len(headers)
     amount_col_position = source_headers.index(result.qb_mapping["amount"]) + 1
+
+    inf_source_headers = list(result.inf_raw.columns)
+    inf_headers = inf_source_headers + ["Exception Status", "Reviewer Note"]
+    unmatched_inf = list(getattr(result, "unmatched_inf", []))
+    inf_subset_dict = result.inf_work.loc[unmatched_inf].to_dict("index")
+    inf_records = [
+        [inf_subset_dict[iidx].get(col) for col in inf_source_headers]
+        + ["Unmatched Infinium", ""]
+        for iidx in unmatched_inf
+    ]
+    inf_frame = pd.DataFrame(inf_records, columns=inf_headers)
+    separator_col = end_col + 1
+    inf_start_col = separator_col + 1
+    inf_end_col = inf_start_col + len(inf_headers) - 1
+    inf_amount_col_position = (
+        inf_start_col + inf_source_headers.index(result.inf_mapping["amount"])
+    )
     
     unmatched_qb_amounts = result.qb_work.loc[result.unmatched_qb, AMOUNT_CENTS].tolist()
     amounts = [cents_or_zero(val) for val in unmatched_qb_amounts]
-    debits = sum(value for value in amounts if value > 0)
-    credits = abs(sum(value for value in amounts if value < 0))
     net = sum(amounts)
 
-    _write_title_band(ws, 1, 1, end_col, "ACCOUNTING EXCEPTIONS | JOURNAL ENTRY SUPPORT", NAVY)
+    unmatched_inf_amounts = result.inf_work.loc[unmatched_inf, AMOUNT_CENTS].tolist()
+    inf_amounts = [cents_or_zero(value) for value in unmatched_inf_amounts]
+    inf_net = sum(inf_amounts)
+
+    qb_table_name = "QuickBooksExceptions"
+    inf_table_name = "InfiniumExceptions"
+    qb_amount_table_index = headers.index(result.qb_mapping["amount"]) + 1
+    inf_amount_table_index = inf_headers.index(result.inf_mapping["amount"]) + 1
+    qb_amount_column_expr = f"INDEX({qb_table_name},0,{qb_amount_table_index})"
+    inf_amount_column_expr = f"INDEX({inf_table_name},0,{inf_amount_table_index})"
+    qb_amount_sum_expr = _table_column_formula(qb_table_name, qb_amount_table_index)
+    inf_amount_sum_expr = _table_column_formula(inf_table_name, inf_amount_table_index)
+
+    _write_title_band(ws, 1, 1, end_col, "QUICKBOOKS EXCEPTIONS | JOURNAL ENTRY SUPPORT", NAVY)
+    _write_title_band(ws, 1, inf_start_col, inf_end_col, "INFINIUM EXCEPTIONS | OPERATIONAL REVIEW", TEAL)
     invalid_unresolved = sum(
         1 for idx in result.unmatched_qb if not valid_cents(result.qb_work.at[idx, AMOUNT_CENTS])
     )
+    invalid_inf_unresolved = sum(
+        1 for idx in unmatched_inf if not valid_cents(result.inf_work.at[idx, AMOUNT_CENTS])
+    )
     _write_caption_band(
         ws, 2, 1, end_col,
-        f"Net signed support total excludes {invalid_unresolved} row(s) with invalid or missing amounts. "
-        f"Review every exception before posting. Generated {format_central_timestamp(result.run_timestamp)}.",
+        f"QuickBooks is the sole accrual and proposed-journal-entry basis. Net signed support excludes "
+        f"{invalid_unresolved} row(s) with invalid or missing amounts. Review every exception before posting. "
+        f"Generated {format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
+    _write_caption_band(
+        ws, 2, inf_start_col, inf_end_col,
+        f"Infinium exceptions are preserved as a separate operational review population. They are excluded "
+        f"from all accrual and proposed-journal-entry calculations; {invalid_inf_unresolved} row(s) have "
+        f"invalid or missing amounts.",
+        TEAL,
+    )
     kpis = [
-        ("Unresolved rows", len(result.unmatched_qb), '#,##0'),
-        ("Gross debits", cents_to_float(debits), '$#,##0.00;[Red]($#,##0.00);-'),
-        ("Credits", cents_to_float(credits), '$#,##0.00;[Red]($#,##0.00);-'),
-        ("Proposed JE support total", cents_to_float(net), '$#,##0.00;[Red]($#,##0.00);-'),
+        ("Unresolved rows", f"=IFERROR(ROWS({qb_table_name}),0)", '#,##0'),
+        (
+            "Gross debits",
+            f'=SUMIF({qb_amount_column_expr},">0",{qb_amount_column_expr})',
+            '$#,##0.00;[Red]($#,##0.00);-',
+        ),
+        (
+            "Credits",
+            f'=ABS(SUMIF({qb_amount_column_expr},"<0",{qb_amount_column_expr}))',
+            '$#,##0.00;[Red]($#,##0.00);-',
+        ),
+        (
+            "Proposed JE support total",
+            f"={qb_amount_sum_expr}",
+            '$#,##0.00;[Red]($#,##0.00);-',
+        ),
     ]
     for idx, (label, value, number_format) in enumerate(kpis):
         start = 1 + idx * 2
@@ -471,13 +593,40 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws.cell(3, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
         ws.cell(4, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
         ws.cell(4, start).number_format = number_format
+        ws.cell(4, start).protection = Protection(locked=True)
+        for row in (3, 4):
+            ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+            ws.cell(row, start).border = _thin_border()
+
+    inf_kpis = [
+        ("Unresolved Infinium rows", f"=IFERROR(ROWS({inf_table_name}),0)", '#,##0'),
+        ("Signed review total", f"={inf_amount_sum_expr}", '$#,##0.00;[Red]($#,##0.00);-'),
+        (
+            "Invalid amount rows",
+            f"=IFERROR(ROWS({inf_table_name}),0)-COUNT({inf_amount_column_expr})",
+            '#,##0',
+        ),
+        ("JE inclusion", "Excluded", 'General'),
+    ]
+    for idx, (label, value, number_format) in enumerate(inf_kpis):
+        start = inf_start_col + idx * 2
+        if start > inf_end_col:
+            break
+        ws.cell(3, start, label)
+        ws.cell(4, start, value)
+        ws.cell(3, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
+        ws.cell(4, start).font = Font(name="Segoe UI", size=12, bold=True, color=TEAL)
+        ws.cell(4, start).number_format = number_format
+        ws.cell(4, start).protection = Protection(locked=True)
         for row in (3, 4):
             ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
             ws.cell(row, start).border = _thin_border()
 
     header_row, data_row = 6, 7
     _write_dataframe_values(ws, frame, header_row, 1)
+    _write_dataframe_values(ws, inf_frame, header_row, inf_start_col)
     _format_header(ws, header_row, 1, end_col, NAVY)
+    _format_header(ws, header_row, inf_start_col, inf_end_col, TEAL)
     if len(frame):
         _format_body_block(ws, data_row, data_row + len(frame) - 1, 1, end_col, NAVY_LIGHT)
         duplicate_qb_rows = _duplicate_source_indexes(result, "QuickBooks")
@@ -489,6 +638,19 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
             ws.cell(row, len(source_headers) + 2).number_format = '$#,##0.00;[Red]($#,##0.00);-'
             if int(qidx) in duplicate_qb_rows:
                 _apply_duplicate_style(ws, row, 1, end_col)
+    if len(inf_frame):
+        inf_last_data_row = data_row + len(inf_frame) - 1
+        _format_body_block(
+            ws, data_row, inf_last_data_row,
+            inf_start_col, inf_end_col, TEAL_LIGHT,
+        )
+        for offset in range(len(inf_frame)):
+            row = data_row + offset
+            ws.cell(row, inf_amount_col_position).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+            ws.cell(row, inf_start_col + len(inf_source_headers)).fill = PatternFill("solid", fgColor=ORANGE)
+            ws.cell(row, inf_start_col + len(inf_source_headers)).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
     total_row = data_row + len(frame)
     _write_total_row(
         ws, total_row, 1, end_col,
@@ -496,13 +658,62 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         "PROPOSED JE SUPPORT TOTAL",
     )
     ws.cell(total_row, amount_col_position).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+    inf_total_row = data_row + len(inf_frame)
+    _write_total_row(
+        ws, inf_total_row, inf_start_col, inf_end_col,
+        {result.inf_mapping["amount"]: cents_to_float(inf_net)}, inf_headers,
+        "INFINIUM REVIEW TOTAL | EXCLUDED FROM JE",
+    )
+    ws.cell(inf_total_row, inf_amount_col_position).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+
+    qb_summed_headers = {result.qb_mapping["amount"]}
+    qb_quantity_header = result.qb_mapping.get("quantity")
+    if qb_quantity_header and qb_quantity_header in headers:
+        qb_summed_headers.add(qb_quantity_header)
+    _add_exception_table(
+        ws,
+        table_name=qb_table_name,
+        headers=headers,
+        header_row=header_row,
+        total_row=total_row,
+        start_col=1,
+        total_label="PROPOSED JE SUPPORT TOTAL",
+        summed_headers=qb_summed_headers,
+        style_name="TableStyleMedium2",
+    )
+    _add_exception_table(
+        ws,
+        table_name=inf_table_name,
+        headers=inf_headers,
+        header_row=header_row,
+        total_row=inf_total_row,
+        start_col=inf_start_col,
+        total_label="INFINIUM REVIEW TOTAL | EXCLUDED FROM JE",
+        summed_headers={result.inf_mapping["amount"]},
+        style_name="TableStyleMedium4",
+    )
+
+    _apply_number_formats(
+        ws, headers, data_row, total_row, 1,
+        {result.qb_mapping["amount"]}, {qb_quantity_header or ""},
+    )
+    _apply_number_formats(
+        ws, inf_headers, data_row, inf_total_row, inf_start_col,
+        {result.inf_mapping["amount"]}, set(),
+    )
     ws.column_dimensions[get_column_letter(len(source_headers) + 1)].width = 48
     ws.column_dimensions[get_column_letter(len(source_headers) + 2)].width = 24
     ws.column_dimensions[get_column_letter(len(source_headers) + 3)].width = 36
     _set_widths(ws, 1, len(source_headers), header_row, total_row)
+    _set_widths(
+        ws, inf_start_col, inf_start_col + len(inf_source_headers) - 1,
+        header_row, inf_total_row,
+    )
+    ws.column_dimensions[get_column_letter(separator_col)].width = 3.5
+    ws.column_dimensions[get_column_letter(inf_start_col + len(inf_source_headers))].width = 28
+    ws.column_dimensions[get_column_letter(inf_start_col + len(inf_source_headers) + 1)].width = 36
     ws.freeze_panes = f"A{data_row}"
     if len(frame):
-        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(end_col)}{header_row + len(frame)}"
         note_col = get_column_letter(len(source_headers) + 3)
         validation = DataValidation(
             type="textLength", operator="lessThanOrEqual", formula1="1000", allow_blank=True
@@ -512,8 +723,20 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws.add_data_validation(validation)
         validation.add(f"{note_col}{data_row}:{note_col}{header_row + len(frame)}")
 
-    journal_amount = abs(cents_to_float(net))
-    je_title_row = total_row + 3
+    if len(inf_frame):
+        inf_note_col = get_column_letter(inf_end_col)
+        inf_validation = DataValidation(
+            type="textLength", operator="lessThanOrEqual", formula1="1000", allow_blank=True
+        )
+        inf_validation.error = "Reviewer notes are limited to 1,000 characters."
+        inf_validation.errorTitle = "Note too long"
+        ws.add_data_validation(inf_validation)
+        inf_validation.add(
+            f"{inf_note_col}{data_row}:{inf_note_col}{header_row + len(inf_frame)}"
+        )
+
+    exceptions_end_row = max(total_row, inf_total_row)
+    je_title_row = exceptions_end_row + 3
     je_caption_row = je_title_row + 1
     je_header_row = je_title_row + 2
     je_data_row = je_header_row + 1
@@ -526,7 +749,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
                 "AC001 Sales Accrual",
                 "017-00000-110160.0",
                 "Accrued Income",
-                journal_amount,
+                0.0,
                 0.0,
                 "Unresolved QuickBooks net exception support",
             ],
@@ -535,7 +758,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
                 "017-91000-400000-0",
                 "Income-Manufacturing",
                 0.0,
-                journal_amount,
+                0.0,
                 "Balanced offset",
             ],
         ],
@@ -554,6 +777,11 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         SLATE,
     )
     _write_dataframe_values(ws, je_frame, je_header_row, 1)
+    je_amount_formula = f"=ABS({qb_amount_sum_expr})"
+    ws.cell(je_data_row, 4, je_amount_formula)
+    ws.cell(je_data_row, 5, 0.0)
+    ws.cell(je_data_row + 1, 4, 0.0)
+    ws.cell(je_data_row + 1, 5, je_amount_formula)
     _format_header(ws, je_header_row, 1, len(je_headers), SLATE)
     _format_body_block(ws, je_data_row, je_data_row + len(je_frame) - 1, 1, len(je_headers), SLATE_LIGHT)
     for row in range(je_data_row, je_data_row + len(je_frame)):
@@ -562,14 +790,27 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     je_total_row = je_data_row + len(je_frame)
     _write_total_row(
         ws, je_total_row, 1, len(je_headers),
-        {"Debit": journal_amount, "Credit": journal_amount}, je_headers, "BALANCED TOTAL",
+        {"Debit": 0.0, "Credit": 0.0}, je_headers, "BALANCED TOTAL",
     )
+    ws.cell(je_total_row, 4, f"=SUM(D{je_data_row}:D{je_data_row + len(je_frame) - 1})")
+    ws.cell(je_total_row, 5, f"=SUM(E{je_data_row}:E{je_data_row + len(je_frame) - 1})")
+    for row in range(je_data_row, je_total_row + 1):
+        for col in (4, 5):
+            ws.cell(row, col).protection = Protection(locked=True)
     ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width or 0, 24)
     ws.column_dimensions["B"].width = max(ws.column_dimensions["B"].width or 0, 23)
     ws.column_dimensions["C"].width = max(ws.column_dimensions["C"].width or 0, 28)
     ws.column_dimensions["F"].width = max(ws.column_dimensions["F"].width or 0, 52)
 
-    duplicate_frame = result.duplicate_analysis
+    duplicate_analysis = result.duplicate_analysis
+    if "Dataset" in duplicate_analysis.columns:
+        duplicate_frame = duplicate_analysis.loc[
+            duplicate_analysis["Dataset"].eq("QuickBooks")
+        ].reset_index(drop=True)
+    else:
+        # Defensive compatibility for older result objects. An unscoped
+        # duplicate table must not leak Infinium rows into the JE work area.
+        duplicate_frame = duplicate_analysis.iloc[0:0].copy()
     duplicate_headers = list(duplicate_frame.columns)
     duplicate_title_row = je_total_row + 3
     duplicate_header_row = duplicate_title_row + 2
@@ -578,20 +819,21 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     section_end_col = max(end_col, duplicate_end_col)
     _write_title_band(
         ws, duplicate_title_row, 1, section_end_col,
-        "DUPLICATE MATCHING-KEY REVIEW | QUICKBOOKS AND INFINIUM", TEAL,
+        "QUICKBOOKS DUPLICATE MATCHING-KEY REVIEW | JE CONTROL", NAVY,
     )
     duplicate_caption = (
-        f"{len(duplicate_frame):,} repeated matching-key group(s) identified. Review these source values for "
-        "duplicate entries or legitimate repeated transactions."
+        f"{len(duplicate_frame):,} QuickBooks repeated matching-key group(s) identified. Review for duplicate "
+        "entries or legitimate repeated transactions. An unresolved QuickBooks row is already included in the "
+        "support total above and must not be added to the proposed JE a second time."
         if len(duplicate_frame)
-        else "No repeated PO/invoice/amount matching keys were identified in either dataset."
+        else "No QuickBooks repeated PO/invoice/amount matching keys were identified."
     )
-    _write_caption_band(ws, duplicate_title_row + 1, 1, section_end_col, duplicate_caption, TEAL)
+    _write_caption_band(ws, duplicate_title_row + 1, 1, section_end_col, duplicate_caption, NAVY)
     _write_dataframe_values(ws, duplicate_frame, duplicate_header_row, 1)
-    _format_header(ws, duplicate_header_row, 1, duplicate_end_col, TEAL)
+    _format_header(ws, duplicate_header_row, 1, duplicate_end_col, NAVY)
     if len(duplicate_frame):
         duplicate_last_row = duplicate_data_row + len(duplicate_frame) - 1
-        _format_body_block(ws, duplicate_data_row, duplicate_last_row, 1, duplicate_end_col, TEAL_LIGHT)
+        _format_body_block(ws, duplicate_data_row, duplicate_last_row, 1, duplicate_end_col, NAVY_LIGHT)
         _apply_number_formats(
             ws, duplicate_headers, duplicate_data_row, duplicate_last_row, 1,
             {"Amount"}, set(),
@@ -675,6 +917,15 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     _set_widths(ws, 1, fiscal_end_col, fiscal_header_row, fiscal_total_row)
     ws.column_dimensions["B"].width = max(ws.column_dimensions["B"].width or 0, 34)
     ws.print_title_rows = "1:6"
+
+    # Formula protection is active while table filtering, sorting, and row
+    # insertion/deletion remain available for post-generation review work.
+    ws.protection.sheet = True
+    ws.protection.insertRows = False
+    ws.protection.deleteRows = False
+    ws.protection.autoFilter = False
+    ws.protection.sort = False
+    ws.protection.selectUnlockedCells = False
     _prepare_sheet(ws)
 
 
