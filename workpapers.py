@@ -540,11 +540,32 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     end_col = len(headers)
     amount_col_position = source_headers.index(result.qb_mapping["amount"]) + 1
 
-    duplicate_frame = result.duplicate_analysis.copy()
+    # duplicate_analysis carries every disposition tier (canonical, excess,
+    # resolved-via-match, and held-for-review) in one report for full audit
+    # traceability. Each tier means something different for the JE, so the
+    # Excel output splits them: canonical/excess get their own section
+    # below, review-hold gets a distinct section further down, and
+    # resolved-via-match candidates need no special display at all since
+    # they proceeded normally with no exclusion.
+    duplicate_frame = result.duplicate_analysis.loc[
+        result.duplicate_analysis["Disposition"].isin(
+            ["Retained canonical row", "Excluded excess copy"]
+        )
+    ].copy()
     duplicate_frame["Reviewer Note"] = ""
     duplicate_headers = list(duplicate_frame.columns)
     dup_end_col = len(duplicate_headers)
-    duplicate_amount_total = float(duplicate_frame["Amount"].sum()) if len(duplicate_frame) else 0.0
+    duplicate_excluded_count = result.metrics["Duplicate QuickBooks Rows"]
+    duplicate_amount_total = result.metrics["Duplicate QuickBooks Amount"]
+
+    review_hold_frame = result.duplicate_analysis.loc[
+        result.duplicate_analysis["Disposition"] == "Held for review - excluded from proposed JE pending disposition"
+    ].copy()
+    review_hold_frame["Reviewer Disposition"] = "Pending Review"
+    review_headers = list(review_hold_frame.columns)
+    review_end_col = len(review_headers)
+    review_hold_count = result.metrics["Duplicate Review Hold QuickBooks Rows"]
+    review_hold_amount = result.metrics["Duplicate Review Hold QuickBooks Amount"]
 
     unmatched_qb_amounts = result.qb_work.loc[result.unmatched_qb, AMOUNT_CENTS].tolist()
     amounts = [cents_or_zero(val) for val in unmatched_qb_amounts]
@@ -566,11 +587,13 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         NAVY,
     )
     duplicate_caption = (
-        f"{len(duplicate_frame):,} QuickBooks item(s) were excluded from matching and from the accrual/JE "
-        "support total in the exceptions table above because each shares an identical normalized PO, "
-        "invoice, and signed amount with another QuickBooks row. Each is listed individually for review; "
-        "if a pair turns out to be a legitimate repeated transaction rather than a duplicate entry, it must "
-        "be added to the JE support manually."
+        f"{len(duplicate_frame):,} QuickBooks item(s) belong to a strong duplicate group (identical "
+        "normalized PO, invoice, and signed amount). One canonical row per group is retained and remains "
+        f"active; {duplicate_excluded_count:,} excess "
+        f"{'copy is' if duplicate_excluded_count == 1 else 'copies are'} excluded from the accrual/JE "
+        "support total in the exceptions table above. If a pair turns out to be a legitimate repeated "
+        "transaction rather than a duplicate entry, the excess copy must be added to the JE support "
+        "manually."
         if len(duplicate_frame)
         else "No QuickBooks exact duplicates (matching PO, invoice, and amount) were identified."
     )
@@ -745,7 +768,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     # far enough to read as clearly separate from the exception detail,
     # close enough to stay on the same review pass.
     duplicate_kpis = [
-        ("Duplicate QuickBooks items", len(duplicate_frame), '#,##0'),
+        ("Duplicate QuickBooks items excluded", duplicate_excluded_count, '#,##0'),
         ("Amount excluded from JE", duplicate_amount_total, '$#,##0.00;[Red]($#,##0.00);-'),
         ("JE inclusion", "Excluded", 'General'),
     ]
@@ -755,7 +778,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     dup_kpi_value_row = dup_title_row + 3
     dup_header_row = dup_title_row + 5
     dup_data_row = dup_header_row + 1
-    section_end_col = max(end_col, dup_end_col)
+    section_end_col = max(end_col, dup_end_col, review_end_col)
 
     _write_title_band(
         ws, dup_title_row, 1, section_end_col,
@@ -785,9 +808,17 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
             ws, duplicate_headers, dup_data_row, dup_last_row, 1,
             {"Amount"}, set(),
         )
-        for offset in range(len(duplicate_frame)):
-            row = dup_data_row + offset
-            _apply_duplicate_style(ws, row, 1, dup_end_col)
+        # Only the excess copy is actually excluded from the JE -- the
+        # retained canonical row is shown for audit context but must not be
+        # styled as if it, too, had been dropped from the accrual.
+        excluded_flags = duplicate_frame["Automatically Excluded"].fillna(False).astype(bool).tolist()
+        for offset, is_excluded in enumerate(excluded_flags):
+            if is_excluded:
+                _apply_duplicate_style(ws, dup_data_row + offset, 1, dup_end_col)
+        if "Reviewer Note" in duplicate_headers:
+            note_col = duplicate_headers.index("Reviewer Note") + 1
+            for row in range(dup_data_row, dup_last_row + 1):
+                ws.cell(row, note_col).protection = Protection(locked=False)
     else:
         dup_last_row = dup_header_row
 
@@ -800,6 +831,10 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws.column_dimensions[
             get_column_letter(duplicate_headers.index("Treatment") + 1)
         ].width = 42
+    if "Policy Note" in duplicate_headers:
+        ws.column_dimensions[
+            get_column_letter(duplicate_headers.index("Policy Note") + 1)
+        ].width = 46
     if "Reviewer Note" in duplicate_headers:
         ws.column_dimensions[
             get_column_letter(duplicate_headers.index("Reviewer Note") + 1)
@@ -814,7 +849,100 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws.add_data_validation(dup_validation)
         dup_validation.add(f"{dup_note_col}{dup_data_row}:{dup_note_col}{dup_last_row}")
 
-    je_title_row = dup_last_row + 3
+    # Duplicate Review Hold: weak-basis (PO-only or invoice-only) candidates
+    # that stayed active for matching but never resolved. They are already
+    # excluded from the JE support total above; this section is where a
+    # human records what actually happens to them next.
+    review_title_row = dup_last_row + 3
+    review_caption_row = review_title_row + 1
+    review_kpi_label_row = review_title_row + 2
+    review_kpi_value_row = review_title_row + 3
+    review_header_row = review_title_row + 5
+    review_data_row = review_header_row + 1
+    review_section_end_col = section_end_col
+
+    review_caption = (
+        f"{review_hold_count:,} weak-basis duplicate candidate(s) (sharing only a PO or only an "
+        "invoice with another QuickBooks row at the same signed amount) remained unresolved after "
+        "every matching pass. Rather than silently inflating the accrual, each is excluded from the "
+        "JE support total above and held here pending a documented human decision -- confirm as a "
+        "genuine duplicate, confirm as legitimate and add to the JE manually, or escalate for "
+        "investigation -- before this journal entry is posted."
+        if review_hold_count
+        else "No QuickBooks weak-basis duplicate candidates remain unresolved."
+    )
+    _write_title_band(
+        ws, review_title_row, 1, review_section_end_col,
+        "DUPLICATE REVIEW HOLD | REQUIRES DOCUMENTED DISPOSITION BEFORE POSTING", SLATE,
+    )
+    _write_caption_band(ws, review_caption_row, 1, review_section_end_col, review_caption, SLATE)
+
+    review_kpis = [
+        ("Items held for review", review_hold_count, '#,##0'),
+        ("Amount excluded from JE", review_hold_amount, '$#,##0.00;[Red]($#,##0.00);-'),
+        ("JE inclusion", "Excluded pending disposition", 'General'),
+    ]
+    for idx, (label, value, number_format) in enumerate(review_kpis):
+        start = 1 + idx * 2
+        if start > review_end_col:
+            break
+        ws.cell(review_kpi_label_row, start, label)
+        ws.cell(review_kpi_value_row, start, value)
+        ws.cell(review_kpi_label_row, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
+        ws.cell(review_kpi_value_row, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
+        ws.cell(review_kpi_value_row, start).number_format = number_format
+        ws.cell(review_kpi_value_row, start).protection = Protection(locked=True)
+        for row in (review_kpi_label_row, review_kpi_value_row):
+            ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+            ws.cell(row, start).border = _thin_border()
+
+    _write_dataframe_values(ws, review_hold_frame, review_header_row, 1)
+    _format_header(ws, review_header_row, 1, review_end_col, SLATE)
+    if len(review_hold_frame):
+        review_last_row = review_data_row + len(review_hold_frame) - 1
+        _format_body_block(ws, review_data_row, review_last_row, 1, review_end_col, SLATE_LIGHT)
+        _apply_number_formats(
+            ws, review_headers, review_data_row, review_last_row, 1,
+            {"Amount", "Excluded Amount"}, set(),
+        )
+        # Amber, not the red duplicate style: this needs attention, but it
+        # is not yet a confirmed duplicate the way an excess copy is.
+        for row in range(review_data_row, review_last_row + 1):
+            for col in range(1, review_end_col + 1):
+                ws.cell(row, col).fill = PatternFill("solid", fgColor=AMBER)
+    else:
+        review_last_row = review_header_row
+
+    _set_widths(ws, 1, review_end_col, review_header_row, review_last_row)
+    if "Policy Note" in review_headers:
+        ws.column_dimensions[
+            get_column_letter(review_headers.index("Policy Note") + 1)
+        ].width = 46
+    if "Other Source Row IDs In Group" in review_headers:
+        ws.column_dimensions[
+            get_column_letter(review_headers.index("Other Source Row IDs In Group") + 1)
+        ].width = 44
+    if "Reviewer Disposition" in review_headers:
+        disposition_col = review_headers.index("Reviewer Disposition") + 1
+        ws.column_dimensions[get_column_letter(disposition_col)].width = 40
+        if len(review_hold_frame):
+            disposition_validation = DataValidation(
+                type="list",
+                formula1='"Pending Review,Confirmed Duplicate - Exclude Permanently,'
+                         'Confirmed Legitimate - Include In JE Manually,Escalated For Investigation"',
+                allow_blank=False,
+            )
+            disposition_validation.error = "Select a disposition from the list before posting."
+            disposition_validation.errorTitle = "Disposition required"
+            ws.add_data_validation(disposition_validation)
+            disposition_letter = get_column_letter(disposition_col)
+            disposition_validation.add(
+                f"{disposition_letter}{review_data_row}:{disposition_letter}{review_last_row}"
+            )
+            for row in range(review_data_row, review_last_row + 1):
+                ws.cell(row, disposition_col).protection = Protection(locked=False)
+
+    je_title_row = review_last_row + 3
     je_caption_row = je_title_row + 1
     je_header_row = je_title_row + 2
     je_data_row = je_header_row + 1
@@ -1191,12 +1319,21 @@ def build_analytics_summary_sheet(wb: Workbook, result: ReconciliationResult) ->
         ws.cell(row + 1, col).number_format = number_format
 
     start = 11
+    posting_status = result.metrics.get("Posting Status", "READY TO POST")
     ws.cell(start, 1, "MODEL STATUS")
     ws.cell(start, 2, result.metrics["Control Status"])
     ws.cell(start, 1).font = Font(name="Segoe UI", size=11, bold=True, color=WHITE)
     ws.cell(start, 1).fill = PatternFill("solid", fgColor=SLATE)
     ws.cell(start, 2).font = Font(name="Segoe UI", size=11, bold=True, color=TEXT)
     ws.cell(start, 2).fill = PatternFill("solid", fgColor=GREEN_LIGHT if result.metrics["Control Status"] == "PASS" else RED_LIGHT)
+    ws.cell(start, 3, "POSTING STATUS")
+    ws.cell(start, 4, posting_status)
+    ws.cell(start, 3).font = Font(name="Segoe UI", size=11, bold=True, color=WHITE)
+    ws.cell(start, 3).fill = PatternFill("solid", fgColor=SLATE)
+    ws.cell(start, 4).font = Font(name="Segoe UI", size=11, bold=True, color=TEXT)
+    ws.cell(start, 4).fill = PatternFill(
+        "solid", fgColor=GREEN_LIGHT if posting_status == "READY TO POST" else AMBER
+    )
     _write_dataframe_values(ws, result.controls, start + 2, 1)
     _format_header(ws, start + 2, 1, len(result.controls.columns), SLATE)
     _format_body_block(ws, start + 3, start + 2 + len(result.controls), 1, len(result.controls.columns), SLATE_LIGHT)

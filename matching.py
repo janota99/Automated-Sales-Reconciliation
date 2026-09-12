@@ -4,11 +4,11 @@ Automatic matching first exhausts unique one-to-one relationships. A bounded,
 unambiguous one-to-many or many-to-one pass may then match rows sharing an exact
 normalized PO and/or invoice when their signed-cent totals agree exactly.
 
-Duplicate detection, exclusion, and reporting are handled entirely by
-``duplicates.py``. This module calls into it before matching so that no
-duplicate -- from a primary file or an optional historical file -- can ever
-be matched, clear an exception, or be folded into the accrual/journal-entry
-total.
+Duplicate detection, disposition, and reporting are handled by
+``duplicates.py``. Strong groups retain one canonical primary row and exclude
+only excess copies. Weaker candidates remain visible for review. Historical
+rows overlapping their own primary dataset are prevented from clearing an
+exception.
 """
 
 from __future__ import annotations
@@ -27,10 +27,12 @@ import pandas as pd
 
 from duplicates import (
     AMOUNT_CENTS,
+    DUPLICATE_RULE_VERSION,
     NORM_INV,
     NORM_PO,
     SOURCE_POS,
     combine_duplicate_reports,
+    finalize_review_dispositions,
     screen_duplicates,
 )
 from fuzzy_po_matching import (
@@ -64,8 +66,8 @@ __all__ = [
 ]
 
 
-APP_VERSION = "2.12.0"
-MATCHING_RULE_VERSION = "2026.09-1TO1-THEN-UNIQUE-GROUPED-HISTORICAL-TRACE-DUPSEPARATED"
+APP_VERSION = "2.13.0"
+MATCHING_RULE_VERSION = "2026.09-1TO1-GROUPED-HISTORICAL-CANONICAL-DUPLICATES"
 
 # Grouped matching is intentionally bounded to keep reconciliation runs
 # predictable. Larger or more complex reference pools remain unresolved for
@@ -167,6 +169,12 @@ class ReconciliationResult:
     duplicate_inf_rows: list[int] = field(default_factory=list)
     duplicate_qb_secondary_rows: list[int] = field(default_factory=list)
     duplicate_inf_secondary_rows: list[int] = field(default_factory=list)
+    suspected_qb_rows: list[int] = field(default_factory=list)
+    suspected_inf_rows: list[int] = field(default_factory=list)
+    suspected_qb_secondary_rows: list[int] = field(default_factory=list)
+    suspected_inf_secondary_rows: list[int] = field(default_factory=list)
+    duplicate_review_hold_qb_rows: list[int] = field(default_factory=list)
+    duplicate_review_hold_inf_rows: list[int] = field(default_factory=list)
 
 
 @lru_cache(maxsize=4096)
@@ -872,6 +880,8 @@ def build_paired_rows(
     candidates: pd.DataFrame,
     duplicate_qb_rows: list[int],
     duplicate_inf_rows: list[int],
+    duplicate_review_hold_qb_rows: list[int],
+    duplicate_review_hold_inf_rows: list[int],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     candidate_reason = (
@@ -962,7 +972,7 @@ def build_paired_rows(
             {
                 "Section": "04 Duplicate QuickBooks",
                 "Match ID": "",
-                "Match Result": "Duplicate QuickBooks entry",
+                "Match Result": "Excluded excess QuickBooks copy",
                 "QB Index": qidx,
                 "Infinium Index": None,
                 "QB Record Scope": "Primary",
@@ -970,9 +980,9 @@ def build_paired_rows(
                 "Group Sequence": None,
                 "Confidence": "Duplicate",
                 "Explanation": (
-                    "Matches another QuickBooks row under the duplicate criteria in "
-                    "duplicates.py. Excluded from matching and from the accrual total "
-                    "and proposed journal entry; listed here as a separate item."
+                    "An earlier canonical QuickBooks row with the same normalized PO, "
+                    "invoice, and signed cents was retained. Only this excess copy was "
+                    "excluded from matching and the proposed journal entry."
                 ),
             }
         )
@@ -981,7 +991,7 @@ def build_paired_rows(
             {
                 "Section": "05 Duplicate Infinium",
                 "Match ID": "",
-                "Match Result": "Duplicate Infinium entry",
+                "Match Result": "Excluded excess Infinium copy",
                 "QB Index": None,
                 "Infinium Index": iidx,
                 "QB Record Scope": None,
@@ -989,10 +999,50 @@ def build_paired_rows(
                 "Group Sequence": None,
                 "Confidence": "Duplicate",
                 "Explanation": (
-                    "Matches another Infinium row under the duplicate criteria in "
-                    "duplicates.py. Excluded from matching; kept on a separate "
-                    "Infinium duplicates worksheet because its treatment is "
-                    "entirely different from QuickBooks duplicates."
+                    "An earlier canonical Infinium row with the same normalized PO, "
+                    "invoice, and signed cents was retained. Only this excess copy was "
+                    "excluded from matching and is reported separately."
+                ),
+            }
+        )
+    for qidx in duplicate_review_hold_qb_rows:
+        rows.append(
+            {
+                "Section": "06 Duplicate Review Hold QuickBooks",
+                "Match ID": "",
+                "Match Result": "Weak-basis duplicate candidate - unresolved",
+                "QB Index": qidx,
+                "Infinium Index": None,
+                "QB Record Scope": "Primary",
+                "Infinium Record Scope": None,
+                "Group Sequence": None,
+                "Confidence": "Hold",
+                "Explanation": (
+                    "This row shares only a PO or only an invoice (never both) with another "
+                    "QuickBooks row at the same signed amount, so it was never excluded "
+                    "outright -- it remained active and eligible to match normally. It did "
+                    "not match anything, so it is excluded from the proposed JE support total "
+                    "and held here pending a documented human disposition."
+                ),
+            }
+        )
+    for iidx in duplicate_review_hold_inf_rows:
+        rows.append(
+            {
+                "Section": "07 Duplicate Review Hold Infinium",
+                "Match ID": "",
+                "Match Result": "Weak-basis duplicate candidate - unresolved",
+                "QB Index": None,
+                "Infinium Index": iidx,
+                "QB Record Scope": None,
+                "Infinium Record Scope": "Primary",
+                "Group Sequence": None,
+                "Confidence": "Hold",
+                "Explanation": (
+                    "This row shares only a PO or only an invoice (never both) with another "
+                    "Infinium row at the same signed amount. It remained active and eligible "
+                    "to match normally, did not match anything, and is held here for review. "
+                    "Infinium items never feed the QuickBooks accrual regardless."
                 ),
             }
         )
@@ -1152,6 +1202,8 @@ def build_method_summary(
     inf: pd.DataFrame,
     duplicate_qb_rows: list[int],
     duplicate_inf_rows: list[int],
+    duplicate_review_hold_qb_rows: list[int],
+    duplicate_review_hold_inf_rows: list[int],
 ) -> pd.DataFrame:
     buckets: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"QB Rows": 0, "Infinium Rows": 0, "QB Cents": 0, "Infinium Cents": 0}
@@ -1183,13 +1235,21 @@ def build_method_summary(
         bucket["Infinium Rows"] = len(unmatched_inf)
         bucket["Infinium Cents"] = _amount_total(inf, unmatched_inf)
     if duplicate_qb_rows:
-        bucket = buckets["Duplicate QuickBooks (excluded from accrual)"]
+        bucket = buckets["Excess QuickBooks copies excluded from accrual"]
         bucket["QB Rows"] = len(duplicate_qb_rows)
         bucket["QB Cents"] = _amount_total(qb, duplicate_qb_rows)
     if duplicate_inf_rows:
-        bucket = buckets["Duplicate Infinium (separate worksheet)"]
+        bucket = buckets["Excess Infinium copies excluded (separate worksheet)"]
         bucket["Infinium Rows"] = len(duplicate_inf_rows)
         bucket["Infinium Cents"] = _amount_total(inf, duplicate_inf_rows)
+    if duplicate_review_hold_qb_rows:
+        bucket = buckets["Duplicate Review Hold - QuickBooks (excluded from JE, pending disposition)"]
+        bucket["QB Rows"] = len(duplicate_review_hold_qb_rows)
+        bucket["QB Cents"] = _amount_total(qb, duplicate_review_hold_qb_rows)
+    if duplicate_review_hold_inf_rows:
+        bucket = buckets["Duplicate Review Hold - Infinium (pending disposition)"]
+        bucket["Infinium Rows"] = len(duplicate_review_hold_inf_rows)
+        bucket["Infinium Cents"] = _amount_total(inf, duplicate_review_hold_inf_rows)
     records = []
     for method, values in buckets.items():
         records.append(
@@ -1333,36 +1393,37 @@ def build_rules_and_config(
              "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence, including the fuzzy PO pass (Priority 7)."},
             {"Priority": 12, "Rule": "Unused secondary rows", "Automatic": "Excluded",
              "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
-            {"Priority": 13, "Rule": "Exact duplicate exclusion (see duplicates.py)", "Automatic": "Yes, before matching",
+            {"Priority": 13, "Rule": "Strong duplicate canonicalization (see duplicates.py)", "Automatic": "Yes, before matching",
              "Requirement": (
-                 "A row whose amount matches another row exactly, and whose populated PO and/or "
-                 "invoice reference also matches exactly, is a duplicate. Duplicates are removed "
-                 "from the working population before any matching or clearance pass runs and are "
-                 "excluded from the accrual total and the proposed journal entry amount. Each "
-                 "duplicate item is listed separately by dataset: QuickBooks duplicates on their "
-                 "own report, Infinium duplicates on a separate worksheet, since their treatment "
-                 "is entirely different."
+                 "For same-file rows with populated PO and invoice and identical signed cents, "
+                 "the earliest source-position row is retained as the canonical transaction and "
+                 "only later copies are excluded. Canonical and excluded rows share a stable group "
+                 "ID and are itemized separately by dataset."
              )},
-            {"Priority": 14, "Rule": "Shared PO/invoice with differing amounts is not a duplicate", "Automatic": "N/A",
+            {"Priority": 14, "Rule": "Weak duplicate candidates: matched normally, held if unresolved",
+             "Automatic": "Conditional",
              "Requirement": (
-                 "Rows sharing only a PO or only an invoice, with different amounts, are never assumed "
-                 "to be duplicates. They remain eligible for the grouped aggregate matching passes "
-                 "(Priorities 4-6), which test whether several such rows sum exactly to one matching "
-                 "opposing entry."
+                 "Rows with identical signed cents but only a PO or only an invoice are never "
+                 "auto-excluded up front -- they remain fully active and eligible to match through "
+                 "every pass above. A candidate that matches proceeds normally with no exclusion. A "
+                 "candidate that is still unresolved once matching and historical clearance complete is "
+                 "removed from the proposed JE support total and placed in Duplicate Review Hold, "
+                 "requiring a documented human disposition before posting. Rows sharing a reference with "
+                 "different amounts are never assumed duplicates and remain eligible for controlled "
+                 "aggregate matching (Priorities 4-6)."
              )},
-            {"Priority": 15, "Rule": "Historical/secondary duplicate exclusion", "Automatic": "Yes, before clearance",
+            {"Priority": 15, "Rule": "Historical overlap exclusion", "Automatic": "Yes, before clearance",
              "Requirement": (
-                 "Optional historical QuickBooks and Infinium files are screened for exact duplicates "
-                 "the same way as the primary files, before they are used to clear a primary exception. "
-                 "A duplicated historical row can never clear a primary exception; it is itemized "
-                 "alongside that dataset's primary duplicates, tagged with a separate 'Historical "
-                 "(Secondary)' scope."
+                 "Historical files use the same canonicalization and are also compared with their own "
+                 "primary dataset. A repeated historical business key is excluded from clearance while "
+                 "the primary row remains untouched."
              )},
         ]
     )
     config_records = [
         {"Setting": "Application Version", "Value": APP_VERSION},
         {"Setting": "Matching Rule Version", "Value": MATCHING_RULE_VERSION},
+        {"Setting": "Duplicate Rule Version", "Value": DUPLICATE_RULE_VERSION},
         {"Setting": "Run ID", "Value": metadata["run_id"]},
         {"Setting": "Run Timestamp (Central Time)", "Value": metadata["run_timestamp"]},
         {"Setting": "QuickBooks Filename", "Value": metadata["qb_filename"]},
@@ -1391,9 +1452,9 @@ def build_rules_and_config(
         {
             "Setting": "Duplicate Treatment",
             "Value": (
-                "Exact duplicates (see duplicates.py) are excluded from matching and from the "
-                "accrual/journal entry total for every dataset, including optional historical files. "
-                "QuickBooks duplicates and Infinium duplicates are itemized on two separate reports."
+                "Strong same-file groups retain one deterministic canonical row and exclude only excess "
+                "copies. PO-only and invoice-only candidates remain active for review. Historical rows "
+                "overlapping their primary dataset cannot clear exceptions."
             ),
         },
     ]
@@ -1518,6 +1579,8 @@ def build_controls(
     unmatched_inf: list[int],
     duplicate_qb_rows: list[int],
     duplicate_inf_rows: list[int],
+    duplicate_review_hold_qb_rows: list[int],
+    duplicate_review_hold_inf_rows: list[int],
 ) -> pd.DataFrame:
     matched_q = _matched_row_indexes(matches, "QB")
     matched_i = _matched_row_indexes(matches, "INF")
@@ -1541,25 +1604,40 @@ def build_controls(
     unresolved_i_total = _amount_total(inf, unmatched_inf)
     duplicate_q_total = _amount_total(qb, duplicate_qb_rows)
     duplicate_i_total = _amount_total(inf, duplicate_inf_rows)
+    review_hold_q_total = _amount_total(qb, duplicate_review_hold_qb_rows)
+    review_hold_i_total = _amount_total(inf, duplicate_review_hold_inf_rows)
     historical_difference = (
         round(float(historical_clearances["Amount Difference"].sum()), 2)
         if not historical_clearances.empty else 0.0
     )
     records = [
         ("QuickBooks row completeness", len(qb),
-         len(matched_q) + len(historical_q) + len(unmatched_qb) + len(duplicate_qb_rows)),
+         len(matched_q) + len(historical_q) + len(unmatched_qb) + len(duplicate_qb_rows)
+         + len(duplicate_review_hold_qb_rows)),
         ("Infinium row completeness", len(inf),
-         len(matched_i) + len(historical_i) + len(unmatched_inf) + len(duplicate_inf_rows)),
+         len(matched_i) + len(historical_i) + len(unmatched_inf) + len(duplicate_inf_rows)
+         + len(duplicate_review_hold_inf_rows)),
         ("QuickBooks amount roll-forward", cents_to_float(qb_total),
-         cents_to_float(matched_q_total + historical_q_total + unresolved_q_total + duplicate_q_total)),
+         cents_to_float(
+             matched_q_total + historical_q_total + unresolved_q_total
+             + duplicate_q_total + review_hold_q_total
+         )),
         ("Infinium amount roll-forward", cents_to_float(inf_total),
-         cents_to_float(matched_i_total + historical_i_total + unresolved_i_total + duplicate_i_total)),
+         cents_to_float(
+             matched_i_total + historical_i_total + unresolved_i_total
+             + duplicate_i_total + review_hold_i_total
+         )),
         ("Primary-to-primary matched totals", cents_to_float(matched_q_total), cents_to_float(matched_i_total)),
         ("Historical clearance amount difference", 0.0, historical_difference),
         ("Unresolved JE support", cents_to_float(unresolved_q_total),
-         cents_to_float(qb_total - matched_q_total - historical_q_total - duplicate_q_total)),
-        ("Duplicate QuickBooks items excluded from JE", cents_to_float(duplicate_q_total),
+         cents_to_float(
+             qb_total - matched_q_total - historical_q_total
+             - duplicate_q_total - review_hold_q_total
+         )),
+        ("Excess QuickBooks copies excluded from JE", cents_to_float(duplicate_q_total),
          cents_to_float(duplicate_q_total)),
+        ("Duplicate Review Hold QuickBooks items excluded from JE",
+         cents_to_float(review_hold_q_total), cents_to_float(review_hold_q_total)),
     ]
     output = []
     for check, expected, actual in records:
@@ -1607,36 +1685,38 @@ def build_reconciliation(
         else None
     )
 
-    # Screen every dataset -- both primary files and any optional historical
-    # (secondary) files -- for exact duplicates before any matching or
-    # clearance pass runs. A duplicated historical row is just as capable of
-    # improperly clearing a real primary exception as a duplicated primary
-    # row is of misstating the accrual, so neither may participate; both are
-    # itemized separately instead. See duplicates.py for the matching rules.
+    # Canonicalize strong same-file groups before matching. Only excess copies
+    # are removed; the earliest source-position row remains active. Weak groups
+    # are reported for review without automatic exclusion. Historical frames
+    # are additionally compared with their own primary population so an
+    # overlapping historical row cannot clear an opposing primary exception.
     qb_screen = screen_duplicates(
         qb, QB_ID, "QuickBooks", "Primary",
-        "Excluded from the accrual total and the proposed journal entry amount; listed separately.",
+        "Strong groups retain one canonical row; only excess copies are excluded from the JE.",
+        auto_exclude_strict=True,
     )
     inf_screen = screen_duplicates(
         inf, INF_ID, "Infinium", "Primary",
-        "Kept on a separate worksheet; Infinium duplicates are reviewed independently and never "
-        "feed the QuickBooks accrual or journal entry.",
+        "Strong groups retain one canonical row; only excess copies are excluded from matching.",
+        auto_exclude_strict=True,
     )
     qb_secondary_screen = (
         screen_duplicates(
             qb_secondary, QB_ID, "QuickBooks", "Historical (Secondary)",
-            "Excluded from historical clearance matching; a duplicated historical row could "
-            "otherwise improperly clear a real primary exception. Historical rows never feed "
-            "the accrual or journal entry regardless.",
+            "Excess copies and rows overlapping QuickBooks primary are excluded from clearance.",
+            auto_exclude_strict=True,
+            reference_frame=qb_screen.active_frame,
+            reference_id_column=QB_ID,
         )
         if qb_secondary is not None else None
     )
     inf_secondary_screen = (
         screen_duplicates(
             inf_secondary, INF_ID, "Infinium", "Historical (Secondary)",
-            "Excluded from historical clearance matching; a duplicated historical row could "
-            "otherwise improperly clear a real primary exception. Historical rows never feed "
-            "the accrual or journal entry regardless.",
+            "Excess copies and rows overlapping Infinium primary are excluded from clearance.",
+            auto_exclude_strict=True,
+            reference_frame=inf_screen.active_frame,
+            reference_id_column=INF_ID,
         )
         if inf_secondary is not None else None
     )
@@ -1657,9 +1737,31 @@ def build_reconciliation(
         qb_secondary_active,
         inf_secondary_active,
     )
+
+    # Weak-basis (PO-only or invoice-only) duplicate candidates were never
+    # excluded from matching -- they stayed active and could resolve
+    # normally. Now that matching and historical clearance are both final,
+    # split them by outcome: one that matched needs no further action, but
+    # one that is still unresolved must never quietly inflate the proposed
+    # JE just because nobody happened to open the duplicates worksheet. It
+    # is pulled into its own Duplicate Review Hold population instead.
+    duplicate_review_hold_qb = sorted(set(unmatched_qb) & set(qb_screen.suspected_rows))
+    duplicate_review_hold_inf = sorted(set(unmatched_inf) & set(inf_screen.suspected_rows))
+    unmatched_qb = sorted(set(unmatched_qb) - set(duplicate_review_hold_qb))
+    unmatched_inf = sorted(set(unmatched_inf) - set(duplicate_review_hold_inf))
+    resolved_suspected_qb_ids = {
+        qb.at[idx, QB_ID] for idx in qb_screen.suspected_rows if idx not in duplicate_review_hold_qb
+    }
+    held_suspected_qb_ids = {qb.at[idx, QB_ID] for idx in duplicate_review_hold_qb}
+    resolved_suspected_inf_ids = {
+        inf.at[idx, INF_ID] for idx in inf_screen.suspected_rows if idx not in duplicate_review_hold_inf
+    }
+    held_suspected_inf_ids = {inf.at[idx, INF_ID] for idx in duplicate_review_hold_inf}
+
     paired_rows = build_paired_rows(
         matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf, candidates,
         qb_screen.duplicate_rows, inf_screen.duplicate_rows,
+        duplicate_review_hold_qb, duplicate_review_hold_inf,
     )
     normalization = build_normalization_detail(qb, inf, qb_mapping, inf_mapping)
     assessments = build_match_assessments(
@@ -1668,15 +1770,24 @@ def build_reconciliation(
     method_summary = build_method_summary(
         matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf,
         qb_screen.duplicate_rows, inf_screen.duplicate_rows,
+        duplicate_review_hold_qb, duplicate_review_hold_inf,
     )
     exception_analysis = build_exception_analysis(qb, inf, unmatched_qb, unmatched_inf, candidates)
-    duplicate_analysis = combine_duplicate_reports(
-        qb_screen.report,
-        qb_secondary_screen.report if qb_secondary_screen else None,
+    duplicate_analysis = finalize_review_dispositions(
+        combine_duplicate_reports(
+            qb_screen.report,
+            qb_secondary_screen.report if qb_secondary_screen else None,
+        ),
+        resolved_ids=resolved_suspected_qb_ids,
+        held_ids=held_suspected_qb_ids,
     )
-    infinium_duplicate_analysis = combine_duplicate_reports(
-        inf_screen.report,
-        inf_secondary_screen.report if inf_secondary_screen else None,
+    infinium_duplicate_analysis = finalize_review_dispositions(
+        combine_duplicate_reports(
+            inf_screen.report,
+            inf_secondary_screen.report if inf_secondary_screen else None,
+        ),
+        resolved_ids=resolved_suspected_inf_ids,
+        held_ids=held_suspected_inf_ids,
     )
     product_summary = build_product_summary(
         qb,
@@ -1687,6 +1798,7 @@ def build_reconciliation(
     controls = build_controls(
         qb, inf, matches, historical_clearances, unmatched_qb, unmatched_inf,
         qb_screen.duplicate_rows, inf_screen.duplicate_rows,
+        duplicate_review_hold_qb, duplicate_review_hold_inf,
     )
     rules, config = build_rules_and_config(
         qb_mapping,
@@ -1762,12 +1874,29 @@ def build_reconciliation(
         "Duplicate QuickBooks Amount": cents_to_float(_amount_total(qb, qb_screen.duplicate_rows)),
         "Duplicate Infinium Rows": len(inf_screen.duplicate_rows),
         "Duplicate Infinium Amount": cents_to_float(_amount_total(inf, inf_screen.duplicate_rows)),
+        "Suspected QuickBooks Duplicate Rows": len(qb_screen.suspected_rows),
+        "Suspected Infinium Duplicate Rows": len(inf_screen.suspected_rows),
+        "Suspected QuickBooks Secondary Duplicate Rows": (
+            len(qb_secondary_screen.suspected_rows) if qb_secondary_screen else 0
+        ),
+        "Suspected Infinium Secondary Duplicate Rows": (
+            len(inf_secondary_screen.suspected_rows) if inf_secondary_screen else 0
+        ),
         "Duplicate QuickBooks Secondary Rows Excluded": (
             len(qb_secondary_screen.duplicate_rows) if qb_secondary_screen else 0
         ),
         "Duplicate Infinium Secondary Rows Excluded": (
             len(inf_secondary_screen.duplicate_rows) if inf_secondary_screen else 0
         ),
+        "Duplicate Review Hold QuickBooks Rows": len(duplicate_review_hold_qb),
+        "Duplicate Review Hold QuickBooks Amount": cents_to_float(
+            _amount_total(qb, duplicate_review_hold_qb)
+        ),
+        "Duplicate Review Hold Infinium Rows": len(duplicate_review_hold_inf),
+        "Duplicate Review Hold Infinium Amount": cents_to_float(
+            _amount_total(inf, duplicate_review_hold_inf)
+        ),
+        "Posting Status": "REVIEW REQUIRED" if duplicate_review_hold_qb else "READY TO POST",
         "QuickBooks Match Rate by Row": (
             (len(matched_q) + len(historical_matched_q)) / len(qb) if len(qb) else 0
         ),
@@ -1779,10 +1908,10 @@ def build_reconciliation(
         "Invalid Infinium Amounts": int(inf[AMOUNT_CENTS].isna().sum()),
         "QuickBooks Subtotal Rows Excluded": int(metadata.get("qb_subtotal_rows_excluded", 0)),
         "Duplicate QuickBooks Item Groups": (
-            int(duplicate_analysis["Source Row ID"].nunique()) if not duplicate_analysis.empty else 0
+            int(duplicate_analysis["Duplicate Group ID"].nunique()) if not duplicate_analysis.empty else 0
         ),
         "Duplicate Infinium Item Groups": (
-            int(infinium_duplicate_analysis["Source Row ID"].nunique())
+            int(infinium_duplicate_analysis["Duplicate Group ID"].nunique())
             if not infinium_duplicate_analysis.empty else 0
         ),
         "Control Status": "PASS" if controls["Status"].eq("PASS").all() else "FAIL",
@@ -1825,6 +1954,12 @@ def build_reconciliation(
         duplicate_inf_rows=inf_screen.duplicate_rows,
         duplicate_qb_secondary_rows=qb_secondary_screen.duplicate_rows if qb_secondary_screen else [],
         duplicate_inf_secondary_rows=inf_secondary_screen.duplicate_rows if inf_secondary_screen else [],
+        suspected_qb_rows=qb_screen.suspected_rows,
+        suspected_inf_rows=inf_screen.suspected_rows,
+        suspected_qb_secondary_rows=qb_secondary_screen.suspected_rows if qb_secondary_screen else [],
+        suspected_inf_secondary_rows=inf_secondary_screen.suspected_rows if inf_secondary_screen else [],
+        duplicate_review_hold_qb_rows=duplicate_review_hold_qb,
+        duplicate_review_hold_inf_rows=duplicate_review_hold_inf,
     )
     validate_reconciliation(result)
     return result
@@ -1836,6 +1971,83 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
         raise ValueError(f"Reconciliation control failure: {', '.join(failures)}")
     duplicate_qb = set(result.duplicate_qb_rows)
     duplicate_inf = set(result.duplicate_inf_rows)
+    review_hold_qb = set(result.duplicate_review_hold_qb_rows)
+    review_hold_inf = set(result.duplicate_review_hold_inf_rows)
+    if duplicate_qb.intersection(result.suspected_qb_rows):
+        raise ValueError(
+            "Duplicate disposition control failure: a QuickBooks row was both "
+            "excluded and retained for review."
+        )
+    if duplicate_inf.intersection(result.suspected_inf_rows):
+        raise ValueError(
+            "Duplicate disposition control failure: an Infinium row was both "
+            "excluded and retained for review."
+        )
+    if not review_hold_qb.issubset(result.suspected_qb_rows):
+        raise ValueError(
+            "Duplicate Review Hold control failure: a held QuickBooks row was never "
+            "a suspected duplicate candidate."
+        )
+    if not review_hold_inf.issubset(result.suspected_inf_rows):
+        raise ValueError(
+            "Duplicate Review Hold control failure: a held Infinium row was never "
+            "a suspected duplicate candidate."
+        )
+    if review_hold_qb.intersection(result.unmatched_qb) or review_hold_inf.intersection(result.unmatched_inf):
+        raise ValueError(
+            "Duplicate Review Hold control failure: a held row also remained in the "
+            "unresolved population used for the accrual/journal entry total."
+        )
+    if duplicate_qb.intersection(review_hold_qb) or duplicate_inf.intersection(review_hold_inf):
+        raise ValueError(
+            "Duplicate Review Hold control failure: a row was both auto-excluded and "
+            "placed in Duplicate Review Hold."
+        )
+    for group in result.matches:
+        if review_hold_qb.intersection(group.qb_rows) or review_hold_inf.intersection(group.inf_rows):
+            raise ValueError(
+                "Duplicate Review Hold control failure: a held row was included in an "
+                "accepted match."
+            )
+    for dataset, report, frame, id_column, excluded_rows in (
+        ("QuickBooks", result.duplicate_analysis, result.qb_work, QB_ID, duplicate_qb | review_hold_qb),
+        ("Infinium", result.infinium_duplicate_analysis, result.inf_work, INF_ID, duplicate_inf | review_hold_inf),
+    ):
+        if report.empty:
+            if excluded_rows:
+                raise ValueError(
+                    f"Duplicate audit control failure: excluded {dataset} rows have no report."
+                )
+            continue
+        required_columns = {
+            "Duplicate Group ID", "Disposition", "Automatically Excluded",
+            "Source Row ID", "Source Scope", "Duplicate Rule Version",
+        }
+        if not required_columns.issubset(report.columns):
+            raise ValueError(f"Duplicate audit control failure: {dataset} report schema is incomplete.")
+        if report["Duplicate Group ID"].isna().any() or report["Duplicate Rule Version"].ne(DUPLICATE_RULE_VERSION).any():
+            raise ValueError(f"Duplicate audit control failure: {dataset} group IDs or rule versions are invalid.")
+        primary_report = report.loc[report["Source Scope"] == "Primary"]
+        reported_excluded_ids = set(
+            primary_report.loc[
+                primary_report["Automatically Excluded"].fillna(False).astype(bool),
+                "Source Row ID",
+            ]
+        )
+        expected_excluded_ids = {frame.at[index, id_column] for index in excluded_rows}
+        if reported_excluded_ids != expected_excluded_ids:
+            raise ValueError(
+                f"Duplicate audit control failure: excluded {dataset} rows do not agree with the report."
+            )
+        confirmed_primary = primary_report.loc[
+            primary_report["Payload Confirmed"].fillna(False).astype(bool)
+            & primary_report["Duplicate Basis"].ne("Primary/Historical overlap")
+        ]
+        for _, group in confirmed_primary.groupby("Duplicate Group ID", sort=False):
+            if group["Disposition"].eq("Retained canonical row").sum() != 1:
+                raise ValueError(
+                    f"Duplicate canonicalization control failure: {dataset} group does not retain exactly one canonical row."
+                )
     for group in result.matches:
         q_count = len(group.qb_rows)
         i_count = len(group.inf_rows)

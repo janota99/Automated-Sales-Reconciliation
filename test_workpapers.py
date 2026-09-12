@@ -16,6 +16,7 @@ import io
 import pandas as pd
 import pytest
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from matching import build_reconciliation
 from workpapers import build_analytics_workbook, build_primary_workbook
@@ -89,8 +90,11 @@ def _build_result_without_duplicates(qb_mapping, inf_mapping, make_metadata):
 
 def test_primary_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping, make_metadata):
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
-    assert result.metrics["Duplicate QuickBooks Rows"] == 2
-    assert result.metrics["Duplicate Infinium Rows"] == 2
+    # Each pair is a full-payload strict duplicate: one row is retained as
+    # canonical (and, matching nothing else, becomes its own unresolved
+    # exception), so only the excess copy is counted as excluded.
+    assert result.metrics["Duplicate QuickBooks Rows"] == 1
+    assert result.metrics["Duplicate Infinium Rows"] == 1
 
     workbook_bytes = build_primary_workbook(result)
     assert len(workbook_bytes) > 0
@@ -244,5 +248,87 @@ def test_render_result_duplicate_badge_never_raises(qb_mapping, inf_mapping, mak
     unresolved_duplicate_groups = int(metrics.get("Duplicate QuickBooks Rows", 0)) + int(
         metrics.get("Duplicate Infinium Rows", 0)
     )
-    assert unresolved_duplicate_groups == 4
+    assert unresolved_duplicate_groups == 2
     assert "Reconciliation Status" not in result.duplicate_analysis.columns
+
+
+def _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata):
+    qb_rows = [
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1"}]
+    return build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+
+
+def test_duplicate_review_hold_section_renders_with_documented_disposition_dropdown(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """The Duplicate Review Hold section must appear after the duplicates
+    section (before the JE), list the held items, and give the reviewer a
+    controlled-vocabulary, editable place to record a documented decision
+    -- not just a static, uneditable list."""
+    result = _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata)
+    assert result.metrics["Posting Status"] == "REVIEW REQUIRED"
+    assert result.metrics["Duplicate Review Hold QuickBooks Rows"] == 2
+
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    ws = wb["Unresolved Exceptions"]
+
+    def first_row_containing(needle: str) -> int:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value and needle in str(cell.value):
+                    return cell.row
+        raise AssertionError(f"{needle!r} not found in sheet")
+
+    duplicates_row = first_row_containing("QUICKBOOKS DUPLICATES EXCLUDED FROM JE")
+    review_hold_row = first_row_containing("DUPLICATE REVIEW HOLD")
+    je_row = first_row_containing("PROPOSED JOURNAL ENTRY")
+    disposition_header_row = first_row_containing("Reviewer Disposition")
+
+    assert duplicates_row < review_hold_row < je_row
+
+    disposition_col = next(
+        cell.column for cell in ws[disposition_header_row] if cell.value == "Reviewer Disposition"
+    )
+    data_rows = range(disposition_header_row + 1, disposition_header_row + 3)
+    for row in data_rows:
+        cell = ws.cell(row, disposition_col)
+        assert cell.value == "Pending Review"
+        assert cell.protection.locked is False, "reviewer must be able to edit the disposition cell"
+
+    list_validations = [dv for dv in ws.data_validations.dataValidation if dv.type == "list"]
+    disposition_letter = get_column_letter(disposition_col)
+    matching_validation = next(
+        dv for dv in list_validations
+        if f"{disposition_letter}{disposition_header_row + 1}" in str(dv.sqref)
+    )
+    assert "Pending Review" in matching_validation.formula1
+    assert "Confirmed Duplicate - Exclude Permanently" in matching_validation.formula1
+    assert "Confirmed Legitimate - Include In JE Manually" in matching_validation.formula1
+    assert "Escalated For Investigation" in matching_validation.formula1
+
+
+def test_no_review_hold_items_renders_empty_section_cleanly(qb_mapping, inf_mapping, make_metadata):
+    """When every weak-basis candidate resolves via a match, the Review
+    Hold section must still render (with an explanatory 'none' caption)
+    rather than crash on an empty frame."""
+    qb_rows = [
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [{"PO": "", "Invoice": "INV-DUP", "Amount": 50.00, "Period": "1"}]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.metrics["Posting Status"] == "READY TO POST"
+    workbook_bytes = build_primary_workbook(result)
+    ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
+    unresolved_text = _worksheet_text(ws)
+    assert any("No QuickBooks weak-basis duplicate candidates remain unresolved" in t for t in unresolved_text)

@@ -333,6 +333,22 @@ def render_result(result: ReconciliationResult) -> None:
     else:
         st.error("Reconciliation completed with failed controls. Downloads are withheld until controls pass.")
 
+    posting_status = metrics.get("Posting Status", "READY TO POST")
+    if posting_status == "REVIEW REQUIRED":
+        review_hold_qb = int(metrics.get("Duplicate Review Hold QuickBooks Rows", 0))
+        review_hold_amount = metrics.get("Duplicate Review Hold QuickBooks Amount", 0.0)
+        render_notice_panel(
+            "Review required before posting",
+            (
+                f"{review_hold_qb:,} weak-basis duplicate candidate(s) totaling "
+                f"{format_currency(review_hold_amount)} remained unresolved after matching. They are excluded "
+                "from the proposed journal entry and held in Duplicate Review Hold pending a documented human "
+                "disposition -- see the Unresolved Exceptions sheet in the download."
+            ),
+            tone="warning",
+            icon="!",
+        )
+
     failed_controls = int(result.controls["Status"].ne("PASS").sum())
     invalid_amount_rows = int(
         metrics["Invalid QuickBooks Amounts"] + metrics["Invalid Infinium Amounts"]

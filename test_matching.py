@@ -271,11 +271,14 @@ def test_full_reconciliation_applies_all_four_duplicate_rules(qb_mapping, inf_ma
         make_metadata(), 2026,
     )
 
-    # Rule 1: duplicates excluded from the accrual/JE total, but present.
-    assert result.metrics["Duplicate QuickBooks Rows"] == 2
-    assert result.metrics["Duplicate QuickBooks Amount"] == pytest.approx(100.00)
-    assert result.metrics["Unresolved QuickBooks Rows"] == 1  # only PO999
-    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(15.00)
+    # Rule 1: each duplicate pair is a full-payload strict match, so one row
+    # is retained as canonical and only the excess copy is excluded from
+    # the accrual/JE total. The canonical copy matches nothing else here,
+    # so it becomes its own genuine unresolved exception -- it is not lost.
+    assert result.metrics["Duplicate QuickBooks Rows"] == 1
+    assert result.metrics["Duplicate QuickBooks Amount"] == pytest.approx(50.00)
+    assert result.metrics["Unresolved QuickBooks Rows"] == 2  # PO999 + canonical PO200 copy
+    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(65.00)
 
     # Rule 2: differing-amount same-PO rows are not duplicates; the grouped
     # aggregate pass matched them to the Infinium entry instead.
@@ -286,9 +289,13 @@ def test_full_reconciliation_applies_all_four_duplicate_rules(qb_mapping, inf_ma
     assert len(po300_matches) == 1
     assert po300_matches[0].group_level is True
 
-    # Rule 3: QuickBooks and Infinium duplicates are two separate reports.
+    # Rule 3: QuickBooks and Infinium duplicates are two separate reports,
+    # each itemizing both the canonical row and its excess copy.
     assert len(result.duplicate_analysis) == 2
     assert set(result.duplicate_analysis["Dataset"]) == {"QuickBooks"}
+    assert set(result.duplicate_analysis["Disposition"]) == {
+        "Retained canonical row", "Excluded excess copy",
+    }
     assert len(result.infinium_duplicate_analysis) == 2
     assert set(result.infinium_duplicate_analysis["Dataset"]) == {"Infinium"}
 
@@ -297,9 +304,16 @@ def test_full_reconciliation_applies_all_four_duplicate_rules(qb_mapping, inf_ma
     assert result.controls["Status"].eq("PASS").all()
 
 
-def test_full_reconciliation_screens_historical_duplicates(qb_mapping, inf_mapping, make_metadata):
-    """A duplicated historical Infinium row must never be allowed to clear
-    a real primary QuickBooks exception."""
+def test_full_reconciliation_canonicalizes_duplicated_historical_rows_before_clearance(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Two byte-identical historical Infinium rows are the same real
+    prior-period transaction uploaded twice, not two independent
+    transactions -- one is retained as canonical and may still clear a
+    primary exception; only the excess copy is excluded. (Genuine
+    cross-scope overlap -- a historical row duplicating something in the
+    *primary* file -- is covered at the unit level in test_duplicates.py.)
+    """
     qb_rows = [
         {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 555.00, "Qty": 1, "Period": "1"},
     ]
@@ -316,15 +330,17 @@ def test_full_reconciliation_screens_historical_duplicates(qb_mapping, inf_mappi
         inf_secondary_raw=pd.DataFrame(inf_secondary_rows),
         inf_secondary_mapping=inf_mapping,
     )
-    assert result.metrics["Duplicate Infinium Secondary Rows Excluded"] == 2
-    assert result.historical_clearances.empty
-    assert "POHIST" in set(result.qb_work.loc[result.unmatched_qb, "PO"])
+    assert result.metrics["Duplicate Infinium Secondary Rows Excluded"] == 1
+    assert not result.historical_clearances.empty
+    assert "POHIST" not in set(result.qb_work.loc[result.unmatched_qb, "PO"])
     assert result.metrics["Control Status"] == "PASS"
 
 
 def test_full_reconciliation_detects_blank_reference_duplicates(qb_mapping, inf_mapping, make_metadata):
-    """A duplicate pair missing its PO must still be caught via the
-    invoice-only fallback, not silently left in the accrual."""
+    """A duplicate pair missing its PO is a weak-basis (invoice-only)
+    candidate: it is never auto-excluded up front, but since neither copy
+    matches anything here, both end up held in Duplicate Review Hold --
+    excluded from the accrual -- rather than inflating it."""
     qb_rows = [
         {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
         {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
@@ -336,10 +352,68 @@ def test_full_reconciliation_detects_blank_reference_duplicates(qb_mapping, inf_
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
-    assert result.metrics["Duplicate QuickBooks Rows"] == 2
+    assert result.metrics["Duplicate QuickBooks Rows"] == 0
+    assert result.metrics["Duplicate Review Hold QuickBooks Rows"] == 2
+    assert result.metrics["Duplicate Review Hold QuickBooks Amount"] == pytest.approx(50.00)
     assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert result.metrics["Posting Status"] == "REVIEW REQUIRED"
     basis_values = set(result.duplicate_analysis["Duplicate Basis"])
     assert "Invoice + Amount (PO blank on both rows)" in basis_values
+
+
+def test_weak_basis_pair_resolved_via_match_proceeds_normally(qb_mapping, inf_mapping, make_metadata):
+    """When a weak-basis (invoice-only) duplicate pair together satisfies a
+    legitimate grouped aggregate match, both rows proceed normally: neither
+    is excluded from the JE, neither is held for review, and their
+    duplicate-report disposition reflects the successful resolution."""
+    qb_rows = [
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 50.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.metrics["Duplicate Review Hold QuickBooks Rows"] == 0
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert result.metrics["Posting Status"] == "READY TO POST"
+    assert len(result.matches) == 1
+    assert result.matches[0].group_level is True
+    assert sorted(result.matches[0].qb_rows) == [0, 1]
+    assert len(result.duplicate_analysis) == 2
+    assert set(result.duplicate_analysis["Disposition"]) == {"Resolved via match - no exclusion applied"}
+
+
+def test_weak_basis_review_hold_does_not_block_control_status(qb_mapping, inf_mapping, make_metadata):
+    """A pending Duplicate Review Hold item changes Posting Status but must
+    never fail the underlying accounting controls -- every dollar and row
+    is still fully accounted for, just not part of the JE support total."""
+    qb_rows = [
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.metrics["Control Status"] == "PASS"
+    assert result.controls["Status"].eq("PASS").all()
+    assert result.metrics["Posting Status"] == "REVIEW REQUIRED"
+    # The held items' dollars are excluded from the JE support total...
+    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(15.00)
+    # ...but still fully accounted for in the roll-forward control.
+    review_hold_control = result.controls.loc[
+        result.controls["Check"] == "Duplicate Review Hold QuickBooks items excluded from JE"
+    ].iloc[0]
+    assert review_hold_control["Expected"] == pytest.approx(50.00)
+    assert review_hold_control["Status"] == "PASS"
 
 
 def test_rules_table_documents_duplicate_handling(qb_mapping, inf_mapping, make_metadata):
@@ -349,9 +423,9 @@ def test_rules_table_documents_duplicate_handling(qb_mapping, inf_mapping, make_
         qb_mapping, inf_mapping, make_metadata(), 2026,
     )
     rule_names = set(result.rules["Rule"])
-    assert "Exact duplicate exclusion (see duplicates.py)" in rule_names
-    assert "Shared PO/invoice with differing amounts is not a duplicate" in rule_names
-    assert "Historical/secondary duplicate exclusion" in rule_names
+    assert "Strong duplicate canonicalization (see duplicates.py)" in rule_names
+    assert "Weak duplicate candidates: matched normally, held if unresolved" in rule_names
+    assert "Historical overlap exclusion" in rule_names
 
 
 def test_validate_reconciliation_rejects_duplicate_leaking_into_unresolved(
