@@ -33,6 +33,14 @@ from duplicates import (
     combine_duplicate_reports,
     screen_duplicates,
 )
+from fuzzy_po_matching import (
+    FUZZY_PO_CONFIDENCE,
+    FUZZY_PO_EXPLANATION,
+    FUZZY_PO_METHOD,
+    PO_TOKENS,
+    find_unique_fuzzy_po_matches,
+    significant_po_tokens,
+)
 
 __all__ = [
     "AMOUNT_CENTS",
@@ -349,6 +357,7 @@ def prepare_working_frame(
     frame[NORM_PO] = frame[mapping["po"]].map(clean_po)
     frame[NORM_INV] = frame[mapping["invoice"]].map(clean_alphanumeric)
     frame[AMOUNT_CENTS] = frame[mapping["amount"]].map(parse_amount_cents)
+    frame[PO_TOKENS] = frame[mapping["po"]].map(significant_po_tokens)
     if source == "QB":
         product_col = mapping.get("product")
         period_col = mapping.get("period")
@@ -580,6 +589,20 @@ def perform_matching(
                 )
                 remaining_q.difference_update(q_rows)
                 remaining_i.difference_update(i_rows)
+
+    # After every exact one-to-one and grouped-aggregate pass, a small,
+    # tightly-bounded fuzzy PO pass covers rows whose PO field is a buyer
+    # name or ad hoc note rather than a clean PO number (e.g. QuickBooks
+    # "Hopper" vs Infinium "DAVID HOPPER 2.2"). The signed amount must
+    # still agree exactly, and only unique whole-word-containment matches
+    # are accepted -- see fuzzy_po_matching.py for the full rule.
+    fuzzy_pairs = find_unique_fuzzy_po_matches(qb, inf, remaining_q, remaining_i)
+    for qidx, iidx in fuzzy_pairs:
+        matches.append(
+            MatchGroup([qidx], [iidx], FUZZY_PO_METHOD, FUZZY_PO_CONFIDENCE, FUZZY_PO_EXPLANATION)
+        )
+        remaining_q.discard(qidx)
+        remaining_i.discard(iidx)
 
     matches.sort(
         key=lambda group: min(
@@ -1289,17 +1312,28 @@ def build_rules_and_config(
              "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized PO and exact signed-cent totals agree."},
             {"Priority": 6, "Rule": "Invoice + Aggregate Amount", "Automatic": "Yes, after one-to-one",
              "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized invoice and exact signed-cent totals agree."},
-            {"Priority": 7, "Rule": "Ambiguous or many-to-many groups", "Automatic": "No",
+            {"Priority": 7, "Rule": "Fuzzy PO + Amount (word match, unique) (see fuzzy_po_matching.py)",
+             "Automatic": "Yes, after every exact pass",
+             "Requirement": (
+                 "Applies only to rows still unresolved after every exact one-to-one and grouped-aggregate "
+                 "pass. The signed amount must still match exactly; the PO comparison is whole-word "
+                 "containment -- every significant word (3+ letters) on the shorter side's PO text must "
+                 "appear on the longer side's -- not a general similarity score. Numbers and short "
+                 "fragments are ignored so a shared product code can never be the sole basis for a match. "
+                 "Accepted only when the match is unique on both sides; ambiguous candidates are left "
+                 "unresolved. Tagged with its own 'Fuzzy' confidence, distinct from every exact-match method."
+             )},
+            {"Priority": 8, "Rule": "Ambiguous or many-to-many groups", "Automatic": "No",
              "Requirement": "Overlapping combinations, many-to-many relationships, groups over the safety limits, and nonunique solutions remain unresolved."},
-            {"Priority": 8, "Rule": "Amount variance", "Automatic": "No",
+            {"Priority": 9, "Rule": "Amount variance", "Automatic": "No",
              "Requirement": "Any nonzero cent difference is flagged as an exception; no tolerance is applied."},
-            {"Priority": 9, "Rule": "Fuzzy product classification", "Automatic": "No financial effect",
+            {"Priority": 10, "Rule": "Fuzzy product classification", "Automatic": "No financial effect",
              "Requirement": "Used only for Product Aggregate Summary; never determines transaction matching."},
-            {"Priority": 10, "Rule": "Secondary historical clearance", "Automatic": "Yes, second pass",
-             "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence."},
-            {"Priority": 11, "Rule": "Unused secondary rows", "Automatic": "Excluded",
+            {"Priority": 11, "Rule": "Secondary historical clearance", "Automatic": "Yes, second pass",
+             "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence, including the fuzzy PO pass (Priority 7)."},
+            {"Priority": 12, "Rule": "Unused secondary rows", "Automatic": "Excluded",
              "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
-            {"Priority": 12, "Rule": "Exact duplicate exclusion (see duplicates.py)", "Automatic": "Yes, before matching",
+            {"Priority": 13, "Rule": "Exact duplicate exclusion (see duplicates.py)", "Automatic": "Yes, before matching",
              "Requirement": (
                  "A row whose amount matches another row exactly, and whose populated PO and/or "
                  "invoice reference also matches exactly, is a duplicate. Duplicates are removed "
@@ -1309,14 +1343,14 @@ def build_rules_and_config(
                  "own report, Infinium duplicates on a separate worksheet, since their treatment "
                  "is entirely different."
              )},
-            {"Priority": 13, "Rule": "Shared PO/invoice with differing amounts is not a duplicate", "Automatic": "N/A",
+            {"Priority": 14, "Rule": "Shared PO/invoice with differing amounts is not a duplicate", "Automatic": "N/A",
              "Requirement": (
                  "Rows sharing only a PO or only an invoice, with different amounts, are never assumed "
                  "to be duplicates. They remain eligible for the grouped aggregate matching passes "
                  "(Priorities 4-6), which test whether several such rows sum exactly to one matching "
                  "opposing entry."
              )},
-            {"Priority": 14, "Rule": "Historical/secondary duplicate exclusion", "Automatic": "Yes, before clearance",
+            {"Priority": 15, "Rule": "Historical/secondary duplicate exclusion", "Automatic": "Yes, before clearance",
              "Requirement": (
                  "Optional historical QuickBooks and Infinium files are screened for exact duplicates "
                  "the same way as the primary files, before they are used to clear a primary exception. "

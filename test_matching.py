@@ -171,6 +171,81 @@ def test_invalid_amount_rows_are_never_matched(qb_mapping, inf_mapping):
     assert candidates.iloc[0]["Disposition"] == "Invalid or missing QuickBooks amount"
 
 
+def test_fuzzy_po_pass_resolves_the_hopper_scenario_after_exact_passes(qb_mapping, inf_mapping):
+    """QuickBooks 'Hopper' vs Infinium 'DAVID HOPPER 2.2' -- the reported
+    real-world case. No exact pass can match these (different normalized
+    PO, no invoice overlap), so only the fuzzy PO pass should resolve it."""
+    qb = _prepare(
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        qb_mapping, "QB",
+    )
+    inf = _prepare(
+        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"}],
+        inf_mapping, "INF",
+    )
+    matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
+    assert len(matches) == 1
+    assert matches[0].method == "Fuzzy PO + Amount (Word Match, Unique)"
+    assert matches[0].confidence == "Fuzzy"
+    assert matches[0].qb_rows == [0] and matches[0].inf_rows == [0]
+    assert unmatched_qb == [] and unmatched_inf == []
+
+
+def test_fuzzy_po_pass_never_overrides_amount_mismatch(qb_mapping, inf_mapping):
+    qb = _prepare(
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        qb_mapping, "QB",
+    )
+    inf = _prepare(
+        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 999.00, "Period": "6"}],
+        inf_mapping, "INF",
+    )
+    matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
+    assert matches == []
+    assert unmatched_qb == [0] and unmatched_inf == [0]
+
+
+def test_fuzzy_po_pass_never_guesses_among_ambiguous_candidates(qb_mapping, inf_mapping):
+    """One QB row fuzzy-matches two Infinium rows at the same amount --
+    the engine must leave all three unresolved rather than guess."""
+    qb = _prepare(
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        qb_mapping, "QB",
+    )
+    inf = _prepare(
+        [
+            {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
+            {"PO": "HOPPER LOGISTICS", "Invoice": "88888", "Amount": 225.00, "Period": "6"},
+        ],
+        inf_mapping, "INF",
+    )
+    matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
+    assert matches == []
+    assert unmatched_qb == [0]
+    assert sorted(unmatched_inf) == [0, 1]
+
+
+def test_full_reconciliation_resolves_hopper_style_po_mismatch(qb_mapping, inf_mapping, make_metadata):
+    """The fuzzy pass must also fire through the full build_reconciliation
+    pipeline, and its match must never be mistaken for an exact one."""
+    qb_rows = [
+        {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "6"},
+    ]
+    inf_rows = [
+        {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.metrics["Control Status"] == "PASS"
+    assert result.metrics["Unresolved QuickBooks Rows"] == 1
+    fuzzy_matches = [g for g in result.matches if g.confidence == "Fuzzy"]
+    assert len(fuzzy_matches) == 1
+    assert "Fuzzy PO" in fuzzy_matches[0].method
+
+
 # ---------------------------------------------------------------------------
 # Full end-to-end build_reconciliation runs -- the four duplicate rules and
 # the two reliability fixes, exercised together the way app.py would.
