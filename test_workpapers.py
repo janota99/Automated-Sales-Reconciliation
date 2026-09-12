@@ -180,10 +180,10 @@ def test_analytics_workbook_builds_with_duplicates_present(qb_mapping, inf_mappi
     assert wb.sheetnames == EXPECTED_ANALYTICS_SHEETS
 
     qb_dup_text = _worksheet_text(wb["QuickBooks Duplicates"])
-    assert any("QB-000002" in text or "QB-000003" in text for text in qb_dup_text)
+    assert any("QB-2" in text or "QB-3" in text for text in qb_dup_text)
 
     inf_dup_text = _worksheet_text(wb["Infinium Duplicates"])
-    assert any("INF-000002" in text or "INF-000003" in text for text in inf_dup_text)
+    assert any("INF-2" in text or "INF-3" in text for text in inf_dup_text)
 
 
 def test_primary_and_analytics_workbooks_build_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):

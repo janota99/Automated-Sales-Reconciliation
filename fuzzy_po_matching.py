@@ -1,39 +1,26 @@
 """Fuzzy PO matching for rows that survive every exact pass in matching.py.
 
-Exact matching requires normalized POs, invoices, and signed amounts to
-agree precisely, and treats anything less as unresolved rather than risk an
-incorrect match. Real-world PO fields are sometimes a buyer's name or an ad
-hoc note rather than a clean PO number -- QuickBooks might record "Hopper"
-where Infinium records "DAVID HOPPER 2.2" for the exact same transaction --
-so a small number of otherwise-correct items never clear the exact passes.
+This module provides a bounded, graph-based fuzzy matching pass for rows that
+remain unresolved after every exact one-to-one and grouped pass. Real-world PO 
+fields often contain ad-hoc notes or entity markers that break exact string 
+equality (e.g., "DAVID HOPPER LLC" vs. "HOPPER").
 
-This module adds one additional, narrowly-scoped pass for rows that remain
-unresolved after every exact pass in ``matching.perform_matching``:
-
-  * The signed-cent amount must still match exactly -- fuzziness never
-    applies to the dollar amount, only to the PO text.
-  * The PO comparison is whole-word containment, not a general similarity
-    score: both sides are split into significant (3+ letter, alphabetic)
-    word tokens, and every token on the shorter side must appear on the
-    longer side. "HOPPER" matches "DAVID HOPPER 2.2" because HOPPER is a
-    whole word on both sides; two POs that merely look similar are not
-    accepted. Numbers and short fragments are dropped before comparing, so
-    shared product codes (e.g. "24" from "24 CASE") can never be the sole
-    basis for a match.
-  * The match must be unique on both sides: if a row would fuzzy-match more
-    than one row on the opposing side, none of those candidates are
-    accepted -- the engine never guesses among ambiguous options.
-
-Every accepted fuzzy match carries its own confidence ("Fuzzy") and method
-name, distinct from every exact-match method, so it is always separately
-identifiable in every report this engine produces.
+Safeguards applied to circumstantial text matches:
+  * The aggregate signed-cent amounts of the matched cluster must agree exactly.
+  * Tokens must be alphanumeric. Pure numbers and financial stop-words are ignored.
+  * Intersection ratio: Shared words must account for >= 60% of the shorter string.
+  * Temporal anchor: If transaction dates are available, candidates must be 
+    within 30 days of each other.
+  * Isolated clusters: Bipartite graph components are evaluated as a whole. If 
+    a linked cluster of rows ties out to a zero-variance aggregate sum, the entire
+    cluster is cleared simultaneously (supporting 1:1, 1:M, and M:1 relationships).
 """
 
 from __future__ import annotations
 
 import re
-from collections import Counter
-from typing import Any
+from collections import defaultdict
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -44,89 +31,173 @@ __all__ = [
     "FUZZY_PO_EXPLANATION",
     "FUZZY_PO_METHOD",
     "PO_TOKENS",
-    "find_unique_fuzzy_po_matches",
+    "find_fuzzy_po_matches",
     "is_fuzzy_po_match",
     "significant_po_tokens",
 ]
 
 # Working-frame column name for a row's precomputed significant PO tokens.
-# Populated once in matching.prepare_working_frame from the raw PO column,
-# so perform_matching never needs the column-mapping dict itself.
 PO_TOKENS = "__REC_PO_TOKENS"
 
-FUZZY_PO_METHOD = "Fuzzy PO + Amount (Word Match, Unique)"
+FUZZY_PO_METHOD = "Fuzzy PO + Amount (Token Intersection & Aggregate)"
 FUZZY_PO_CONFIDENCE = "Fuzzy"
 FUZZY_PO_EXPLANATION = (
-    "Applied only after every exact pass left this row unresolved. The signed amount "
-    "agrees exactly; the PO comparison is whole-word containment -- every significant "
-    "word (3+ letters) on the shorter side's PO text appears on the longer side's -- "
-    "and this was the sole such candidate on both sides."
+    "Applied only after exact passes left these rows unresolved. The aggregate signed "
+    "amounts agree exactly; the PO comparison requires a strong intersection of significant, "
+    "alphanumeric tokens (excluding stop-words and pure numbers). Matches require temporal "
+    "proximity and avoid single-word generic false positives."
 )
 
-_RE_WORD = re.compile(r"[A-Z]+")
+_RE_WORD = re.compile(r"[A-Z0-9]+")
 _MIN_TOKEN_LENGTH = 3
+_MAX_GROUP_SIZE = 8
+
+# Globally filter lazy data entry and generic corporate entity markers
+_STOP_WORDS = frozenset([
+    "INC", "LLC", "LTD", "THE", "AND", "CORP", "COMPANY", "CO", 
+    "MISC", "VOID", "NONE", "TBD", "NULL", "N/A"
+])
 
 
 def significant_po_tokens(value: Any) -> frozenset[str]:
-    """Return the significant alphabetic word tokens in a raw PO value.
+    """Return the significant alphanumeric tokens in a raw PO value.
 
-    Numbers and short fragments (fewer than 3 letters) are dropped: they are
-    common to both PO numbers and product codes and would otherwise create
-    false-positive containment matches on a shared number or abbreviation
-    rather than a shared name.
+    Pure numbers and short fragments are dropped to prevent false-positive 
+    containment matches on shared product codes or generic abbreviations.
     """
     if value is None or pd.isna(value):
         return frozenset()
     text = str(value).strip().upper()
-    return frozenset(token for token in _RE_WORD.findall(text) if len(token) >= _MIN_TOKEN_LENGTH)
+    tokens = set()
+    for token in _RE_WORD.findall(text):
+        if token.isdigit():
+            continue  
+        if token in _STOP_WORDS:
+            continue
+        if len(token) >= _MIN_TOKEN_LENGTH:
+            tokens.add(token)
+    return frozenset(tokens)
 
 
 def is_fuzzy_po_match(tokens_a: frozenset[str], tokens_b: frozenset[str]) -> bool:
-    """True if the smaller non-empty token set is fully contained in the other.
-
-    Both sides must have at least one significant token -- an empty token
-    set (blank PO, or a PO with no word 3+ letters long) never matches
-    anything, since it would otherwise be a trivial subset of every row.
-    """
+    """True if the token sets intersect with a strong operational ratio."""
     if not tokens_a or not tokens_b:
         return False
-    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
-    return shorter.issubset(longer)
+        
+    intersection = tokens_a.intersection(tokens_b)
+    if not intersection:
+        return False
+        
+    # Prevent single-word generic false positives unless highly specific
+    if len(intersection) == 1:
+        match_word = list(intersection)[0]
+        if len(match_word) < 6:
+            return False
+            
+    # Require the intersection to cover the majority of the shorter side, so a
+    # short buyer-name note (e.g. "HOPPER") can still match a longer PO field
+    # that fully contains it (e.g. "DAVID HOPPER LLC") -- this is the primary
+    # case this module exists to catch. Matching against the longer side
+    # instead would demand the short side subsume most of the long side too,
+    # which no genuine buyer-name-vs-PO-field pair ever does.
+    # e.g., {"DAVID", "SMITH", "LLC"} vs {"DAVID", "HOPPER"} still fails the ratio
+    shorter_len = min(len(tokens_a), len(tokens_b))
+    ratio = len(intersection) / shorter_len
+
+    return ratio >= 0.60
 
 
-def find_unique_fuzzy_po_matches(
+def find_fuzzy_po_matches(
     qb: pd.DataFrame,
     inf: pd.DataFrame,
     remaining_q: set[int],
     remaining_i: set[int],
-) -> list[tuple[int, int]]:
-    """Return unique one-to-one (QB index, Infinium index) fuzzy PO pairs.
+    qb_date_col: Optional[str] = None,
+    inf_date_col: Optional[str] = None,
+    max_days_variance: int = 30,
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Return grouped fuzzy PO pairs and aggregates using a bipartite graph.
 
-    Only rows with a valid, exactly-matching signed amount and a non-empty
-    fuzzy PO match are considered as candidates, and a pair is accepted
-    only when it is the sole candidate for both of its rows -- ambiguous
-    candidates are left unresolved rather than guessed.
+    Builds edges between any rows that pass the temporal and fuzzy-text checks.
+    Isolates connected components and clears them if the component's aggregate
+    QuickBooks sum exactly equals its Infinium sum.
     """
     q_rows = sorted(remaining_q, key=lambda idx: qb.at[idx, SOURCE_POS])
     i_rows = sorted(remaining_i, key=lambda idx: inf.at[idx, SOURCE_POS])
-
-    candidates: list[tuple[int, int]] = []
+    
+    # 1. Build possible candidate edges
+    edges: list[tuple[int, int]] = []
     for qidx in q_rows:
         qamount = qb.at[qidx, AMOUNT_CENTS]
         q_tokens = qb.at[qidx, PO_TOKENS]
-        if qamount is None or pd.isna(qamount) or not q_tokens:
+        if pd.isna(qamount) or not q_tokens:
             continue
+            
+        q_date = pd.to_datetime(qb.at[qidx, qb_date_col]) if qb_date_col else None
+        
         for iidx in i_rows:
             iamount = inf.at[iidx, AMOUNT_CENTS]
-            if iamount is None or pd.isna(iamount) or int(qamount) != int(iamount):
+            i_tokens = inf.at[iidx, PO_TOKENS]
+            if pd.isna(iamount) or not i_tokens:
                 continue
-            if is_fuzzy_po_match(q_tokens, inf.at[iidx, PO_TOKENS]):
-                candidates.append((qidx, iidx))
+                
+            # Temporal Anchor constraint
+            if q_date is not None and inf_date_col is not None:
+                i_date = pd.to_datetime(inf.at[iidx, inf_date_col])
+                if pd.notna(q_date) and pd.notna(i_date):
+                    if abs((q_date - i_date).days) > max_days_variance:
+                        continue
 
-    q_occurrences = Counter(qidx for qidx, _ in candidates)
-    i_occurrences = Counter(iidx for _, iidx in candidates)
-    return [
-        (qidx, iidx)
-        for qidx, iidx in candidates
-        if q_occurrences[qidx] == 1 and i_occurrences[iidx] == 1
-    ]
+            if is_fuzzy_po_match(q_tokens, i_tokens):
+                edges.append((qidx, iidx))
+                
+    # 2. Build Bipartite Graph of connected candidates
+    q_adj: dict[int, set[int]] = defaultdict(set)
+    i_adj: dict[int, set[int]] = defaultdict(set)
+    for q, i in edges:
+        q_adj[q].add(i)
+        i_adj[i].add(q)
+        
+    visited_q: set[int] = set()
+    visited_i: set[int] = set()
+    accepted_groups: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    
+    # 3. Traverse isolated components and evaluate financial tie-out
+    for q_start in list(q_adj.keys()):
+        if q_start in visited_q:
+            continue
+            
+        comp_q: set[int] = set()
+        comp_i: set[int] = set()
+        
+        queue_q = [q_start]
+        queue_i: list[int] = []
+        
+        # BFS traversal to isolate the full connected cluster
+        while queue_q or queue_i:
+            while queue_q:
+                curr_q = queue_q.pop(0)
+                if curr_q not in comp_q:
+                    comp_q.add(curr_q)
+                    visited_q.add(curr_q)
+                    for nxt_i in q_adj[curr_q]:
+                        if nxt_i not in comp_i:
+                            queue_i.append(nxt_i)
+                            
+            while queue_i:
+                curr_i = queue_i.pop(0)
+                if curr_i not in comp_i:
+                    comp_i.add(curr_i)
+                    visited_i.add(curr_i)
+                    for nxt_q in i_adj[curr_i]:
+                        if nxt_q not in comp_q:
+                            queue_q.append(nxt_q)
+        
+        # 4. Enforce strict aggregate financial agreement on the isolated cluster
+        q_sum = sum(int(qb.at[q, AMOUNT_CENTS]) for q in comp_q)
+        i_sum = sum(int(inf.at[i, AMOUNT_CENTS]) for i in comp_i)
+        
+        if q_sum == i_sum and len(comp_q) <= _MAX_GROUP_SIZE and len(comp_i) <= _MAX_GROUP_SIZE:
+            accepted_groups.append((tuple(sorted(comp_q)), tuple(sorted(comp_i))))
+            
+    return accepted_groups

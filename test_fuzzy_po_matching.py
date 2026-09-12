@@ -5,7 +5,7 @@ import pandas as pd
 from duplicates import AMOUNT_CENTS, SOURCE_POS
 from fuzzy_po_matching import (
     PO_TOKENS,
-    find_unique_fuzzy_po_matches,
+    find_fuzzy_po_matches,
     is_fuzzy_po_match,
     significant_po_tokens,
 )
@@ -80,44 +80,45 @@ def test_completely_unrelated_names_do_not_match():
 
 
 # ---------------------------------------------------------------------------
-# find_unique_fuzzy_po_matches
+# find_fuzzy_po_matches
 # ---------------------------------------------------------------------------
 
 def test_finds_the_hopper_pair_with_matching_amount():
     qb = make_frame(("QB1", "Hopper", 22500))
     inf = make_frame(("INF1", "DAVID HOPPER 2.2", 22500))
-    pairs = find_unique_fuzzy_po_matches(qb, inf, {0}, {0})
-    assert pairs == [(0, 0)]
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0})
+    assert groups == [((0,), (0,))]
 
 
 def test_amount_mismatch_blocks_an_otherwise_fuzzy_match():
     qb = make_frame(("QB1", "Hopper", 22500))
     inf = make_frame(("INF1", "DAVID HOPPER 2.2", 30000))
-    pairs = find_unique_fuzzy_po_matches(qb, inf, {0}, {0})
-    assert pairs == []
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0})
+    assert groups == []
 
 
 def test_invalid_amount_rows_are_never_fuzzy_matched():
     qb = make_frame(("QB1", "Hopper", None))
     inf = make_frame(("INF1", "DAVID HOPPER 2.2", 22500))
-    pairs = find_unique_fuzzy_po_matches(qb, inf, {0}, {0})
-    assert pairs == []
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0})
+    assert groups == []
 
 
 def test_ambiguous_fuzzy_candidates_are_never_guessed():
-    """One QB row fuzzy-matches two different Infinium rows at the same
-    amount -- neither is accepted, since the engine never guesses."""
+    """One QB row fuzzy-matches two different Infinium rows, but their
+    aggregate amount doesn't tie out to the QB side -- the whole component
+    is rejected rather than guessing which Infinium row is the real match."""
     qb = make_frame(("QB1", "Hopper", 22500))
     inf = make_frame(
         ("INF1", "DAVID HOPPER 2.2", 22500),
         ("INF2", "HOPPER LOGISTICS", 22500),
     )
-    pairs = find_unique_fuzzy_po_matches(qb, inf, {0}, {0, 1})
-    assert pairs == []
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0, 1})
+    assert groups == []
 
 
 def test_unrelated_rows_with_no_fuzzy_match_stay_unresolved():
     qb = make_frame(("QB1", "Acme Corp", 5000))
     inf = make_frame(("INF1", "DAVID HOPPER 2.2", 5000))
-    pairs = find_unique_fuzzy_po_matches(qb, inf, {0}, {0})
-    assert pairs == []
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0})
+    assert groups == []

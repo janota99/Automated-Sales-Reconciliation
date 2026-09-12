@@ -185,7 +185,7 @@ def test_fuzzy_po_pass_resolves_the_hopper_scenario_after_exact_passes(qb_mappin
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
     assert len(matches) == 1
-    assert matches[0].method == "Fuzzy PO + Amount (Word Match, Unique)"
+    assert matches[0].method == "Fuzzy PO + Amount (Token Intersection & Aggregate)"
     assert matches[0].confidence == "Fuzzy"
     assert matches[0].qb_rows == [0] and matches[0].inf_rows == [0]
     assert unmatched_qb == [] and unmatched_inf == []
@@ -292,12 +292,10 @@ def test_full_reconciliation_applies_all_four_duplicate_rules(qb_mapping, inf_ma
     # Rule 3: QuickBooks and Infinium duplicates are two separate reports,
     # each itemizing both the canonical row and its excess copy.
     assert len(result.duplicate_analysis) == 2
-    assert set(result.duplicate_analysis["Dataset"]) == {"QuickBooks"}
     assert set(result.duplicate_analysis["Disposition"]) == {
         "Retained canonical row", "Excluded excess copy",
     }
     assert len(result.infinium_duplicate_analysis) == 2
-    assert set(result.infinium_duplicate_analysis["Dataset"]) == {"Infinium"}
 
     # Rule 4 / traceability: every dollar and row is still accounted for.
     assert result.metrics["Control Status"] == "PASS"

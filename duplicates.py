@@ -2,10 +2,16 @@
 
 Detection, classification, and disposition are deliberately separate. Strong
 same-file groups (PO + invoice + signed cents) retain one deterministic
-canonical row and exclude only excess copies. Weaker PO-only or invoice-only
-groups remain active and are reported for review. Historical rows may also be
-screened against their primary dataset so upload overlap cannot improperly
-clear an exception.
+canonical row per identical payload and exclude only excess copies. Weaker
+PO-only or invoice-only groups remain active and are reported for review.
+Historical screening is explicitly two-stage: same-file copies are handled
+first, then the surviving rows are compared with their primary dataset so
+upload overlap cannot improperly clear an exception.
+
+This module intentionally makes no cross-system amount-variance decisions.
+``matching.py`` consumes these duplicate dispositions first and only then
+classifies mutually unique PO/invoice relationships whose amounts differ,
+ensuring a duplicate candidate can never be repurposed as an amount error.
 """
 
 from __future__ import annotations
@@ -23,7 +29,8 @@ __all__ = [
     "DUPLICATE_ANALYSIS_COLUMNS", "DUPLICATE_BASIS_CROSS_SCOPE",
     "DUPLICATE_BASIS_INVOICE_ONLY", "DUPLICATE_BASIS_PO_ONLY",
     "DUPLICATE_BASIS_STRICT", "DUPLICATE_RULE_VERSION",
-    "DISPOSITION_REVIEW", "DISPOSITION_REVIEW_HOLD", "DISPOSITION_REVIEW_RESOLVED",
+    "DISPOSITION_HISTORICAL_REVIEW_HOLD", "DISPOSITION_REVIEW",
+    "DISPOSITION_REVIEW_HOLD", "DISPOSITION_REVIEW_RESOLVED",
     "DuplicateScreeningError", "DuplicateScreeningResult",
     "build_duplicate_item_report", "combine_duplicate_reports",
     "duplicate_row_basis", "duplicate_row_indexes", "finalize_review_dispositions",
@@ -35,7 +42,7 @@ NORM_PO = "__REC_NORM_PO"
 NORM_INV = "__REC_NORM_INV"
 AMOUNT_CENTS = "__REC_AMOUNT_CENTS"
 
-DUPLICATE_RULE_VERSION = "2026.09-CANONICAL-EXCESS-WEAK-REVIEW-CROSS-SCOPE"
+DUPLICATE_RULE_VERSION = "2026.09-STREAMLINED-DUPLICATE-OUTPUT"
 DUPLICATE_BASIS_STRICT = "PO + Invoice + Amount"
 DUPLICATE_BASIS_PO_ONLY = "PO + Amount (invoice blank on both rows)"
 DUPLICATE_BASIS_INVOICE_ONLY = "Invoice + Amount (PO blank on both rows)"
@@ -47,19 +54,30 @@ DISPOSITION_REVIEW = "Review required - retained for matching"
 DISPOSITION_EXCLUDED_OVERLAP = "Excluded historical overlap"
 DISPOSITION_REVIEW_RESOLVED = "Resolved via match - no exclusion applied"
 DISPOSITION_REVIEW_HOLD = "Held for review - excluded from proposed JE pending disposition"
+DISPOSITION_HISTORICAL_REVIEW_HOLD = (
+    "Held for review - excluded from historical clearance pending disposition"
+)
 CONFIDENCE_CONFIRMED = "High"
 CONFIDENCE_SUSPECTED = "Review"
 CONFIDENCE_HELD = "Hold"
 CONFIDENCE_RESOLVED = "Resolved"
 
-# Original columns stay first for compatibility with existing exporters.
+# This is a user-facing review report. Dataset is intentionally omitted because
+# QuickBooks and Infinium reports are delivered separately. Disposition is the
+# single authoritative status field; the former Treatment duplicate was removed.
+# The full confirmation-field inventory is also internal-only; the report shows
+# only fields that actually differ, which is the evidence a reviewer needs.
 DUPLICATE_ANALYSIS_COLUMNS = [
-    "Dataset", "Source Scope", "Source Row ID", "Duplicate Basis",
-    "Normalized PO", "Normalized Invoice", "Amount", "Duplicate Group Size",
-    "Other Source Row IDs In Group", "Treatment", "Duplicate Group ID",
+    "Source Scope", "Screening Stage", "Source Row ID", "Duplicate Basis",
+    "Potential Duplicate Reason", "Differing Confirmation Fields",
+    "Normalized PO", "Normalized Invoice", "Amount", "Duplicate Values",
+    "Duplicate Group Size",
+    "Confirmed Copy Set Size", "Other Source Row IDs In Group",
+    "Duplicate Group ID", "Confirmed Copy Set ID",
     "Confidence", "Disposition", "Canonical Source Row ID",
     "Reference Source Row IDs", "Automatically Excluded", "Excluded Amount",
-    "Payload Confirmed", "Confirmation Fields", "Policy Note",
+    "Payload Confirmed", "Policy Note",
+    "Manual Decision", "Reviewed By", "Review Timestamp", "Review Rationale",
     "Duplicate Rule Version",
 ]
 
@@ -78,12 +96,15 @@ class _Decision:
     basis: str
     key: GroupKey
     group_id: str
+    copy_set_id: str
     group_rows: tuple[RowLabel, ...]
+    copy_set_rows: tuple[RowLabel, ...]
     reference_rows: tuple[RowLabel, ...]
     disposition: str
     confidence: str
     canonical_index: Optional[RowLabel]
     payload_confirmed: bool
+    screening_stage: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +262,12 @@ def _group_id(key: GroupKey) -> str:
     return f"DUP-{sha256(payload.encode('utf-8')).hexdigest()[:12].upper()}"
 
 
+def _copy_set_id(key: GroupKey, signature: tuple[str, ...]) -> str:
+    """Identify one payload-specific copy set within a broader business key."""
+    payload = "\x1f".join([*(map(str, key)), "\x1e", *signature])
+    return f"COPY-{sha256(payload.encode('utf-8')).hexdigest()[:16].upper()}"
+
+
 def _confirmation_columns(frame: pd.DataFrame, id_column: str) -> tuple[str, ...]:
     """Use original source columns as corroborating duplicate evidence."""
     internal = {SOURCE_POS, NORM_PO, NORM_INV, AMOUNT_CENTS, id_column}
@@ -300,43 +327,21 @@ def _decisions(
     frame: pd.DataFrame,
     *,
     auto_exclude_strict: bool,
-    reference_frame: Optional[pd.DataFrame],
     confirmation_columns: tuple[str, ...],
-    reference_confirmation_columns: tuple[str, ...],
 ) -> list[_Decision]:
+    """Classify duplicates within one file only.
+
+    Cross-scope overlap is intentionally handled by
+    ``_cross_scope_decisions`` after same-file excess copies are removed.
+    Keeping the stages separate prevents the existence of a primary reference
+    from bypassing historical same-file canonicalization.
+    """
     current_groups = _groups(frame)
-    reference_groups = _groups(reference_frame) if reference_frame is not None else {}
     decisions: list[_Decision] = []
     for key, rows in current_groups.items():
-        reference_rows = tuple(reference_groups.get(key, ()))
-        if len(rows) < 2 and not reference_rows:
+        if len(rows) < 2:
             continue
         group_id = _group_id(key)
-        if reference_rows:
-            reference_by_payload: dict[tuple[str, ...], list[RowLabel]] = defaultdict(list)
-            for reference_index in reference_rows:
-                signature = _payload_signature(
-                    reference_frame, reference_index, reference_confirmation_columns
-                )
-                reference_by_payload[signature].append(reference_index)
-            for index in rows:
-                signature = _payload_signature(frame, index, confirmation_columns)
-                confirmed_reference_rows = tuple(reference_by_payload.get(signature, ()))
-                payload_confirmed = bool(confirmation_columns and confirmed_reference_rows)
-                if payload_confirmed:
-                    disposition = DISPOSITION_EXCLUDED_OVERLAP
-                    confidence = CONFIDENCE_CONFIRMED
-                    canonical = confirmed_reference_rows[0]
-                else:
-                    disposition = DISPOSITION_REVIEW
-                    confidence = CONFIDENCE_SUSPECTED
-                    canonical = None
-                decisions.append(_Decision(
-                    index, DUPLICATE_BASIS_CROSS_SCOPE, key, group_id, tuple(rows),
-                    reference_rows, disposition, confidence, canonical,
-                    payload_confirmed,
-                ))
-            continue
         strong = (
             key[0] == DUPLICATE_BASIS_STRICT
             and auto_exclude_strict
@@ -346,6 +351,8 @@ def _decisions(
         for index in rows:
             payload_groups[_payload_signature(frame, index, confirmation_columns)].append(index)
         for payload_rows in payload_groups.values():
+            signature = _payload_signature(frame, payload_rows[0], confirmation_columns)
+            copy_set_id = _copy_set_id(key, signature)
             payload_confirmed = strong and len(payload_rows) > 1
             canonical = payload_rows[0] if payload_confirmed else None
             for index in payload_rows:
@@ -356,9 +363,55 @@ def _decisions(
                 else:
                     disposition, confidence = DISPOSITION_REVIEW, CONFIDENCE_SUSPECTED
                 decisions.append(_Decision(
-                    index, key[0], key, group_id, tuple(rows), (), disposition,
-                    confidence, canonical, payload_confirmed,
+                    index, key[0], key, group_id, copy_set_id, tuple(rows),
+                    tuple(payload_rows), (),
+                    disposition, confidence, canonical, payload_confirmed, "Same-file",
                 ))
+    return decisions
+
+
+def _cross_scope_decisions(
+    frame: pd.DataFrame,
+    reference_frame: pd.DataFrame,
+    *,
+    confirmation_columns: tuple[str, ...],
+) -> list[_Decision]:
+    """Compare already canonicalized historical rows with primary rows."""
+    current_groups = _groups(frame)
+    reference_groups = _groups(reference_frame)
+    decisions: list[_Decision] = []
+    for key, rows in current_groups.items():
+        reference_rows = tuple(reference_groups.get(key, ()))
+        if not reference_rows:
+            continue
+        group_id = _group_id(key)
+        reference_by_payload: dict[tuple[str, ...], list[RowLabel]] = defaultdict(list)
+        current_by_payload: dict[tuple[str, ...], list[RowLabel]] = defaultdict(list)
+        for current_index in rows:
+            current_by_payload[
+                _payload_signature(frame, current_index, confirmation_columns)
+            ].append(current_index)
+        for reference_index in reference_rows:
+            signature = _payload_signature(reference_frame, reference_index, confirmation_columns)
+            reference_by_payload[signature].append(reference_index)
+        for index in rows:
+            signature = _payload_signature(frame, index, confirmation_columns)
+            confirmed_reference_rows = tuple(reference_by_payload.get(signature, ()))
+            payload_confirmed = bool(confirmation_columns and confirmed_reference_rows)
+            if payload_confirmed:
+                disposition = DISPOSITION_EXCLUDED_OVERLAP
+                confidence = CONFIDENCE_CONFIRMED
+                canonical = confirmed_reference_rows[0]
+            else:
+                disposition = DISPOSITION_REVIEW
+                confidence = CONFIDENCE_SUSPECTED
+                canonical = None
+            decisions.append(_Decision(
+                index, DUPLICATE_BASIS_CROSS_SCOPE, key, group_id,
+                _copy_set_id(key, signature), tuple(rows),
+                tuple(current_by_payload[signature]), reference_rows,
+                disposition, confidence, canonical, payload_confirmed, "Cross-scope",
+            ))
     return decisions
 
 
@@ -392,18 +445,78 @@ def _report_from_decisions(
             canonical_id = frame.at[decision.canonical_index, id_column]
         excluded = decision.disposition in {DISPOSITION_EXCLUDED_EXCESS, DISPOSITION_EXCLUDED_OVERLAP}
         amount = cents_to_float(frame.at[index, AMOUNT_CENTS])
+        if decision.basis == DUPLICATE_BASIS_PO_ONLY:
+            duplicate_reason = (
+                "Same normalized PO and signed amount; invoice is blank on all "
+                "candidate rows."
+            )
+        elif decision.basis == DUPLICATE_BASIS_INVOICE_ONLY:
+            duplicate_reason = (
+                "Same normalized invoice and signed amount; PO is blank on all "
+                "candidate rows."
+            )
+        elif decision.basis == DUPLICATE_BASIS_CROSS_SCOPE:
+            duplicate_reason = (
+                "Historical and primary rows share the same duplicate business key, "
+                + (
+                    "and their confirmation payloads agree."
+                    if decision.payload_confirmed
+                    else "but their confirmation payloads do not fully agree."
+                )
+            )
+        elif decision.payload_confirmed:
+            duplicate_reason = (
+                "Same normalized PO, invoice, signed amount, and confirmation payload."
+            )
+        else:
+            duplicate_reason = (
+                "Same normalized PO, invoice, and signed amount, but one or more "
+                "confirmation fields differ."
+            )
+
+        differing_fields: list[str] = []
+        for column in confirmation_columns:
+            current_value = _payload_value(frame.at[index, column])
+            if decision.reference_rows and reference_frame is not None:
+                comparison_values = {
+                    _payload_value(reference_frame.at[row, column])
+                    for row in decision.reference_rows
+                }
+            else:
+                # A confirmed copy set is compared against itself only, so an
+                # unrelated payload subgroup sharing the same duplicate key
+                # can't be mistaken for a differing field on a confirmed row.
+                # An unconfirmed (Review) row is compared against the full
+                # duplicate-key group, to surface which field(s) disagree.
+                comparison_rows = (
+                    decision.copy_set_rows if decision.payload_confirmed else decision.group_rows
+                )
+                comparison_values = {
+                    _payload_value(frame.at[row, column])
+                    for row in comparison_rows
+                }
+            if current_value not in comparison_values or len(comparison_values) > 1:
+                differing_fields.append(str(column))
         records.append({
-            "Dataset": dataset_label,
             "Source Scope": source_scope,
+            "Screening Stage": decision.screening_stage,
             "Source Row ID": frame.at[index, id_column],
             "Duplicate Basis": decision.basis,
+            "Potential Duplicate Reason": duplicate_reason,
+            "Differing Confirmation Fields": "; ".join(differing_fields),
             "Normalized PO": frame.at[index, NORM_PO],
             "Normalized Invoice": frame.at[index, NORM_INV],
             "Amount": amount,
+            "Duplicate Values": (
+                f"PO={frame.at[index, NORM_PO] or '<BLANK>'} | "
+                f"Invoice={frame.at[index, NORM_INV] or '<BLANK>'} | "
+                f"Signed Amount={amount if amount is not None else '<INVALID>'}"
+            ),
             "Duplicate Group Size": len(decision.group_rows) + len(decision.reference_rows),
+            "Confirmed Copy Set Size": len(decision.copy_set_rows),
             "Other Source Row IDs In Group": "; ".join(other_ids),
-            "Treatment": decision.disposition,
             "Duplicate Group ID": decision.group_id,
+            "Confirmed Copy Set ID": decision.copy_set_id,
             "Confidence": decision.confidence,
             "Disposition": decision.disposition,
             "Canonical Source Row ID": canonical_id,
@@ -411,8 +524,11 @@ def _report_from_decisions(
             "Automatically Excluded": excluded,
             "Excluded Amount": amount if excluded else None,
             "Payload Confirmed": decision.payload_confirmed,
-            "Confirmation Fields": "; ".join(map(str, confirmation_columns)),
             "Policy Note": policy_note,
+            "Manual Decision": None,
+            "Reviewed By": None,
+            "Review Timestamp": None,
+            "Review Rationale": None,
             "Duplicate Rule Version": DUPLICATE_RULE_VERSION,
         })
     return pd.DataFrame(records, columns=DUPLICATE_ANALYSIS_COLUMNS)
@@ -430,9 +546,7 @@ def build_duplicate_item_report(
     validate_duplicate_input(frame, id_column, frame_label=f"{dataset_label} {source_scope}")
     confirmation_columns = _confirmation_columns(frame, id_column)
     decisions = _decisions(
-        frame, auto_exclude_strict=True, reference_frame=None,
-        confirmation_columns=confirmation_columns,
-        reference_confirmation_columns=(),
+        frame, auto_exclude_strict=True, confirmation_columns=confirmation_columns,
     )
     selected = [decision for decision in decisions if decision.row_index in duplicate_rows]
     return _report_from_decisions(
@@ -448,11 +562,16 @@ def combine_duplicate_reports(*reports: Optional[pd.DataFrame]) -> pd.DataFrame:
     if not populated:
         return pd.DataFrame(columns=DUPLICATE_ANALYSIS_COLUMNS)
     combined = pd.concat(populated, ignore_index=True).reindex(columns=DUPLICATE_ANALYSIS_COLUMNS)
+    # IDs are deliberately short (QB-1, QB-2, ...), so sort by their numeric
+    # suffix to keep QB-10 after QB-9 instead of after QB-1.
+    combined["__SOURCE_ROW_SORT"] = pd.to_numeric(
+        combined["Source Row ID"].astype("string").str.extract(r"(\d+)$", expand=False),
+        errors="coerce",
+    )
     return combined.sort_values(
-        ["Dataset", "Source Scope", "Duplicate Group ID", "Source Row ID"],
+        ["Source Scope", "Duplicate Group ID", "__SOURCE_ROW_SORT", "Source Row ID"],
         kind="stable",
-        key=lambda values: values.astype("string"),
-    ).reset_index(drop=True)
+    ).drop(columns="__SOURCE_ROW_SORT").reset_index(drop=True)
 
 
 def screen_duplicates(
@@ -465,10 +584,14 @@ def screen_duplicates(
     auto_exclude_strict: bool = True,
     reference_frame: Optional[pd.DataFrame] = None,
     reference_id_column: Optional[str] = None,
+    allow_missing_amounts: bool = True,
 ) -> DuplicateScreeningResult:
     """Detect candidates, apply policy, and return active/excluded populations."""
     frame_label = f"{dataset_label} {source_scope}".strip()
-    validate_duplicate_input(frame, id_column, frame_label=frame_label)
+    validate_duplicate_input(
+        frame, id_column, frame_label=frame_label,
+        allow_missing_amounts=allow_missing_amounts,
+    )
     if reference_frame is not None:
         if not reference_id_column:
             raise DuplicateScreeningError(
@@ -477,6 +600,7 @@ def screen_duplicates(
         validate_duplicate_input(
             reference_frame, reference_id_column,
             frame_label=f"{dataset_label} Primary Reference",
+            allow_missing_amounts=allow_missing_amounts,
         )
     candidate_confirmation_columns = _confirmation_columns(frame, id_column)
     if reference_frame is None:
@@ -487,29 +611,59 @@ def screen_duplicates(
             column for column in candidate_confirmation_columns
             if column in reference_candidates
         )
-    decisions = _decisions(
+    same_file_decisions = _decisions(
         frame, auto_exclude_strict=auto_exclude_strict,
-        reference_frame=reference_frame,
-        confirmation_columns=confirmation_columns,
-        reference_confirmation_columns=confirmation_columns,
+        confirmation_columns=candidate_confirmation_columns,
     )
+    same_file_excluded = {
+        decision.row_index for decision in same_file_decisions
+        if decision.disposition == DISPOSITION_EXCLUDED_EXCESS
+    }
+    overlap_decisions: list[_Decision] = []
+    if reference_frame is not None:
+        overlap_candidates = frame.drop(index=list(same_file_excluded)).copy()
+        overlap_decisions = _cross_scope_decisions(
+            overlap_candidates,
+            reference_frame,
+            confirmation_columns=confirmation_columns,
+        )
+    decisions = [*same_file_decisions, *overlap_decisions]
     excluded = _ordered_indexes(frame, (
         decision.row_index for decision in decisions
         if decision.disposition in {DISPOSITION_EXCLUDED_EXCESS, DISPOSITION_EXCLUDED_OVERLAP}
     ))
+    excluded_set = set(excluded)
     canonical = _ordered_indexes(frame, (
         decision.row_index for decision in decisions
         if decision.disposition == DISPOSITION_CANONICAL
+        and decision.row_index not in excluded_set
     ))
-    suspected = _ordered_indexes(frame, (
+    suspected = _ordered_indexes(frame, set(
         decision.row_index for decision in decisions
         if decision.disposition == DISPOSITION_REVIEW
+        and decision.row_index not in excluded_set
     ))
-    report = _report_from_decisions(
-        frame, decisions, id_column=id_column, dataset_label=dataset_label,
-        source_scope=source_scope, policy_note=treatment,
-        reference_frame=reference_frame, reference_id_column=reference_id_column,
-        confirmation_columns=confirmation_columns,
+    # Same-file decisions were classified against the candidate frame's own
+    # (wider) confirmation columns, so they must be reported against that same
+    # set -- reporting them against the reference-narrowed set could hide the
+    # very field that drove the classification. Cross-scope decisions were
+    # classified against the narrower set and are reported the same way.
+    report = pd.concat(
+        [
+            _report_from_decisions(
+                frame, same_file_decisions, id_column=id_column, dataset_label=dataset_label,
+                source_scope=source_scope, policy_note=treatment,
+                reference_frame=None, reference_id_column=None,
+                confirmation_columns=candidate_confirmation_columns,
+            ),
+            _report_from_decisions(
+                frame, overlap_decisions, id_column=id_column, dataset_label=dataset_label,
+                source_scope=source_scope, policy_note=treatment,
+                reference_frame=reference_frame, reference_id_column=reference_id_column,
+                confirmation_columns=confirmation_columns,
+            ),
+        ],
+        ignore_index=True,
     )
     return DuplicateScreeningResult(
         duplicate_rows=excluded,
@@ -527,6 +681,7 @@ def finalize_review_dispositions(
     *,
     resolved_ids: Iterable[Any] = (),
     held_ids: Iterable[Any] = (),
+    historical_hold_ids: Iterable[Any] = (),
 ) -> pd.DataFrame:
     """Patch review-tier rows with their final match outcome.
 
@@ -549,20 +704,28 @@ def finalize_review_dispositions(
         return report
     resolved = {str(value) for value in resolved_ids}
     held = {str(value) for value in held_ids}
+    historical_held = {str(value) for value in historical_hold_ids}
+    overlaps = (resolved & held) | (resolved & historical_held) | (held & historical_held)
+    if overlaps:
+        raise DuplicateScreeningError(
+            "Duplicate disposition IDs must be mutually exclusive; overlapping IDs: "
+            f"{sorted(overlaps)}."
+        )
     updated = report.copy()
     is_review = updated["Disposition"] == DISPOSITION_REVIEW
     row_ids = updated["Source Row ID"].astype(str)
     resolved_mask = is_review & row_ids.isin(resolved)
     held_mask = is_review & row_ids.isin(held)
+    historical_held_mask = is_review & row_ids.isin(historical_held)
 
-    updated.loc[resolved_mask, ["Disposition", "Treatment"]] = DISPOSITION_REVIEW_RESOLVED
+    updated.loc[resolved_mask, "Disposition"] = DISPOSITION_REVIEW_RESOLVED
     updated.loc[resolved_mask, "Confidence"] = CONFIDENCE_RESOLVED
     updated.loc[resolved_mask, "Policy Note"] = (
         "This candidate matched normally during reconciliation; no duplicate "
         "exclusion was ever applied."
     )
 
-    updated.loc[held_mask, ["Disposition", "Treatment"]] = DISPOSITION_REVIEW_HOLD
+    updated.loc[held_mask, "Disposition"] = DISPOSITION_REVIEW_HOLD
     updated.loc[held_mask, "Confidence"] = CONFIDENCE_HELD
     updated.loc[held_mask, "Automatically Excluded"] = True
     updated.loc[held_mask, "Excluded Amount"] = updated.loc[held_mask, "Amount"]
@@ -570,5 +733,19 @@ def finalize_review_dispositions(
         "This candidate remained unresolved after matching. It is excluded from the "
         "accrual/proposed journal entry and held in Duplicate Review Hold pending a "
         "documented human disposition."
+    )
+
+    updated.loc[historical_held_mask, "Disposition"] = (
+        DISPOSITION_HISTORICAL_REVIEW_HOLD
+    )
+    updated.loc[historical_held_mask, "Confidence"] = CONFIDENCE_HELD
+    updated.loc[historical_held_mask, "Automatically Excluded"] = True
+    updated.loc[historical_held_mask, "Excluded Amount"] = updated.loc[
+        historical_held_mask, "Amount"
+    ]
+    updated.loc[historical_held_mask, "Policy Note"] = (
+        "This historical candidate requires review and was not permitted to clear a "
+        "primary exception. A documented disposition is required before relying on "
+        "the historical-clearance result."
     )
     return updated

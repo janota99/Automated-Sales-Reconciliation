@@ -827,9 +827,9 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws.column_dimensions[
             get_column_letter(duplicate_headers.index("Other Source Row IDs In Group") + 1)
         ].width = 44
-    if "Treatment" in duplicate_headers:
+    if "Disposition" in duplicate_headers:
         ws.column_dimensions[
-            get_column_letter(duplicate_headers.index("Treatment") + 1)
+            get_column_letter(duplicate_headers.index("Disposition") + 1)
         ].width = 42
     if "Policy Note" in duplicate_headers:
         ws.column_dimensions[

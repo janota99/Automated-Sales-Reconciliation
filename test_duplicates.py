@@ -177,7 +177,6 @@ class FinalizeReviewDispositionTests(unittest.TestCase):
         updated = finalize_review_dispositions(report, resolved_ids=["ROW-1"])
         row = updated.loc[updated["Source Row ID"] == "ROW-1"].iloc[0]
         self.assertEqual(row["Disposition"], DISPOSITION_REVIEW_RESOLVED)
-        self.assertEqual(row["Treatment"], DISPOSITION_REVIEW_RESOLVED)
         self.assertFalse(bool(row["Automatically Excluded"]))
         self.assertIsNone(row["Excluded Amount"])
 
@@ -186,7 +185,6 @@ class FinalizeReviewDispositionTests(unittest.TestCase):
         updated = finalize_review_dispositions(report, held_ids=["ROW-2"])
         row = updated.loc[updated["Source Row ID"] == "ROW-2"].iloc[0]
         self.assertEqual(row["Disposition"], DISPOSITION_REVIEW_HOLD)
-        self.assertEqual(row["Treatment"], DISPOSITION_REVIEW_HOLD)
         self.assertTrue(bool(row["Automatically Excluded"]))
         self.assertEqual(row["Excluded Amount"], row["Amount"])
 
