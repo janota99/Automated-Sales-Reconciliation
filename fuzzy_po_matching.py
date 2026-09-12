@@ -193,11 +193,21 @@ def find_fuzzy_po_matches(
                         if nxt_q not in comp_q:
                             queue_q.append(nxt_q)
         
-        # 4. Enforce strict aggregate financial agreement on the isolated cluster
+        # 4. Enforce strict aggregate financial agreement on the isolated cluster.
+        # Only bounded one-to-one, one-to-many, or many-to-one shapes are ever
+        # posted downstream (see the grouped-matching control in matching.py);
+        # a true many-to-many component is too coincidental to trust on an
+        # aggregate sum alone and is left unresolved for manual review instead.
         q_sum = sum(int(qb.at[q, AMOUNT_CENTS]) for q in comp_q)
         i_sum = sum(int(inf.at[i, AMOUNT_CENTS]) for i in comp_i)
-        
-        if q_sum == i_sum and len(comp_q) <= _MAX_GROUP_SIZE and len(comp_i) <= _MAX_GROUP_SIZE:
+        bounded_shape = len(comp_q) == 1 or len(comp_i) == 1
+
+        if (
+            q_sum == i_sum
+            and bounded_shape
+            and len(comp_q) <= _MAX_GROUP_SIZE
+            and len(comp_i) <= _MAX_GROUP_SIZE
+        ):
             accepted_groups.append((tuple(sorted(comp_q)), tuple(sorted(comp_i))))
             
     return accepted_groups

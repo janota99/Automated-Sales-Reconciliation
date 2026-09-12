@@ -122,3 +122,16 @@ def test_unrelated_rows_with_no_fuzzy_match_stay_unresolved():
     inf = make_frame(("INF1", "DAVID HOPPER 2.2", 5000))
     groups = find_fuzzy_po_matches(qb, inf, {0}, {0})
     assert groups == []
+
+
+def test_many_to_many_components_are_rejected_even_when_totals_tie_out():
+    """matching.py's grouped-matching control only ever accepts a bounded
+    one-to-many or many-to-one relationship (one side must be exactly one
+    row). A true many-to-many cluster -- multiple QB rows and multiple
+    Infinium rows linked only through shared fuzzy tokens -- must never be
+    accepted here, even if the aggregate sums happen to agree, or it would
+    trip that downstream control and halt the whole reconciliation."""
+    qb = make_frame(("QB1", "Hopper", 10000), ("QB2", "Hopper Logistics", 15000))
+    inf = make_frame(("INF1", "David Hopper 2.2", 10000), ("INF2", "Hopper Trucking", 15000))
+    groups = find_fuzzy_po_matches(qb, inf, {0, 1}, {0, 1})
+    assert groups == []
