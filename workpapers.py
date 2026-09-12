@@ -23,7 +23,7 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Font, PatternFill, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.worksheet.table import Table, TableColumn, TableFormula, TableStyleInfo
+from openpyxl.worksheet.table import Table, TableColumn, TableStyleInfo
 
 from config import (
     AMBER,
@@ -77,9 +77,37 @@ def _write_dataframe_values(ws, frame: pd.DataFrame, start_row: int, start_col: 
             ws.cell(start_row + row_offset, start_col + col_offset, excel_safe(value))
 
 
-def _table_column_formula(table_name: str, one_based_column_index: int) -> str:
-    """Return a structured formula that expands and contracts with an Excel table."""
-    return f"SUM(INDEX({table_name},0,{one_based_column_index}))"
+def _escape_structured_ref_component(text: str) -> str:
+    """Escape characters with special meaning inside an Excel structured-table reference."""
+    escaped = str(text)
+    for char in ("'", "#", "[", "]"):
+        escaped = escaped.replace(char, f"'{char}")
+    return escaped
+
+
+def _table_column_reference(table_name: str, column_header: str) -> str:
+    """Return a proper qualified structured reference, e.g. ``Table1[Amount]``.
+
+    A bare table name (or ``INDEX(TableName,0,N)`` built from one) is not a
+    valid Excel reference when written directly as raw formula text -- only
+    Excel's own UI auto-converts a typed table name into this bracketed
+    structured-reference form. Writing the bracketed form ourselves is what
+    makes formulas outside the table (KPI cards, the proposed JE amount)
+    actually resolve instead of showing #NAME?.
+    """
+    return f"{table_name}[{_escape_structured_ref_component(column_header)}]"
+
+
+def _table_totals_row_formula(column_header: str) -> str:
+    """Return the native Excel table totals-row SUM formula for one column.
+
+    Matches exactly what Excel's own UI writes when a table's Total Row is
+    enabled and "Sum" is selected: an *unqualified* single-column reference
+    (no table name -- it is implicit from the cell's own position in that
+    table's totals row) wrapped in SUBTOTAL so the total also respects any
+    filter applied to the table.
+    """
+    return f"SUBTOTAL(109,[{_escape_structured_ref_component(column_header)}])"
 
 
 def _add_exception_table(
@@ -120,9 +148,8 @@ def _add_exception_table(
         if offset == 1:
             column.totalsRowLabel = total_label
         if header in summed_headers:
-            formula_text = _table_column_formula(table_name, offset)
-            column.totalsRowFunction = "custom"
-            column.totalsRowFormula = TableFormula(attr_text=formula_text)
+            formula_text = _table_totals_row_formula(header)
+            column.totalsRowFunction = "sum"
             formula_columns[header] = start_col + offset - 1
             formula_cell = ws.cell(total_row, start_col + offset - 1)
             formula_cell.value = f"={formula_text}"
@@ -516,9 +543,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     duplicate_frame = result.duplicate_analysis.copy()
     duplicate_frame["Reviewer Note"] = ""
     duplicate_headers = list(duplicate_frame.columns)
-    separator_col = end_col + 1
-    dup_start_col = separator_col + 1
-    dup_end_col = dup_start_col + len(duplicate_headers) - 1
+    dup_end_col = len(duplicate_headers)
     duplicate_amount_total = float(duplicate_frame["Amount"].sum()) if len(duplicate_frame) else 0.0
 
     unmatched_qb_amounts = result.qb_work.loc[result.unmatched_qb, AMOUNT_CENTS].tolist()
@@ -526,15 +551,10 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     net = sum(amounts)
 
     qb_table_name = "QuickBooksExceptions"
-    qb_amount_table_index = headers.index(result.qb_mapping["amount"]) + 1
-    qb_amount_column_expr = f"INDEX({qb_table_name},0,{qb_amount_table_index})"
-    qb_amount_sum_expr = _table_column_formula(qb_table_name, qb_amount_table_index)
+    qb_amount_column_expr = _table_column_reference(qb_table_name, result.qb_mapping["amount"])
+    qb_amount_sum_expr = f"SUM({qb_amount_column_expr})"
 
     _write_title_band(ws, 1, 1, end_col, "QUICKBOOKS EXCEPTIONS | JOURNAL ENTRY SUPPORT", NAVY)
-    _write_title_band(
-        ws, 1, dup_start_col, dup_end_col,
-        "QUICKBOOKS DUPLICATES EXCLUDED FROM JE | REVIEW", NAVY,
-    )
     invalid_unresolved = sum(
         1 for idx in result.unmatched_qb if not valid_cents(result.qb_work.at[idx, AMOUNT_CENTS])
     )
@@ -547,17 +567,16 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     )
     duplicate_caption = (
         f"{len(duplicate_frame):,} QuickBooks item(s) were excluded from matching and from the accrual/JE "
-        "support total to the left because each shares an identical normalized PO, invoice, and signed "
-        "amount with another QuickBooks row. Each is listed individually for review; if a pair turns out to "
-        "be a legitimate repeated transaction rather than a duplicate entry, it must be added to the JE "
-        "support manually."
+        "support total in the exceptions table above because each shares an identical normalized PO, "
+        "invoice, and signed amount with another QuickBooks row. Each is listed individually for review; "
+        "if a pair turns out to be a legitimate repeated transaction rather than a duplicate entry, it must "
+        "be added to the JE support manually."
         if len(duplicate_frame)
         else "No QuickBooks exact duplicates (matching PO, invoice, and amount) were identified."
     )
-    _write_caption_band(ws, 2, dup_start_col, dup_end_col, duplicate_caption, NAVY)
 
     kpis = [
-        ("Unresolved rows", f"=IFERROR(ROWS({qb_table_name}),0)", '#,##0'),
+        ("Unresolved rows", f"=IFERROR(ROWS({qb_amount_column_expr}),0)", '#,##0'),
         (
             "Gross debits",
             f'=SUMIF({qb_amount_column_expr},">0",{qb_amount_column_expr})',
@@ -588,25 +607,6 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
             ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
             ws.cell(row, start).border = _thin_border()
 
-    duplicate_kpis = [
-        ("Duplicate QuickBooks items", len(duplicate_frame), '#,##0'),
-        ("Amount excluded from JE", duplicate_amount_total, '$#,##0.00;[Red]($#,##0.00);-'),
-        ("JE inclusion", "Excluded", 'General'),
-    ]
-    for idx, (label, value, number_format) in enumerate(duplicate_kpis):
-        start = dup_start_col + idx * 2
-        if start > dup_end_col:
-            break
-        ws.cell(3, start, label)
-        ws.cell(4, start, value)
-        ws.cell(3, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
-        ws.cell(4, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
-        ws.cell(4, start).number_format = number_format
-        ws.cell(4, start).protection = Protection(locked=True)
-        for row in (3, 4):
-            ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-            ws.cell(row, start).border = _thin_border()
-
     # QuickBooks exceptions by fiscal period -- promoted above the detail
     # tables so period-level review (count and net amount per period) never
     # requires scrolling past the full exception and duplicate lists.
@@ -617,7 +617,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     fiscal_header_row = fiscal_title_row + 2
     fiscal_data_row = fiscal_header_row + 1
     fiscal_end_col = len(fiscal_headers)
-    fiscal_section_end_col = max(end_col, dup_end_col)
+    fiscal_section_end_col = end_col
     selected_period = result.metadata.get("fiscal_period")
     has_fiscal_period = bool(result.qb_mapping.get("period"))
     _write_title_band(
@@ -685,9 +685,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     header_row = fiscal_total_row + 3
     data_row = header_row + 1
     _write_dataframe_values(ws, frame, header_row, 1)
-    _write_dataframe_values(ws, duplicate_frame, header_row, dup_start_col)
     _format_header(ws, header_row, 1, end_col, NAVY)
-    _format_header(ws, header_row, dup_start_col, dup_end_col, NAVY)
     if len(frame):
         _format_body_block(ws, data_row, data_row + len(frame) - 1, 1, end_col, NAVY_LIGHT)
         duplicate_qb_rows = _duplicate_source_indexes(result, "QuickBooks")
@@ -699,18 +697,6 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
             ws.cell(row, len(source_headers) + 2).number_format = '$#,##0.00;[Red]($#,##0.00);-'
             if int(qidx) in duplicate_qb_rows:
                 _apply_duplicate_style(ws, row, 1, end_col)
-    if len(duplicate_frame):
-        dup_last_row = data_row + len(duplicate_frame) - 1
-        _format_body_block(ws, data_row, dup_last_row, dup_start_col, dup_end_col, NAVY_LIGHT)
-        _apply_number_formats(
-            ws, duplicate_headers, data_row, dup_last_row, dup_start_col,
-            {"Amount"}, set(),
-        )
-        for offset in range(len(duplicate_frame)):
-            row = data_row + offset
-            _apply_duplicate_style(ws, row, dup_start_col, dup_end_col)
-    else:
-        dup_last_row = header_row
     total_row = data_row + len(frame)
     _write_total_row(
         ws, total_row, 1, end_col,
@@ -743,20 +729,6 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws.column_dimensions[get_column_letter(len(source_headers) + 2)].width = 24
     ws.column_dimensions[get_column_letter(len(source_headers) + 3)].width = 36
     _set_widths(ws, 1, len(source_headers), header_row, total_row)
-    _set_widths(ws, dup_start_col, dup_end_col, header_row, dup_last_row)
-    ws.column_dimensions[get_column_letter(separator_col)].width = 3.5
-    if "Other Source Row IDs In Group" in duplicate_headers:
-        ws.column_dimensions[
-            get_column_letter(dup_start_col + duplicate_headers.index("Other Source Row IDs In Group"))
-        ].width = 44
-    if "Treatment" in duplicate_headers:
-        ws.column_dimensions[
-            get_column_letter(dup_start_col + duplicate_headers.index("Treatment"))
-        ].width = 42
-    if "Reviewer Note" in duplicate_headers:
-        ws.column_dimensions[
-            get_column_letter(dup_start_col + duplicate_headers.index("Reviewer Note"))
-        ].width = 36
     ws.freeze_panes = f"A{data_row}"
     if len(frame):
         note_col = get_column_letter(len(source_headers) + 3)
@@ -768,6 +740,70 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws.add_data_validation(validation)
         validation.add(f"{note_col}{data_row}:{note_col}{header_row + len(frame)}")
 
+    # QuickBooks duplicates excluded from the JE above, and the proposed JE
+    # itself, are placed a fixed 10 rows below the exceptions total row --
+    # far enough to read as clearly separate from the exception detail,
+    # close enough to stay on the same review pass.
+    duplicate_kpis = [
+        ("Duplicate QuickBooks items", len(duplicate_frame), '#,##0'),
+        ("Amount excluded from JE", duplicate_amount_total, '$#,##0.00;[Red]($#,##0.00);-'),
+        ("JE inclusion", "Excluded", 'General'),
+    ]
+    dup_title_row = total_row + 10
+    dup_caption_row = dup_title_row + 1
+    dup_kpi_label_row = dup_title_row + 2
+    dup_kpi_value_row = dup_title_row + 3
+    dup_header_row = dup_title_row + 5
+    dup_data_row = dup_header_row + 1
+    section_end_col = max(end_col, dup_end_col)
+
+    _write_title_band(
+        ws, dup_title_row, 1, section_end_col,
+        "QUICKBOOKS DUPLICATES EXCLUDED FROM JE | REVIEW", NAVY,
+    )
+    _write_caption_band(ws, dup_caption_row, 1, section_end_col, duplicate_caption, NAVY)
+    for idx, (label, value, number_format) in enumerate(duplicate_kpis):
+        start = 1 + idx * 2
+        if start > dup_end_col:
+            break
+        ws.cell(dup_kpi_label_row, start, label)
+        ws.cell(dup_kpi_value_row, start, value)
+        ws.cell(dup_kpi_label_row, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
+        ws.cell(dup_kpi_value_row, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
+        ws.cell(dup_kpi_value_row, start).number_format = number_format
+        ws.cell(dup_kpi_value_row, start).protection = Protection(locked=True)
+        for row in (dup_kpi_label_row, dup_kpi_value_row):
+            ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+            ws.cell(row, start).border = _thin_border()
+
+    _write_dataframe_values(ws, duplicate_frame, dup_header_row, 1)
+    _format_header(ws, dup_header_row, 1, dup_end_col, NAVY)
+    if len(duplicate_frame):
+        dup_last_row = dup_data_row + len(duplicate_frame) - 1
+        _format_body_block(ws, dup_data_row, dup_last_row, 1, dup_end_col, NAVY_LIGHT)
+        _apply_number_formats(
+            ws, duplicate_headers, dup_data_row, dup_last_row, 1,
+            {"Amount"}, set(),
+        )
+        for offset in range(len(duplicate_frame)):
+            row = dup_data_row + offset
+            _apply_duplicate_style(ws, row, 1, dup_end_col)
+    else:
+        dup_last_row = dup_header_row
+
+    _set_widths(ws, 1, dup_end_col, dup_header_row, dup_last_row)
+    if "Other Source Row IDs In Group" in duplicate_headers:
+        ws.column_dimensions[
+            get_column_letter(duplicate_headers.index("Other Source Row IDs In Group") + 1)
+        ].width = 44
+    if "Treatment" in duplicate_headers:
+        ws.column_dimensions[
+            get_column_letter(duplicate_headers.index("Treatment") + 1)
+        ].width = 42
+    if "Reviewer Note" in duplicate_headers:
+        ws.column_dimensions[
+            get_column_letter(duplicate_headers.index("Reviewer Note") + 1)
+        ].width = 36
     if len(duplicate_frame):
         dup_note_col = get_column_letter(dup_end_col)
         dup_validation = DataValidation(
@@ -776,12 +812,9 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         dup_validation.error = "Reviewer notes are limited to 1,000 characters."
         dup_validation.errorTitle = "Note too long"
         ws.add_data_validation(dup_validation)
-        dup_validation.add(
-            f"{dup_note_col}{data_row}:{dup_note_col}{header_row + len(duplicate_frame)}"
-        )
+        dup_validation.add(f"{dup_note_col}{dup_data_row}:{dup_note_col}{dup_last_row}")
 
-    exceptions_end_row = max(total_row, dup_last_row)
-    je_title_row = exceptions_end_row + 3
+    je_title_row = dup_last_row + 3
     je_caption_row = je_title_row + 1
     je_header_row = je_title_row + 2
     je_data_row = je_header_row + 1
@@ -810,12 +843,12 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         columns=je_headers,
     )
     _write_title_band(
-        ws, je_title_row, 1, end_col,
+        ws, je_title_row, 1, section_end_col,
         "PROPOSED JOURNAL ENTRY | AC001 SALES ACCRUAL",
         SLATE,
     )
     _write_caption_band(
-        ws, je_caption_row, 1, end_col,
+        ws, je_caption_row, 1, section_end_col,
         "Post only after review and approval. Debit 017-00000-110160.0 Accrued Income and credit "
         "017-91000-400000-0 Income-Manufacturing for the absolute unresolved net amount; evaluate "
         "reversals and negative source values before posting.",

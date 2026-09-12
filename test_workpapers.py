@@ -116,11 +116,11 @@ def test_primary_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping
     assert any(text == "Reviewer Note" for text in unresolved_text)
 
 
-def test_fiscal_period_summary_and_duplicates_are_promoted_above_detail_tables(
+def test_fiscal_period_summary_is_promoted_above_the_exception_table(
     qb_mapping, inf_mapping, make_metadata,
 ):
-    """Both the fiscal-period breakdown and the duplicates block must sit
-    above the raw exception/duplicate detail tables, not buried below them."""
+    """The fiscal-period breakdown must sit above the raw exception table,
+    not buried below it."""
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
     workbook_bytes = build_primary_workbook(result)
     ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
@@ -133,14 +133,37 @@ def test_fiscal_period_summary_and_duplicates_are_promoted_above_detail_tables(
         raise AssertionError(f"{needle!r} not found in sheet")
 
     fiscal_row = first_row_containing("QUICKBOOKS EXCEPTIONS BY FISCAL PERIOD")
-    duplicates_row = first_row_containing("QUICKBOOKS DUPLICATES EXCLUDED FROM JE")
     exception_table_header_row = first_row_containing("Exception Status")
 
     assert fiscal_row < exception_table_header_row
-    assert duplicates_row < exception_table_header_row
-    # Both promoted sections must appear near the very top of the sheet.
     assert fiscal_row <= 10
-    assert duplicates_row <= 5
+
+
+def test_duplicates_and_je_sit_ten_rows_below_the_exceptions_total(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Per explicit request: the duplicates block (and the JE section that
+    follows it) must be placed exactly 10 standard rows beneath the
+    QuickBooks exceptions total row -- clearly separate from the exception
+    detail, but still on the same page without excessive scrolling."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    workbook_bytes = build_primary_workbook(result)
+    ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
+
+    def first_row_containing(needle: str) -> int:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value and needle in str(cell.value):
+                    return cell.row
+        raise AssertionError(f"{needle!r} not found in sheet")
+
+    exceptions_total_row = first_row_containing("PROPOSED JE SUPPORT TOTAL")
+    duplicates_row = first_row_containing("QUICKBOOKS DUPLICATES EXCLUDED FROM JE")
+    je_row = first_row_containing("PROPOSED JOURNAL ENTRY")
+
+    assert duplicates_row == exceptions_total_row + 10
+    assert je_row > duplicates_row
+    assert duplicates_row > exceptions_total_row
 
 
 def test_analytics_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping, make_metadata):
@@ -179,6 +202,37 @@ def test_primary_and_analytics_workbooks_build_with_no_duplicates(qb_mapping, in
     assert any(
         "No QuickBooks exact duplicates" in text for text in unresolved_text
     )
+
+
+def test_unresolved_sheet_formulas_use_valid_structured_references(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Regression test for a #NAME? bug: a bare table name (or INDEX(TableName,0,N)
+    built from one) is not a valid Excel reference when written as raw formula
+    text -- only Excel's own UI auto-converts a typed table name into proper
+    Table[Column] structured-reference syntax. Every formula on this sheet must
+    use that qualified form outside the table, or the unqualified [Column] form
+    inside the table's own totals row."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    ws = wb["Unresolved Exceptions"]
+
+    formula_cells = [
+        (cell.coordinate, cell.value)
+        for row in ws.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and cell.value.startswith("=")
+    ]
+    assert formula_cells, "expected at least one formula cell to check"
+    for coordinate, formula in formula_cells:
+        assert "INDEX(" not in formula, f"{coordinate} still uses the broken INDEX(TableName,...) form: {formula}"
+        assert "ROWS(QuickBooksExceptions)" not in formula, (
+            f"{coordinate} references the table by bare name, which Excel cannot resolve: {formula}"
+        )
+
+    # The KPI row (outside the table) must use the qualified Table[Column] form.
+    kpi_formulas = " ".join(formula for _, formula in formula_cells if "QuickBooksExceptions[" in formula)
+    assert "QuickBooksExceptions[Amount]" in kpi_formulas
 
 
 def test_render_result_duplicate_badge_never_raises(qb_mapping, inf_mapping, make_metadata):
