@@ -486,13 +486,16 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
 def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws = wb.create_sheet("Unresolved Exceptions")
 
-    # Keep the two source systems in distinct review areas. QuickBooks is the
-    # accounting/accrual basis on the left; Infinium is an independent
-    # operational exception list on the right and never feeds the proposed JE.
+    # QuickBooks is the sole accrual and journal-entry basis, so this sheet
+    # keeps everything with accrual relevance -- the raw QuickBooks exception
+    # population on the left, and the QuickBooks items excluded from that
+    # same population as duplicates on the right. Infinium exceptions carry
+    # no accrual impact and are already listed in Reconciled Data, so they
+    # are intentionally not repeated here.
     source_headers = list(result.qb_raw.columns)
     headers = source_headers + ["Exception Status", "Reference Amount Difference", "Reviewer Note"]
     candidate_map = result.candidates.set_index("QuickBooks Row ID").to_dict("index") if not result.candidates.empty else {}
-    
+
     qb_subset_dict = result.qb_work.loc[result.unmatched_qb].to_dict("index")
     records = []
     for qidx in result.unmatched_qb:
@@ -510,47 +513,30 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     end_col = len(headers)
     amount_col_position = source_headers.index(result.qb_mapping["amount"]) + 1
 
-    inf_source_headers = list(result.inf_raw.columns)
-    inf_headers = inf_source_headers + ["Exception Status", "Reviewer Note"]
-    unmatched_inf = list(getattr(result, "unmatched_inf", []))
-    inf_subset_dict = result.inf_work.loc[unmatched_inf].to_dict("index")
-    inf_records = [
-        [inf_subset_dict[iidx].get(col) for col in inf_source_headers]
-        + ["Unmatched Infinium", ""]
-        for iidx in unmatched_inf
-    ]
-    inf_frame = pd.DataFrame(inf_records, columns=inf_headers)
+    duplicate_frame = result.duplicate_analysis.copy()
+    duplicate_frame["Reviewer Note"] = ""
+    duplicate_headers = list(duplicate_frame.columns)
     separator_col = end_col + 1
-    inf_start_col = separator_col + 1
-    inf_end_col = inf_start_col + len(inf_headers) - 1
-    inf_amount_col_position = (
-        inf_start_col + inf_source_headers.index(result.inf_mapping["amount"])
-    )
-    
+    dup_start_col = separator_col + 1
+    dup_end_col = dup_start_col + len(duplicate_headers) - 1
+    duplicate_amount_total = float(duplicate_frame["Amount"].sum()) if len(duplicate_frame) else 0.0
+
     unmatched_qb_amounts = result.qb_work.loc[result.unmatched_qb, AMOUNT_CENTS].tolist()
     amounts = [cents_or_zero(val) for val in unmatched_qb_amounts]
     net = sum(amounts)
 
-    unmatched_inf_amounts = result.inf_work.loc[unmatched_inf, AMOUNT_CENTS].tolist()
-    inf_amounts = [cents_or_zero(value) for value in unmatched_inf_amounts]
-    inf_net = sum(inf_amounts)
-
     qb_table_name = "QuickBooksExceptions"
-    inf_table_name = "InfiniumExceptions"
     qb_amount_table_index = headers.index(result.qb_mapping["amount"]) + 1
-    inf_amount_table_index = inf_headers.index(result.inf_mapping["amount"]) + 1
     qb_amount_column_expr = f"INDEX({qb_table_name},0,{qb_amount_table_index})"
-    inf_amount_column_expr = f"INDEX({inf_table_name},0,{inf_amount_table_index})"
     qb_amount_sum_expr = _table_column_formula(qb_table_name, qb_amount_table_index)
-    inf_amount_sum_expr = _table_column_formula(inf_table_name, inf_amount_table_index)
 
     _write_title_band(ws, 1, 1, end_col, "QUICKBOOKS EXCEPTIONS | JOURNAL ENTRY SUPPORT", NAVY)
-    _write_title_band(ws, 1, inf_start_col, inf_end_col, "INFINIUM EXCEPTIONS | OPERATIONAL REVIEW", TEAL)
+    _write_title_band(
+        ws, 1, dup_start_col, dup_end_col,
+        "QUICKBOOKS DUPLICATES EXCLUDED FROM JE | REVIEW", NAVY,
+    )
     invalid_unresolved = sum(
         1 for idx in result.unmatched_qb if not valid_cents(result.qb_work.at[idx, AMOUNT_CENTS])
-    )
-    invalid_inf_unresolved = sum(
-        1 for idx in unmatched_inf if not valid_cents(result.inf_work.at[idx, AMOUNT_CENTS])
     )
     _write_caption_band(
         ws, 2, 1, end_col,
@@ -559,13 +545,17 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         f"Generated {format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
-    _write_caption_band(
-        ws, 2, inf_start_col, inf_end_col,
-        f"Infinium exceptions are preserved as a separate operational review population. They are excluded "
-        f"from all accrual and proposed-journal-entry calculations; {invalid_inf_unresolved} row(s) have "
-        f"invalid or missing amounts.",
-        TEAL,
+    duplicate_caption = (
+        f"{len(duplicate_frame):,} QuickBooks item(s) were excluded from matching and from the accrual/JE "
+        "support total to the left because each shares an identical normalized PO, invoice, and signed "
+        "amount with another QuickBooks row. Each is listed individually for review; if a pair turns out to "
+        "be a legitimate repeated transaction rather than a duplicate entry, it must be added to the JE "
+        "support manually."
+        if len(duplicate_frame)
+        else "No QuickBooks exact duplicates (matching PO, invoice, and amount) were identified."
     )
+    _write_caption_band(ws, 2, dup_start_col, dup_end_col, duplicate_caption, NAVY)
+
     kpis = [
         ("Unresolved rows", f"=IFERROR(ROWS({qb_table_name}),0)", '#,##0'),
         (
@@ -598,35 +588,106 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
             ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
             ws.cell(row, start).border = _thin_border()
 
-    inf_kpis = [
-        ("Unresolved Infinium rows", f"=IFERROR(ROWS({inf_table_name}),0)", '#,##0'),
-        ("Signed review total", f"={inf_amount_sum_expr}", '$#,##0.00;[Red]($#,##0.00);-'),
-        (
-            "Invalid amount rows",
-            f"=IFERROR(ROWS({inf_table_name}),0)-COUNT({inf_amount_column_expr})",
-            '#,##0',
-        ),
+    duplicate_kpis = [
+        ("Duplicate QuickBooks items", len(duplicate_frame), '#,##0'),
+        ("Amount excluded from JE", duplicate_amount_total, '$#,##0.00;[Red]($#,##0.00);-'),
         ("JE inclusion", "Excluded", 'General'),
     ]
-    for idx, (label, value, number_format) in enumerate(inf_kpis):
-        start = inf_start_col + idx * 2
-        if start > inf_end_col:
+    for idx, (label, value, number_format) in enumerate(duplicate_kpis):
+        start = dup_start_col + idx * 2
+        if start > dup_end_col:
             break
         ws.cell(3, start, label)
         ws.cell(4, start, value)
         ws.cell(3, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
-        ws.cell(4, start).font = Font(name="Segoe UI", size=12, bold=True, color=TEAL)
+        ws.cell(4, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
         ws.cell(4, start).number_format = number_format
         ws.cell(4, start).protection = Protection(locked=True)
         for row in (3, 4):
             ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
             ws.cell(row, start).border = _thin_border()
 
-    header_row, data_row = 6, 7
+    # QuickBooks exceptions by fiscal period -- promoted above the detail
+    # tables so period-level review (count and net amount per period) never
+    # requires scrolling past the full exception and duplicate lists.
+    fiscal_summary = build_fiscal_exception_summary(result)
+    fiscal_headers = list(fiscal_summary.columns)
+    fiscal_title_row = 7
+    fiscal_caption_row = fiscal_title_row + 1
+    fiscal_header_row = fiscal_title_row + 2
+    fiscal_data_row = fiscal_header_row + 1
+    fiscal_end_col = len(fiscal_headers)
+    fiscal_section_end_col = max(end_col, dup_end_col)
+    selected_period = result.metadata.get("fiscal_period")
+    has_fiscal_period = bool(result.qb_mapping.get("period"))
+    _write_title_band(
+        ws, fiscal_title_row, 1, fiscal_section_end_col,
+        (
+            "QUICKBOOKS EXCEPTIONS BY FISCAL PERIOD | CURRENT VS PRIOR PERIODS"
+            if has_fiscal_period
+            else "QUICKBOOKS EXCEPTIONS BY FISCAL PERIOD | FISCAL PERIOD NOT AVAILABLE"
+        ),
+        NAVY,
+    )
+    quantity_note = (
+        "Exception quantity is sourced from the mapped QuickBooks quantity column."
+        if result.qb_mapping.get("quantity")
+        else "No QuickBooks quantity column was mapped; exception quantities are shown as zero."
+    )
+    _write_caption_band(
+        ws, fiscal_caption_row, 1, fiscal_section_end_col,
+        (
+            f"Selected current reporting period: PD-{int(selected_period):02d}. Every other valid QuickBooks fiscal "
+            f"period is classified as a prior-period urgent exception. {quantity_note}"
+            if has_fiscal_period and selected_period is not None
+            else f"No current reporting period was selected. Exceptions are summarized by source period without current/prior classification. {quantity_note}"
+            if has_fiscal_period
+            else "No credible QuickBooks fiscal-period identifier was found or mapped. Period-based "
+            f"classification is disabled and all exceptions are summarized together. {quantity_note}"
+        ),
+        NAVY,
+    )
+    _write_dataframe_values(ws, fiscal_summary, fiscal_header_row, 1)
+    _format_header(ws, fiscal_header_row, 1, fiscal_end_col, NAVY)
+    if len(fiscal_summary):
+        fiscal_last_row = fiscal_data_row + len(fiscal_summary) - 1
+        _format_body_block(ws, fiscal_data_row, fiscal_last_row, 1, fiscal_end_col, NAVY_LIGHT)
+        for offset, classification in enumerate(fiscal_summary["Period Classification"], start=fiscal_data_row):
+            fill = (
+                RED_LIGHT
+                if classification == "Prior-Period Urgent Exception"
+                else GREEN_LIGHT
+                if classification == "Current Reporting Period"
+                else AMBER
+            )
+            for col in range(1, fiscal_end_col + 1):
+                ws.cell(offset, col).fill = PatternFill("solid", fgColor=fill)
+        _apply_number_formats(
+            ws, fiscal_headers, fiscal_data_row, fiscal_last_row, 1,
+            {"Net Exception Amount"}, {"Exception Count", "Exception Quantity"},
+        )
+    else:
+        fiscal_last_row = fiscal_header_row
+    fiscal_total_row = fiscal_last_row + 1
+    _write_total_row(
+        ws, fiscal_total_row, 1, fiscal_end_col,
+        {
+            "Exception Count": float(fiscal_summary["Exception Count"].sum()) if len(fiscal_summary) else 0,
+            "Exception Quantity": float(fiscal_summary["Exception Quantity"].sum()) if len(fiscal_summary) else 0,
+            "Net Exception Amount": float(fiscal_summary["Net Exception Amount"].sum()) if len(fiscal_summary) else 0,
+        },
+        fiscal_headers,
+        "TOTAL EXCEPTIONS",
+    )
+    _set_widths(ws, 1, fiscal_end_col, fiscal_header_row, fiscal_total_row)
+    ws.column_dimensions["B"].width = max(ws.column_dimensions["B"].width or 0, 34)
+
+    header_row = fiscal_total_row + 3
+    data_row = header_row + 1
     _write_dataframe_values(ws, frame, header_row, 1)
-    _write_dataframe_values(ws, inf_frame, header_row, inf_start_col)
+    _write_dataframe_values(ws, duplicate_frame, header_row, dup_start_col)
     _format_header(ws, header_row, 1, end_col, NAVY)
-    _format_header(ws, header_row, inf_start_col, inf_end_col, TEAL)
+    _format_header(ws, header_row, dup_start_col, dup_end_col, NAVY)
     if len(frame):
         _format_body_block(ws, data_row, data_row + len(frame) - 1, 1, end_col, NAVY_LIGHT)
         duplicate_qb_rows = _duplicate_source_indexes(result, "QuickBooks")
@@ -638,19 +699,18 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
             ws.cell(row, len(source_headers) + 2).number_format = '$#,##0.00;[Red]($#,##0.00);-'
             if int(qidx) in duplicate_qb_rows:
                 _apply_duplicate_style(ws, row, 1, end_col)
-    if len(inf_frame):
-        inf_last_data_row = data_row + len(inf_frame) - 1
-        _format_body_block(
-            ws, data_row, inf_last_data_row,
-            inf_start_col, inf_end_col, TEAL_LIGHT,
+    if len(duplicate_frame):
+        dup_last_row = data_row + len(duplicate_frame) - 1
+        _format_body_block(ws, data_row, dup_last_row, dup_start_col, dup_end_col, NAVY_LIGHT)
+        _apply_number_formats(
+            ws, duplicate_headers, data_row, dup_last_row, dup_start_col,
+            {"Amount"}, set(),
         )
-        for offset in range(len(inf_frame)):
+        for offset in range(len(duplicate_frame)):
             row = data_row + offset
-            ws.cell(row, inf_amount_col_position).number_format = '$#,##0.00;[Red]($#,##0.00);-'
-            ws.cell(row, inf_start_col + len(inf_source_headers)).fill = PatternFill("solid", fgColor=ORANGE)
-            ws.cell(row, inf_start_col + len(inf_source_headers)).alignment = Alignment(
-                wrap_text=True, vertical="center"
-            )
+            _apply_duplicate_style(ws, row, dup_start_col, dup_end_col)
+    else:
+        dup_last_row = header_row
     total_row = data_row + len(frame)
     _write_total_row(
         ws, total_row, 1, end_col,
@@ -658,13 +718,6 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         "PROPOSED JE SUPPORT TOTAL",
     )
     ws.cell(total_row, amount_col_position).number_format = '$#,##0.00;[Red]($#,##0.00);-'
-    inf_total_row = data_row + len(inf_frame)
-    _write_total_row(
-        ws, inf_total_row, inf_start_col, inf_end_col,
-        {result.inf_mapping["amount"]: cents_to_float(inf_net)}, inf_headers,
-        "INFINIUM REVIEW TOTAL | EXCLUDED FROM JE",
-    )
-    ws.cell(inf_total_row, inf_amount_col_position).number_format = '$#,##0.00;[Red]($#,##0.00);-'
 
     qb_summed_headers = {result.qb_mapping["amount"]}
     qb_quantity_header = result.qb_mapping.get("quantity")
@@ -681,37 +734,29 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         summed_headers=qb_summed_headers,
         style_name="TableStyleMedium2",
     )
-    _add_exception_table(
-        ws,
-        table_name=inf_table_name,
-        headers=inf_headers,
-        header_row=header_row,
-        total_row=inf_total_row,
-        start_col=inf_start_col,
-        total_label="INFINIUM REVIEW TOTAL | EXCLUDED FROM JE",
-        summed_headers={result.inf_mapping["amount"]},
-        style_name="TableStyleMedium4",
-    )
 
     _apply_number_formats(
         ws, headers, data_row, total_row, 1,
         {result.qb_mapping["amount"]}, {qb_quantity_header or ""},
     )
-    _apply_number_formats(
-        ws, inf_headers, data_row, inf_total_row, inf_start_col,
-        {result.inf_mapping["amount"]}, set(),
-    )
     ws.column_dimensions[get_column_letter(len(source_headers) + 1)].width = 48
     ws.column_dimensions[get_column_letter(len(source_headers) + 2)].width = 24
     ws.column_dimensions[get_column_letter(len(source_headers) + 3)].width = 36
     _set_widths(ws, 1, len(source_headers), header_row, total_row)
-    _set_widths(
-        ws, inf_start_col, inf_start_col + len(inf_source_headers) - 1,
-        header_row, inf_total_row,
-    )
+    _set_widths(ws, dup_start_col, dup_end_col, header_row, dup_last_row)
     ws.column_dimensions[get_column_letter(separator_col)].width = 3.5
-    ws.column_dimensions[get_column_letter(inf_start_col + len(inf_source_headers))].width = 28
-    ws.column_dimensions[get_column_letter(inf_start_col + len(inf_source_headers) + 1)].width = 36
+    if "Other Source Row IDs In Group" in duplicate_headers:
+        ws.column_dimensions[
+            get_column_letter(dup_start_col + duplicate_headers.index("Other Source Row IDs In Group"))
+        ].width = 44
+    if "Treatment" in duplicate_headers:
+        ws.column_dimensions[
+            get_column_letter(dup_start_col + duplicate_headers.index("Treatment"))
+        ].width = 42
+    if "Reviewer Note" in duplicate_headers:
+        ws.column_dimensions[
+            get_column_letter(dup_start_col + duplicate_headers.index("Reviewer Note"))
+        ].width = 36
     ws.freeze_panes = f"A{data_row}"
     if len(frame):
         note_col = get_column_letter(len(source_headers) + 3)
@@ -723,19 +768,19 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws.add_data_validation(validation)
         validation.add(f"{note_col}{data_row}:{note_col}{header_row + len(frame)}")
 
-    if len(inf_frame):
-        inf_note_col = get_column_letter(inf_end_col)
-        inf_validation = DataValidation(
+    if len(duplicate_frame):
+        dup_note_col = get_column_letter(dup_end_col)
+        dup_validation = DataValidation(
             type="textLength", operator="lessThanOrEqual", formula1="1000", allow_blank=True
         )
-        inf_validation.error = "Reviewer notes are limited to 1,000 characters."
-        inf_validation.errorTitle = "Note too long"
-        ws.add_data_validation(inf_validation)
-        inf_validation.add(
-            f"{inf_note_col}{data_row}:{inf_note_col}{header_row + len(inf_frame)}"
+        dup_validation.error = "Reviewer notes are limited to 1,000 characters."
+        dup_validation.errorTitle = "Note too long"
+        ws.add_data_validation(dup_validation)
+        dup_validation.add(
+            f"{dup_note_col}{data_row}:{dup_note_col}{header_row + len(duplicate_frame)}"
         )
 
-    exceptions_end_row = max(total_row, inf_total_row)
+    exceptions_end_row = max(total_row, dup_last_row)
     je_title_row = exceptions_end_row + 3
     je_caption_row = je_title_row + 1
     je_header_row = je_title_row + 2
@@ -802,121 +847,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws.column_dimensions["C"].width = max(ws.column_dimensions["C"].width or 0, 28)
     ws.column_dimensions["F"].width = max(ws.column_dimensions["F"].width or 0, 52)
 
-    duplicate_analysis = result.duplicate_analysis
-    if "Dataset" in duplicate_analysis.columns:
-        duplicate_frame = duplicate_analysis.loc[
-            duplicate_analysis["Dataset"].eq("QuickBooks")
-        ].reset_index(drop=True)
-    else:
-        # Defensive compatibility for older result objects. An unscoped
-        # duplicate table must not leak Infinium rows into the JE work area.
-        duplicate_frame = duplicate_analysis.iloc[0:0].copy()
-    duplicate_headers = list(duplicate_frame.columns)
-    duplicate_title_row = je_total_row + 3
-    duplicate_header_row = duplicate_title_row + 2
-    duplicate_data_row = duplicate_header_row + 1
-    duplicate_end_col = len(duplicate_headers)
-    section_end_col = max(end_col, duplicate_end_col)
-    _write_title_band(
-        ws, duplicate_title_row, 1, section_end_col,
-        "QUICKBOOKS DUPLICATE MATCHING-KEY REVIEW | JE CONTROL", NAVY,
-    )
-    duplicate_caption = (
-        f"{len(duplicate_frame):,} QuickBooks repeated matching-key group(s) identified. Review for duplicate "
-        "entries or legitimate repeated transactions. An unresolved QuickBooks row is already included in the "
-        "support total above and must not be added to the proposed JE a second time."
-        if len(duplicate_frame)
-        else "No QuickBooks repeated PO/invoice/amount matching keys were identified."
-    )
-    _write_caption_band(ws, duplicate_title_row + 1, 1, section_end_col, duplicate_caption, NAVY)
-    _write_dataframe_values(ws, duplicate_frame, duplicate_header_row, 1)
-    _format_header(ws, duplicate_header_row, 1, duplicate_end_col, NAVY)
-    if len(duplicate_frame):
-        duplicate_last_row = duplicate_data_row + len(duplicate_frame) - 1
-        _format_body_block(ws, duplicate_data_row, duplicate_last_row, 1, duplicate_end_col, NAVY_LIGHT)
-        _apply_number_formats(
-            ws, duplicate_headers, duplicate_data_row, duplicate_last_row, 1,
-            {"Amount"}, set(),
-        )
-        for row in range(duplicate_data_row, duplicate_last_row + 1):
-            _apply_duplicate_style(ws, row, 1, duplicate_end_col)
-        ws.column_dimensions[get_column_letter(duplicate_headers.index("Source Row IDs") + 1)].width = 44
-        ws.column_dimensions[get_column_letter(duplicate_headers.index("Reconciliation Status") + 1)].width = 42
-    else:
-        duplicate_last_row = duplicate_header_row
-
-    fiscal_summary = build_fiscal_exception_summary(result)
-    fiscal_headers = list(fiscal_summary.columns)
-    fiscal_title_row = duplicate_last_row + 3
-    fiscal_caption_row = fiscal_title_row + 1
-    fiscal_header_row = fiscal_title_row + 2
-    fiscal_data_row = fiscal_header_row + 1
-    fiscal_end_col = len(fiscal_headers)
-    fiscal_section_end_col = max(end_col, fiscal_end_col)
-    selected_period = result.metadata.get("fiscal_period")
-    has_fiscal_period = bool(result.qb_mapping.get("period"))
-    _write_title_band(
-        ws, fiscal_title_row, 1, fiscal_section_end_col,
-        (
-            "FISCAL-PERIOD EXCEPTION SUMMARY | CURRENT VS PRIOR PERIODS"
-            if has_fiscal_period
-            else "EXCEPTION SUMMARY | FISCAL PERIOD NOT AVAILABLE"
-        ),
-        NAVY,
-    )
-    quantity_note = (
-        "Exception quantity is sourced from the mapped QuickBooks quantity column."
-        if result.qb_mapping.get("quantity")
-        else "No QuickBooks quantity column was mapped; exception quantities are shown as zero."
-    )
-    _write_caption_band(
-        ws, fiscal_caption_row, 1, fiscal_section_end_col,
-        (
-            f"Selected current reporting period: PD-{int(selected_period):02d}. Every other valid QuickBooks fiscal "
-            f"period is classified as a prior-period urgent exception. {quantity_note}"
-            if has_fiscal_period and selected_period is not None
-            else f"No current reporting period was selected. Exceptions are summarized by source period without current/prior classification. {quantity_note}"
-            if has_fiscal_period
-            else "No credible QuickBooks fiscal-period identifier was found or mapped. Period-based "
-            f"classification is disabled and all exceptions are summarized together. {quantity_note}"
-        ),
-        NAVY,
-    )
-    _write_dataframe_values(ws, fiscal_summary, fiscal_header_row, 1)
-    _format_header(ws, fiscal_header_row, 1, fiscal_end_col, NAVY)
-    if len(fiscal_summary):
-        fiscal_last_row = fiscal_data_row + len(fiscal_summary) - 1
-        _format_body_block(ws, fiscal_data_row, fiscal_last_row, 1, fiscal_end_col, NAVY_LIGHT)
-        for offset, classification in enumerate(fiscal_summary["Period Classification"], start=fiscal_data_row):
-            fill = (
-                RED_LIGHT
-                if classification == "Prior-Period Urgent Exception"
-                else GREEN_LIGHT
-                if classification == "Current Reporting Period"
-                else AMBER
-            )
-            for col in range(1, fiscal_end_col + 1):
-                ws.cell(offset, col).fill = PatternFill("solid", fgColor=fill)
-        _apply_number_formats(
-            ws, fiscal_headers, fiscal_data_row, fiscal_last_row, 1,
-            {"Net Exception Amount"}, {"Exception Count", "Exception Quantity"},
-        )
-    else:
-        fiscal_last_row = fiscal_header_row
-    fiscal_total_row = fiscal_last_row + 1
-    _write_total_row(
-        ws, fiscal_total_row, 1, fiscal_end_col,
-        {
-            "Exception Count": float(fiscal_summary["Exception Count"].sum()) if len(fiscal_summary) else 0,
-            "Exception Quantity": float(fiscal_summary["Exception Quantity"].sum()) if len(fiscal_summary) else 0,
-            "Net Exception Amount": float(fiscal_summary["Net Exception Amount"].sum()) if len(fiscal_summary) else 0,
-        },
-        fiscal_headers,
-        "TOTAL EXCEPTIONS",
-    )
-    _set_widths(ws, 1, fiscal_end_col, fiscal_header_row, fiscal_total_row)
-    ws.column_dimensions["B"].width = max(ws.column_dimensions["B"].width or 0, 34)
-    ws.print_title_rows = "1:6"
+    ws.print_title_rows = "1:4"
 
     # Formula protection is active while table filtering, sorting, and row
     # insertion/deletion remain available for post-generation review work.
@@ -1290,6 +1221,20 @@ def build_analytics_workbook(result: ReconciliationResult) -> bytes:
         wb, "Exception Analysis", "EXCEPTION ANALYSIS",
         "Unresolved population summarized by source period, reason, and source ledger. Period is reporting metadata only.",
         result.exception_analysis, NAVY,
+    )
+    _add_standard_data_sheet(
+        wb, "QuickBooks Duplicates", "QUICKBOOKS DUPLICATES",
+        "Every QuickBooks row excluded from matching and from the accrual/journal-entry total because it "
+        "shares an identical normalized PO, invoice, and signed amount with another QuickBooks row.",
+        result.duplicate_analysis, NAVY,
+    )
+    _add_standard_data_sheet(
+        wb, "Infinium Duplicates", "INFINIUM DUPLICATES",
+        "Every Infinium row excluded from matching because it shares an identical normalized PO, invoice, "
+        "and signed amount with another Infinium row. Kept on a separate worksheet from QuickBooks "
+        "duplicates because the treatment is entirely different: Infinium duplicates are reviewed "
+        "independently and never feed the QuickBooks accrual or journal entry.",
+        result.infinium_duplicate_analysis, TEAL,
     )
     _add_standard_data_sheet(
         wb, "Rules and Run Config", "RULES AND RUN CONFIGURATION",

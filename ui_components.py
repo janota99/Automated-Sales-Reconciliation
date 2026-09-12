@@ -339,13 +339,13 @@ def render_result(result: ReconciliationResult) -> None:
     )
     unmatched_qb = int(metrics["Unresolved QuickBooks Rows"])
     unmatched_inf = int(metrics["Unmatched Infinium Rows"])
-    unresolved_duplicate_groups = 0
-    if not result.duplicate_analysis.empty:
-        unresolved_duplicate_groups = int(
-            result.duplicate_analysis["Reconciliation Status"]
-            .ne("All rows matched through a more specific unique key")
-            .sum()
-        )
+    # Every row in duplicate_analysis/infinium_duplicate_analysis is, by
+    # construction, excluded from matching and needs review -- there is no
+    # "resolved via a more specific key" status anymore (duplicates are
+    # removed from the working population before matching ever runs).
+    unresolved_duplicate_groups = int(metrics.get("Duplicate QuickBooks Rows", 0)) + int(
+        metrics.get("Duplicate Infinium Rows", 0)
+    )
 
     tab_labels = [
         attention_tab_label("Overview", failed_controls + invalid_amount_rows),
