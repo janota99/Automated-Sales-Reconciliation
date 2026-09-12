@@ -83,17 +83,22 @@ PRODUCT_STANDARD = "__REC_PRODUCT_STANDARD"
 FISCAL_LABEL = "__REC_FISCAL_LABEL"
 PRODUCT_LEXICON = {
     "Allsups 24 Case": ["ALLSUPS", "ALLSUPS 24", "ALLSUPS 24 CASE", "ALLSUP 24"],
+
     "Food Club 24 Case": [
         "FOOD CLUB", "FOOD CLUB 24", "FOOD CLUB 24 CASE", "FC 24",
         "FOODCLUB 24", "FOODCLUB24 CASE", "FC24 CASE",
     ],
+    "Food Club 40 Case": [
+        "FOOD CLUB 40", "FOOD CLUB 40 CASE", "FC 40", "FOODCLUB 40",
+        "FOODCLUB40 CASE", "FC40 CASE",
+    ],  
     "Food King 24 Case": [
         "FOOD KING 24", "FOOD KING 24 CASE", "FK 24", "FOODKING 24",
-        "FOODKING24 CASE", "FK24 CASE",
+        "FOODKING24 CASE", "FK24 CASE", "KINGS 24 CASE", "KINGS 24",
     ],
     "Food King 40 Case": [
         "FOOD KING 40", "FOOD KING 40 CASE", "FK 40", "FOODKING 40",
-        "FOODKING40 CASE", "FK40 CASE",
+        "FOODKING40 CASE", "FK40 CASE", "KINGS 40 CASE", "KINGS 40",
     ],
     "Juniors 24 Case": ["JUNIORS", "JUNIORS 24", "JUNIORS 24 CASE"],
     "Lowes 24 Case": ["LOWES", "LOWES 24", "LOWES 24 CASE", "LOWES24"],
@@ -114,6 +119,9 @@ PRODUCT_LEXICON = {
         "TNT24", "TOOT N TOTUM", "TOOT 'N TOTUM 24", "TNT 24",
         "TOOT N TOTUM 24 CASE", "TOOTN TOTUM 24 CASE",
     ],
+    "Spring House 24 Case": [
+        "SPRING HOUSE 24", "SPRING HOUSE 24 CASE", "SH 24", "SPRINGHOUSE 24", "SPRINGHOUSE 24 CASE",
+    ]
 }
 
 _RE_TRAILING_ZEROS = re.compile(r"^([0-9]+)\.0+$")
@@ -180,6 +188,9 @@ class ReconciliationResult:
     duplicate_review_hold_inf_rows: list[int] = field(default_factory=list)
     amount_variance_review_hold_qb_rows: list[int] = field(default_factory=list)
     amount_variance_review_hold_inf_rows: list[int] = field(default_factory=list)
+    fuzzy_match_review_hold_analysis: pd.DataFrame = field(default_factory=pd.DataFrame)
+    fuzzy_match_review_hold_qb_rows: list[int] = field(default_factory=list)
+    fuzzy_match_review_hold_inf_rows: list[int] = field(default_factory=list)
 
 
 @lru_cache(maxsize=4096)
@@ -497,6 +508,8 @@ def _group_candidates(
 def perform_matching(
     qb: pd.DataFrame,
     inf: pd.DataFrame,
+    *,
+    enable_fuzzy: bool = True,
 ) -> tuple[list[MatchGroup], list[int], list[int], pd.DataFrame]:
     """Match one-to-one first, then unique exact aggregate relationships."""
     remaining_q = set(qb.index)
@@ -608,17 +621,22 @@ def perform_matching(
     # name or ad hoc note rather than a clean PO number (e.g. QuickBooks
     # "Hopper" vs Infinium "DAVID HOPPER 2.2"). The signed amount must
     # still agree exactly, and only unique whole-word-containment matches
-    # are accepted -- see fuzzy_po_matching.py for the full rule.
-    fuzzy_groups = find_fuzzy_po_matches(qb, inf, remaining_q, remaining_i)
-    for q_group, i_group in fuzzy_groups:
-        matches.append(
-            MatchGroup(
-                list(q_group), list(i_group), FUZZY_PO_METHOD, FUZZY_PO_CONFIDENCE,
-                FUZZY_PO_EXPLANATION, group_level=len(q_group) > 1 or len(i_group) > 1,
+    # are accepted -- see fuzzy_po_matching.py for the full rule. Disabled
+    # when matching historical/secondary data against the primary population
+    # -- a text-similarity guess is a much bigger risk against a population
+    # that isn't the accrual source of truth, so it's simply not attempted
+    # there rather than held for review.
+    if enable_fuzzy:
+        fuzzy_groups = find_fuzzy_po_matches(qb, inf, remaining_q, remaining_i)
+        for q_group, i_group in fuzzy_groups:
+            matches.append(
+                MatchGroup(
+                    list(q_group), list(i_group), FUZZY_PO_METHOD, FUZZY_PO_CONFIDENCE,
+                    FUZZY_PO_EXPLANATION, group_level=len(q_group) > 1 or len(i_group) > 1,
+                )
             )
-        )
-        remaining_q.difference_update(q_group)
-        remaining_i.difference_update(i_group)
+            remaining_q.difference_update(q_group)
+            remaining_i.difference_update(i_group)
 
     matches.sort(
         key=lambda group: min(
@@ -859,6 +877,81 @@ def build_reference_amount_variances(
     )
 
 
+FUZZY_MATCH_REVIEW_COLUMNS = [
+    "Fuzzy Match ID", "Classification", "Confidence", "Match Basis",
+    "QuickBooks Row IDs", "QuickBooks Row Indexes", "Infinium Row IDs",
+    "Infinium Row Indexes", "QuickBooks Row Count", "Infinium Row Count",
+    "Matched Text Evidence", "QuickBooks Amount", "Infinium Amount",
+    "Accrual Treatment", "Posting Disposition", "Explanation",
+    "Manual Decision", "Reviewed By", "Review Timestamp", "Review Rationale",
+]
+
+FUZZY_MATCH_CLASSIFICATION_SINGLE = "Fuzzy Match - Possible Text Variant of PO or Invoice"
+FUZZY_MATCH_CLASSIFICATION_GROUPED = "Fuzzy Match - Multiple Line Items Netting to One Total"
+FUZZY_MATCH_CONFIDENCE = "Review"
+
+
+def build_fuzzy_match_review_holds(
+    qb: pd.DataFrame,
+    inf: pd.DataFrame,
+    fuzzy_groups: list[MatchGroup],
+) -> pd.DataFrame:
+    """Report every fuzzy PO/text match held for a documented human decision.
+
+    A fuzzy match is a text-similarity guess, not a certain relationship --
+    unlike an exact match it is never posted automatically. This produces the
+    plain-English, auditor-facing report; the caller is responsible for
+    removing these rows from ``matches`` and treating them as held rather
+    than accepted (see ``build_reconciliation``).
+    """
+    records: list[dict[str, Any]] = []
+    for number, group in enumerate(fuzzy_groups, 1):
+        q_rows = sorted(group.qb_rows, key=lambda idx: qb.at[idx, SOURCE_POS])
+        i_rows = sorted(group.inf_rows, key=lambda idx: inf.at[idx, SOURCE_POS])
+        grouped = len(q_rows) > 1 or len(i_rows) > 1
+        classification = (
+            FUZZY_MATCH_CLASSIFICATION_GROUPED if grouped else FUZZY_MATCH_CLASSIFICATION_SINGLE
+        )
+        shared_tokens: set[str] = set()
+        for qidx in q_rows:
+            for iidx in i_rows:
+                shared_tokens |= qb.at[qidx, PO_TOKENS] & inf.at[iidx, PO_TOKENS]
+        q_total = _amount_total(qb, q_rows)
+        i_total = _amount_total(inf, i_rows)
+        records.append({
+            "Fuzzy Match ID": f"FUZZY-{number:06d}",
+            "Classification": classification,
+            "Confidence": FUZZY_MATCH_CONFIDENCE,
+            "Match Basis": (
+                f"Shared PO/text tokens ({', '.join(sorted(shared_tokens)) or 'n/a'}) "
+                "and exact aggregate amount tie-out"
+            ),
+            "QuickBooks Row IDs": "; ".join(str(qb.at[idx, QB_ID]) for idx in q_rows),
+            "QuickBooks Row Indexes": "; ".join(str(idx) for idx in q_rows),
+            "Infinium Row IDs": "; ".join(str(inf.at[idx, INF_ID]) for idx in i_rows),
+            "Infinium Row Indexes": "; ".join(str(idx) for idx in i_rows),
+            "QuickBooks Row Count": len(q_rows),
+            "Infinium Row Count": len(i_rows),
+            "Matched Text Evidence": ", ".join(sorted(shared_tokens)) or "n/a",
+            "QuickBooks Amount": cents_to_float(q_total),
+            "Infinium Amount": cents_to_float(i_total),
+            "Accrual Treatment": (
+                "Excluded from automatic JE; a text-similarity match is never posted "
+                "without documented review"
+            ),
+            "Posting Disposition": "REVIEW REQUIRED - DO NOT POST",
+            "Explanation": (
+                f"{group.explanation} Neither amount is automatically posted pending "
+                "documented review."
+            ),
+            "Manual Decision": None,
+            "Reviewed By": None,
+            "Review Timestamp": None,
+            "Review Rationale": None,
+        })
+    return pd.DataFrame(records, columns=FUZZY_MATCH_REVIEW_COLUMNS)
+
+
 HISTORICAL_CLEARANCE_COLUMNS = [
     "Clearance ID",
     "Group Sequence",
@@ -982,7 +1075,7 @@ def build_historical_clearances(
 
     if inf_secondary is not None and len(inf_secondary) and unmatched_qb:
         secondary_matches, _, _, _ = perform_matching(
-            qb.loc[unmatched_qb].copy(), inf_secondary
+            qb.loc[unmatched_qb].copy(), inf_secondary, enable_fuzzy=False
         )
         for group in secondary_matches:
             cleared_qb.update(int(idx) for idx in group.qb_rows)
@@ -1005,7 +1098,7 @@ def build_historical_clearances(
 
     if qb_secondary is not None and len(qb_secondary) and unmatched_inf:
         secondary_matches, _, _, _ = perform_matching(
-            qb_secondary, inf.loc[unmatched_inf].copy()
+            qb_secondary, inf.loc[unmatched_inf].copy(), enable_fuzzy=False
         )
         for group in secondary_matches:
             cleared_inf.update(int(idx) for idx in group.inf_rows)
@@ -1049,6 +1142,7 @@ def build_paired_rows(
     duplicate_review_hold_qb_rows: list[int],
     duplicate_review_hold_inf_rows: list[int],
     amount_variance_analysis: pd.DataFrame,
+    fuzzy_review_hold_groups: list[MatchGroup],
     qb_duplicate_report: Optional[pd.DataFrame] = None,
     inf_duplicate_report: Optional[pd.DataFrame] = None,
 ) -> list[dict[str, Any]]:
@@ -1241,6 +1335,32 @@ def build_paired_rows(
                     ),
                 }
             )
+    for group in fuzzy_review_hold_groups:
+        ordered_q = sorted(group.qb_rows, key=lambda idx: qb.at[idx, SOURCE_POS])
+        ordered_i = sorted(group.inf_rows, key=lambda idx: inf.at[idx, SOURCE_POS])
+        grouped = len(ordered_q) > 1 or len(ordered_i) > 1
+        classification = (
+            FUZZY_MATCH_CLASSIFICATION_GROUPED if grouped else FUZZY_MATCH_CLASSIFICATION_SINGLE
+        )
+        for sequence, (qidx, iidx) in enumerate(zip_longest(ordered_q, ordered_i), 1):
+            rows.append(
+                {
+                    "Section": "09 Fuzzy Match Review Hold",
+                    "Match ID": group.match_id,
+                    "Match Result": classification,
+                    "QB Index": qidx,
+                    "Infinium Index": iidx,
+                    "QB Record Scope": "Primary" if qidx is not None else None,
+                    "Infinium Record Scope": "Primary" if iidx is not None else None,
+                    "Group Sequence": sequence,
+                    "Confidence": FUZZY_MATCH_CONFIDENCE,
+                    "Explanation": (
+                        f"{group.explanation} Neither amount is automatically posted "
+                        "pending documented review."
+                    ),
+                }
+            )
+
     def duplicate_lookup(report: Optional[pd.DataFrame]) -> dict[str, dict[str, Any]]:
         if report is None or report.empty:
             return {}
@@ -1371,6 +1491,10 @@ def build_paired_rows(
                 ])
             )
             row["Potential Amount Difference"] = detail.get("Potential Difference")
+        elif section == "09 Fuzzy Match Review Hold":
+            row["Exception Cause"] = "Potential Match - Pending Manual Confirmation"
+            row["Cause Confidence"] = FUZZY_MATCH_CONFIDENCE
+            row["Financial Treatment"] = "Excluded pending documented match confirmation"
 
         detail: dict[str, Any] = {}
         if row.get("QB Index") is not None and row.get("QB Record Scope") == "Primary":
@@ -1608,6 +1732,8 @@ def build_method_summary(
     duplicate_review_hold_inf_rows: list[int],
     amount_variance_review_hold_qb_rows: list[int],
     amount_variance_review_hold_inf_rows: list[int],
+    fuzzy_match_review_hold_qb_rows: list[int],
+    fuzzy_match_review_hold_inf_rows: list[int],
 ) -> pd.DataFrame:
     buckets: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"QB Rows": 0, "Infinium Rows": 0, "QB Cents": 0, "Infinium Cents": 0}
@@ -1662,6 +1788,12 @@ def build_method_summary(
         bucket["Infinium Rows"] = len(amount_variance_review_hold_inf_rows)
         bucket["QB Cents"] = _amount_total(qb, amount_variance_review_hold_qb_rows)
         bucket["Infinium Cents"] = _amount_total(inf, amount_variance_review_hold_inf_rows)
+    if fuzzy_match_review_hold_qb_rows or fuzzy_match_review_hold_inf_rows:
+        bucket = buckets["Fuzzy Match Review Hold (excluded from JE, pending confirmation)"]
+        bucket["QB Rows"] = len(fuzzy_match_review_hold_qb_rows)
+        bucket["Infinium Rows"] = len(fuzzy_match_review_hold_inf_rows)
+        bucket["QB Cents"] = _amount_total(qb, fuzzy_match_review_hold_qb_rows)
+        bucket["Infinium Cents"] = _amount_total(inf, fuzzy_match_review_hold_inf_rows)
     records = []
     for method, values in buckets.items():
         records.append(
@@ -1722,6 +1854,7 @@ def build_exception_analysis(
     candidates: pd.DataFrame,
     amount_variance_analysis: Optional[pd.DataFrame] = None,
     paired_rows: Optional[list[dict[str, Any]]] = None,
+    fuzzy_match_review_hold_analysis: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     candidate_reason = candidates.set_index("QuickBooks Row ID")["Exception Cause"].to_dict() if not candidates.empty else {}
@@ -1780,6 +1913,18 @@ def build_exception_analysis(
             records.append(
                 {
                     "Analysis Type": "Reference-matched amount variances on review hold",
+                    "Dimension": classification,
+                    "Transaction Count": len(group),
+                    "Amount": float(group["QuickBooks Amount"].sum()),
+                }
+            )
+    if fuzzy_match_review_hold_analysis is not None and not fuzzy_match_review_hold_analysis.empty:
+        for classification, group in fuzzy_match_review_hold_analysis.groupby(
+            "Classification", sort=False
+        ):
+            records.append(
+                {
+                    "Analysis Type": "Fuzzy matches on review hold",
                     "Dimension": classification,
                     "Transaction Count": len(group),
                     "Amount": float(group["QuickBooks Amount"].sum()),
@@ -2046,6 +2191,8 @@ def build_controls(
     duplicate_review_hold_inf_rows: list[int],
     amount_variance_review_hold_qb_rows: list[int],
     amount_variance_review_hold_inf_rows: list[int],
+    fuzzy_match_review_hold_qb_rows: list[int],
+    fuzzy_match_review_hold_inf_rows: list[int],
 ) -> pd.DataFrame:
     matched_q = _matched_row_indexes(matches, "QB")
     matched_i = _matched_row_indexes(matches, "INF")
@@ -2073,6 +2220,8 @@ def build_controls(
     review_hold_i_total = _amount_total(inf, duplicate_review_hold_inf_rows)
     variance_hold_q_total = _amount_total(qb, amount_variance_review_hold_qb_rows)
     variance_hold_i_total = _amount_total(inf, amount_variance_review_hold_inf_rows)
+    fuzzy_hold_q_total = _amount_total(qb, fuzzy_match_review_hold_qb_rows)
+    fuzzy_hold_i_total = _amount_total(inf, fuzzy_match_review_hold_inf_rows)
     historical_difference = (
         round(float(historical_clearances["Amount Difference"].sum()), 2)
         if not historical_clearances.empty else 0.0
@@ -2080,19 +2229,23 @@ def build_controls(
     records = [
         ("QuickBooks row completeness", len(qb),
          len(matched_q) + len(historical_q) + len(unmatched_qb) + len(duplicate_qb_rows)
-         + len(duplicate_review_hold_qb_rows) + len(amount_variance_review_hold_qb_rows)),
+         + len(duplicate_review_hold_qb_rows) + len(amount_variance_review_hold_qb_rows)
+         + len(fuzzy_match_review_hold_qb_rows)),
         ("Infinium row completeness", len(inf),
          len(matched_i) + len(historical_i) + len(unmatched_inf) + len(duplicate_inf_rows)
-         + len(duplicate_review_hold_inf_rows) + len(amount_variance_review_hold_inf_rows)),
+         + len(duplicate_review_hold_inf_rows) + len(amount_variance_review_hold_inf_rows)
+         + len(fuzzy_match_review_hold_inf_rows)),
         ("QuickBooks amount roll-forward", cents_to_float(qb_total),
          cents_to_float(
              matched_q_total + historical_q_total + unresolved_q_total
              + duplicate_q_total + review_hold_q_total + variance_hold_q_total
+             + fuzzy_hold_q_total
          )),
         ("Infinium amount roll-forward", cents_to_float(inf_total),
          cents_to_float(
              matched_i_total + historical_i_total + unresolved_i_total
              + duplicate_i_total + review_hold_i_total + variance_hold_i_total
+             + fuzzy_hold_i_total
          )),
         ("Primary-to-primary matched totals", cents_to_float(matched_q_total), cents_to_float(matched_i_total)),
         ("Historical clearance amount difference", 0.0, historical_difference),
@@ -2100,6 +2253,7 @@ def build_controls(
          cents_to_float(
              qb_total - matched_q_total - historical_q_total
              - duplicate_q_total - review_hold_q_total - variance_hold_q_total
+             - fuzzy_hold_q_total
          )),
         ("Excess QuickBooks copies excluded from JE", cents_to_float(duplicate_q_total),
          cents_to_float(duplicate_q_total)),
@@ -2107,6 +2261,8 @@ def build_controls(
          cents_to_float(review_hold_q_total), cents_to_float(review_hold_q_total)),
         ("Reference-matched amount variance QuickBooks items excluded from automatic JE",
          cents_to_float(variance_hold_q_total), cents_to_float(variance_hold_q_total)),
+        ("Fuzzy match review hold QuickBooks items excluded from automatic JE",
+         cents_to_float(fuzzy_hold_q_total), cents_to_float(fuzzy_hold_q_total)),
     ]
     output = []
     for check, expected, actual in records:
@@ -2213,6 +2369,24 @@ def build_reconciliation(
     matches, initially_unmatched_qb, initially_unmatched_inf, candidates = perform_matching(
         qb_active, inf_active
     )
+
+    # A fuzzy PO/text match is a similarity guess, not a certain relationship,
+    # so it is never posted the way an exact match is. Pull every fuzzy group
+    # out of the accepted matches and into its own review-hold population --
+    # see build_fuzzy_match_review_holds for the reviewer-facing report.
+    fuzzy_hold_groups = [group for group in matches if group.confidence == FUZZY_PO_CONFIDENCE]
+    matches = [group for group in matches if group.confidence != FUZZY_PO_CONFIDENCE]
+    fuzzy_hold_groups.sort(
+        key=lambda group: min(qb_active.at[idx, SOURCE_POS] for idx in group.qb_rows)
+    )
+    for number, group in enumerate(fuzzy_hold_groups, 1):
+        group.match_id = f"FUZZY-{number:06d}"
+    fuzzy_match_review_hold_qb = sorted({idx for group in fuzzy_hold_groups for idx in group.qb_rows})
+    fuzzy_match_review_hold_inf = sorted({idx for group in fuzzy_hold_groups for idx in group.inf_rows})
+    fuzzy_match_review_hold_analysis = build_fuzzy_match_review_holds(
+        qb_active, inf_active, fuzzy_hold_groups
+    )
+
     historical_clearances, unmatched_qb, unmatched_inf = build_historical_clearances(
         qb,
         inf,
@@ -2263,6 +2437,7 @@ def build_reconciliation(
         qb_screen.duplicate_rows, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_analysis,
+        fuzzy_hold_groups,
         qb_screen.report,
         inf_screen.report,
     )
@@ -2276,10 +2451,12 @@ def build_reconciliation(
         qb_screen.duplicate_rows, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
+        fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
     )
     exception_analysis = build_exception_analysis(
         qb, inf, unmatched_qb, unmatched_inf, candidates,
         amount_variance_analysis, paired_rows,
+        fuzzy_match_review_hold_analysis,
     )
     qb_primary_duplicate_report = finalize_review_dispositions(
         qb_screen.report,
@@ -2330,6 +2507,7 @@ def build_reconciliation(
         qb_screen.duplicate_rows, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
+        fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
     )
     rules, config = build_rules_and_config(
         qb_mapping,
@@ -2381,6 +2559,8 @@ def build_reconciliation(
         posting_blockers.append("unresolved Infinium historical duplicate review holds")
     if not amount_variance_analysis.empty:
         posting_blockers.append("unresolved reference-matched amount variance review holds")
+    if not fuzzy_match_review_hold_analysis.empty:
+        posting_blockers.append("unresolved fuzzy PO match review holds")
     if qb[AMOUNT_CENTS].isna().any():
         posting_blockers.append("invalid QuickBooks amounts")
     if inf[AMOUNT_CENTS].isna().any():
@@ -2475,6 +2655,13 @@ def build_reconciliation(
             float(amount_variance_analysis["Absolute Difference"].sum())
             if not amount_variance_analysis.empty else 0.0
         ),
+        "Fuzzy Match Review Hold Rows": len(fuzzy_match_review_hold_analysis),
+        "Fuzzy Match Review Hold QuickBooks Amount": cents_to_float(
+            _amount_total(qb, fuzzy_match_review_hold_qb)
+        ),
+        "Fuzzy Match Review Hold Infinium Amount": cents_to_float(
+            _amount_total(inf, fuzzy_match_review_hold_inf)
+        ),
         "Posting Blockers": "; ".join(posting_blockers) if posting_blockers else "None",
         "Posting Status": "REVIEW REQUIRED" if posting_blockers else "READY TO POST",
         "Posting Authorization": "DO NOT POST" if posting_blockers else "AUTHORIZED BY AUTOMATED CONTROLS",
@@ -2552,6 +2739,9 @@ def build_reconciliation(
         duplicate_review_hold_inf_rows=duplicate_review_hold_inf,
         amount_variance_review_hold_qb_rows=amount_variance_review_hold_qb,
         amount_variance_review_hold_inf_rows=amount_variance_review_hold_inf,
+        fuzzy_match_review_hold_analysis=fuzzy_match_review_hold_analysis,
+        fuzzy_match_review_hold_qb_rows=fuzzy_match_review_hold_qb,
+        fuzzy_match_review_hold_inf_rows=fuzzy_match_review_hold_inf,
     )
     validate_reconciliation(result)
     return result
@@ -2567,6 +2757,8 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
     review_hold_inf = set(result.duplicate_review_hold_inf_rows)
     variance_hold_qb = set(result.amount_variance_review_hold_qb_rows)
     variance_hold_inf = set(result.amount_variance_review_hold_inf_rows)
+    fuzzy_hold_qb = set(result.fuzzy_match_review_hold_qb_rows)
+    fuzzy_hold_inf = set(result.fuzzy_match_review_hold_inf_rows)
     if duplicate_qb.intersection(result.suspected_qb_rows):
         raise ValueError(
             "Duplicate disposition control failure: a QuickBooks row was both "
@@ -2643,6 +2835,42 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
             reported_difference = Decimal(str(variance["Potential Difference"])) * 100
             if reported_difference != Decimal(q_cents - i_cents):
                 raise ValueError("Amount variance control failure: reported difference is incorrect.")
+    if (
+        fuzzy_hold_qb.intersection(
+            duplicate_qb | review_hold_qb | variance_hold_qb | set(result.unmatched_qb)
+        )
+        or fuzzy_hold_inf.intersection(
+            duplicate_inf | review_hold_inf | variance_hold_inf | set(result.unmatched_inf)
+        )
+    ):
+        raise ValueError(
+            "Fuzzy match review hold control failure: a fuzzy-held row also appears in "
+            "another financial disposition population."
+        )
+    fuzzy_report = result.fuzzy_match_review_hold_analysis
+    if fuzzy_report.empty != (not fuzzy_hold_qb and not fuzzy_hold_inf):
+        raise ValueError(
+            "Fuzzy match review hold audit control failure: report and held-row "
+            "populations do not agree."
+        )
+    if not fuzzy_report.empty:
+        reported_qb_rows: set[int] = set()
+        reported_inf_rows: set[int] = set()
+        for record in fuzzy_report.to_dict("records"):
+            reported_qb_rows.update(
+                int(idx) for idx in str(record["QuickBooks Row Indexes"]).split(";") if idx.strip()
+            )
+            reported_inf_rows.update(
+                int(idx) for idx in str(record["Infinium Row Indexes"]).split(";") if idx.strip()
+            )
+        if reported_qb_rows != fuzzy_hold_qb:
+            raise ValueError(
+                "Fuzzy match review hold audit control failure: QuickBooks row indexes disagree."
+            )
+        if reported_inf_rows != fuzzy_hold_inf:
+            raise ValueError(
+                "Fuzzy match review hold audit control failure: Infinium row indexes disagree."
+            )
     for group in result.matches:
         if review_hold_qb.intersection(group.qb_rows) or review_hold_inf.intersection(group.inf_rows):
             raise ValueError(
@@ -2653,6 +2881,16 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
             raise ValueError(
                 "Amount variance control failure: a variance-held row was included in an "
                 "accepted match."
+            )
+        if fuzzy_hold_qb.intersection(group.qb_rows) or fuzzy_hold_inf.intersection(group.inf_rows):
+            raise ValueError(
+                "Fuzzy match review hold control failure: a fuzzy-held row was included in "
+                "an accepted match."
+            )
+        if group.confidence == FUZZY_PO_CONFIDENCE:
+            raise ValueError(
+                "Fuzzy match review hold control failure: a fuzzy match was accepted "
+                "instead of held for review."
             )
     for dataset, report, frame, id_column, excluded_rows in (
         ("QuickBooks", result.duplicate_analysis, result.qb_work, QB_ID, duplicate_qb | review_hold_qb),
@@ -2845,6 +3083,7 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
         "06 Duplicate Review Hold QuickBooks",
         "07 Duplicate Review Hold Infinium",
         "08 Reference-Matched Amount Variance Review Hold",
+        "09 Fuzzy Match Review Hold",
     }
     duplicate_sections = {"04 Duplicate QuickBooks", "05 Duplicate Infinium"}
     for row in result.paired_rows:

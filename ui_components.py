@@ -348,6 +348,20 @@ def render_result(result: ReconciliationResult) -> None:
             tone="warning",
             icon="!",
         )
+        fuzzy_hold_rows = int(metrics.get("Fuzzy Match Review Hold Rows", 0))
+        fuzzy_hold_amount = metrics.get("Fuzzy Match Review Hold QuickBooks Amount", 0.0)
+        if fuzzy_hold_rows:
+            render_notice_panel(
+                "Fuzzy matches await confirmation",
+                (
+                    f"{fuzzy_hold_rows:,} fuzzy PO/text match(es) totaling "
+                    f"{format_currency(fuzzy_hold_amount)} (QuickBooks side) were found by text similarity "
+                    "rather than an exact reference, so they were never posted automatically. They are held "
+                    "for a documented human confirmation -- see the Detailed Match Ledger in the download."
+                ),
+                tone="warning",
+                icon="!",
+            )
 
     failed_controls = int(result.controls["Status"].ne("PASS").sum())
     invalid_amount_rows = int(

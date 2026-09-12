@@ -186,6 +186,37 @@ def test_analytics_workbook_builds_with_duplicates_present(qb_mapping, inf_mappi
     assert any("INF-2" in text or "INF-3" in text for text in inf_dup_text)
 
 
+def test_unresolved_sheet_duplicate_tables_use_simplified_reviewer_columns(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """The 'Unresolved Exceptions' sheet's duplicate sub-tables show a small,
+    plain-English column set for non-technical reviewers, while the full
+    technical schema stays intact on the 'QuickBooks Duplicates' audit sheet
+    -- a regression guard for the "display-only, additive" scope of that
+    simplification."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    primary_wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    ws = primary_wb["Unresolved Exceptions"]
+    unresolved_text = _worksheet_text(ws)
+
+    for header in ("Duplicate ID", "Row ID", "What Was Found", "Reason", "Status"):
+        assert header in unresolved_text, f"missing simplified header {header!r}"
+    for technical_header in (
+        "Screening Stage", "Normalized PO", "Normalized Invoice",
+        "Confirmed Copy Set ID", "Duplicate Rule Version", "Payload Confirmed",
+    ):
+        assert technical_header not in unresolved_text, (
+            f"technical header {technical_header!r} leaked into the reviewer-facing sheet"
+        )
+    assert any("Same PO 200, Invoice INV200" in text for text in unresolved_text)
+    assert any("Kept (Original)" in text or "Removed (Duplicate)" in text for text in unresolved_text)
+
+    analytics_wb = load_workbook(io.BytesIO(build_analytics_workbook(result)))
+    audit_text = _worksheet_text(analytics_wb["QuickBooks Duplicates"])
+    for technical_header in ("Screening Stage", "Normalized PO", "Confirmed Copy Set ID", "Duplicate Rule Version"):
+        assert technical_header in audit_text, f"expected full audit column {technical_header!r} to remain"
+
+
 def test_primary_and_analytics_workbooks_build_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):
     """The empty-duplicate-frame branches must render cleanly too."""
     result = _build_result_without_duplicates(qb_mapping, inf_mapping, make_metadata)

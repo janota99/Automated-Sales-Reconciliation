@@ -12,6 +12,10 @@ import pandas as pd
 import pytest
 
 from matching import (
+    FUZZY_MATCH_CLASSIFICATION_GROUPED,
+    FUZZY_MATCH_CLASSIFICATION_SINGLE,
+    MatchGroup,
+    build_fuzzy_match_review_holds,
     build_reconciliation,
     cents_or_zero,
     cents_to_float,
@@ -225,9 +229,61 @@ def test_fuzzy_po_pass_never_guesses_among_ambiguous_candidates(qb_mapping, inf_
     assert sorted(unmatched_inf) == [0, 1]
 
 
+def test_perform_matching_enable_fuzzy_false_leaves_hopper_row_unmatched(qb_mapping, inf_mapping):
+    """Fuzzy matching is disabled for historical-clearance matching -- a
+    Hopper-style row must stay unmatched rather than fuzzy-clear against a
+    population that is not the accrual source of truth."""
+    qb = _prepare(
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        qb_mapping, "QB",
+    )
+    inf = _prepare(
+        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"}],
+        inf_mapping, "INF",
+    )
+    matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf, enable_fuzzy=False)
+    assert matches == []
+    assert unmatched_qb == [0] and unmatched_inf == [0]
+
+
+def test_build_fuzzy_match_review_holds_classifies_single_and_grouped(qb_mapping, inf_mapping):
+    qb = _prepare(
+        [
+            {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"},
+            {"PO": "Hopper", "Invoice": "20055", "Amount": 100.00, "Qty": 1, "Period": "6"},
+            {"PO": "Hopper", "Invoice": "20066", "Amount": 125.00, "Qty": 1, "Period": "6"},
+        ],
+        qb_mapping, "QB",
+    )
+    inf = _prepare(
+        [
+            {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
+            {"PO": "DAVID HOPPER 3.1", "Invoice": "88888", "Amount": 225.00, "Period": "6"},
+        ],
+        inf_mapping, "INF",
+    )
+    single_group = MatchGroup([0], [0], "Fuzzy PO", "Fuzzy", "single-row text variant")
+    grouped_group = MatchGroup([1, 2], [1], "Fuzzy PO", "Fuzzy", "multi-row netting", group_level=True)
+    analysis = build_fuzzy_match_review_holds(qb, inf, [single_group, grouped_group])
+    assert len(analysis) == 2
+    single_row = analysis.iloc[0]
+    grouped_row = analysis.iloc[1]
+    assert single_row["Classification"] == FUZZY_MATCH_CLASSIFICATION_SINGLE
+    assert single_row["QuickBooks Row Count"] == 1
+    assert single_row["Infinium Row Count"] == 1
+    assert grouped_row["Classification"] == FUZZY_MATCH_CLASSIFICATION_GROUPED
+    assert grouped_row["QuickBooks Row Count"] == 2
+    assert grouped_row["Infinium Row Count"] == 1
+    assert grouped_row["QuickBooks Amount"] == pytest.approx(225.00)
+    assert grouped_row["Infinium Amount"] == pytest.approx(225.00)
+    assert "HOPPER" in grouped_row["Matched Text Evidence"]
+
+
 def test_full_reconciliation_resolves_hopper_style_po_mismatch(qb_mapping, inf_mapping, make_metadata):
     """The fuzzy pass must also fire through the full build_reconciliation
-    pipeline, and its match must never be mistaken for an exact one."""
+    pipeline, but a fuzzy match is a text-similarity guess, not a certain
+    relationship -- it must never be posted like an exact match. It goes to
+    its own review-hold population instead, and blocks posting."""
     qb_rows = [
         {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"},
         {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "6"},
@@ -241,9 +297,12 @@ def test_full_reconciliation_resolves_hopper_style_po_mismatch(qb_mapping, inf_m
     )
     assert result.metrics["Control Status"] == "PASS"
     assert result.metrics["Unresolved QuickBooks Rows"] == 1
-    fuzzy_matches = [g for g in result.matches if g.confidence == "Fuzzy"]
-    assert len(fuzzy_matches) == 1
-    assert "Fuzzy PO" in fuzzy_matches[0].method
+    assert not any(g.confidence == "Fuzzy" for g in result.matches)
+    assert result.metrics["Fuzzy Match Review Hold Rows"] == 1
+    assert len(result.fuzzy_match_review_hold_qb_rows) == 1
+    assert len(result.fuzzy_match_review_hold_inf_rows) == 1
+    assert "Fuzzy Match" in result.fuzzy_match_review_hold_analysis.iloc[0]["Classification"]
+    assert result.metrics["Posting Status"] == "REVIEW REQUIRED"
 
 
 # ---------------------------------------------------------------------------
@@ -459,9 +518,37 @@ def test_validate_reconciliation_rejects_duplicate_inside_an_accepted_match(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
-    from matching import MatchGroup
     result.matches.append(
         MatchGroup([result.duplicate_qb_rows[0]], [0], "Fabricated", "Strong", "test")
     )
     with pytest.raises(ValueError, match="Duplicate exclusion control failure"):
+        validate_reconciliation(result)
+
+
+def test_validate_reconciliation_rejects_fuzzy_held_row_in_accepted_match(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Direct test of the safety net added alongside the fuzzy match review
+    hold: if a fuzzy-held row were ever also posted inside an accepted
+    match, validation must fail loudly rather than silently double-count it."""
+    qb_rows = [
+        {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "6"},
+    ]
+    inf_rows = [
+        {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.fuzzy_match_review_hold_qb_rows, "fixture must actually produce a fuzzy hold to tamper with"
+    result.matches.append(
+        MatchGroup(
+            [result.fuzzy_match_review_hold_qb_rows[0]],
+            [result.fuzzy_match_review_hold_inf_rows[0]],
+            "Fabricated", "Strong", "test",
+        )
+    )
+    with pytest.raises(ValueError, match="Fuzzy match review hold control failure"):
         validate_reconciliation(result)

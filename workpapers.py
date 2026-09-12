@@ -54,6 +54,12 @@ from excel_styles import (
     _write_title_band,
     _write_total_row,
 )
+from duplicates import (
+    DUPLICATE_BASIS_CROSS_SCOPE,
+    DUPLICATE_BASIS_INVOICE_ONLY,
+    DUPLICATE_BASIS_PO_ONLY,
+    DUPLICATE_BASIS_STRICT,
+)
 from matching import (
     AMOUNT_CENTS,
     INF_ID,
@@ -66,7 +72,7 @@ from matching import (
     numeric_sum,
     valid_cents,
 )
-from utils import excel_safe, format_central_timestamp
+from utils import excel_safe, format_central_timestamp, format_currency
 
 
 def _write_dataframe_values(ws, frame: pd.DataFrame, start_row: int, start_col: int) -> None:
@@ -510,6 +516,86 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
     _prepare_sheet(ws)
 
 
+_DUPLICATE_STATUS_LABELS = {
+    "Retained canonical row": "Kept (Original)",
+    "Excluded excess copy": "Removed (Duplicate)",
+    "Held for review - excluded from proposed JE pending disposition": "Pending Review",
+}
+
+_DUPLICATE_BASIS_PHRASES = {
+    DUPLICATE_BASIS_STRICT: "PO, Invoice, and Amount",
+    DUPLICATE_BASIS_PO_ONLY: "PO and Amount",
+    DUPLICATE_BASIS_INVOICE_ONLY: "Invoice and Amount",
+    DUPLICATE_BASIS_CROSS_SCOPE: "PO, Invoice, and Amount across periods",
+}
+
+
+def _what_was_found(row: dict) -> str:
+    basis = row.get("Duplicate Basis", "")
+    po = row.get("Normalized PO") or ""
+    invoice = row.get("Normalized Invoice") or ""
+    amount_str = format_currency(row.get("Amount"))
+    if basis == DUPLICATE_BASIS_PO_ONLY:
+        shared = f"Same PO {po} and Amount {amount_str} (Invoice blank on both rows)"
+    elif basis == DUPLICATE_BASIS_INVOICE_ONLY:
+        shared = f"Same Invoice {invoice} and Amount {amount_str} (PO blank on both rows)"
+    elif basis == DUPLICATE_BASIS_CROSS_SCOPE:
+        shared = f"Same PO {po}, Invoice {invoice}, and Amount {amount_str} as a row in the other period's data"
+    else:
+        shared = f"Same PO {po}, Invoice {invoice}, and Amount {amount_str}"
+    other_ids = [
+        piece.strip() for piece in str(row.get("Other Source Row IDs In Group", "")).split(";")
+        if piece.strip()
+    ]
+    if not other_ids:
+        as_clause = ""
+    elif len(other_ids) == 1:
+        as_clause = f" as row {other_ids[0]}"
+    elif len(other_ids) <= 3:
+        as_clause = f" as rows {', '.join(other_ids)}"
+    else:
+        as_clause = f" as rows {', '.join(other_ids[:3])}, and {len(other_ids) - 3} more"
+    return f"{shared}{as_clause}."
+
+
+def _duplicate_reason(row: dict) -> str:
+    basis_phrase = _DUPLICATE_BASIS_PHRASES.get(row.get("Duplicate Basis", ""), "PO, Invoice, and Amount")
+    if row.get("Payload Confirmed"):
+        return "These rows appear identical in every field compared."
+    differing = str(row.get("Differing Confirmation Fields", "") or "").strip()
+    if differing:
+        return f"These rows match on {basis_phrase}, but differ in: {differing.replace('; ', ', ')}."
+    return f"These rows share the same {basis_phrase}; no other confirmation fields were available to compare."
+
+
+def _simplify_duplicate_display(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce a duplicate_analysis-shaped frame to a small, plain-English view
+    for non-technical reviewers -- unique ID, what was found, and why.
+
+    This is purely a display transform for the "Unresolved Exceptions" sheet.
+    The full technical schema (Screening Stage, Duplicate Basis, Normalized
+    PO/Invoice, Confirmed Copy Set ID, etc.) stays intact everywhere else --
+    the "QuickBooks/Infinium Duplicates" audit sheets, `finalize_review_
+    dispositions`, and `validate_reconciliation` all keep reading the
+    original `duplicate_analysis` frame untouched.
+    """
+    optional_columns = [col for col in ("Reviewer Note", "Reviewer Disposition") if col in frame.columns]
+    if frame.empty:
+        return pd.DataFrame(columns=["Duplicate ID", "Row ID", "What Was Found", "Reason", "Amount", "Status"] + optional_columns)
+    records = frame.to_dict("records")
+    simplified = pd.DataFrame({
+        "Duplicate ID": frame["Duplicate Group ID"].values,
+        "Row ID": frame["Source Row ID"].values,
+        "What Was Found": [_what_was_found(row) for row in records],
+        "Reason": [_duplicate_reason(row) for row in records],
+        "Amount": frame["Amount"].values,
+        "Status": frame["Disposition"].map(_DUPLICATE_STATUS_LABELS).fillna(frame["Disposition"]).values,
+    })
+    for column in optional_columns:
+        simplified[column] = frame[column].values
+    return simplified
+
+
 def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws = wb.create_sheet("Unresolved Exceptions")
 
@@ -553,6 +639,11 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         )
     ].copy()
     duplicate_frame["Reviewer Note"] = ""
+    # Capture styling inputs from the full technical frame before reducing it
+    # to the reviewer-facing view below -- only the excess copy is actually
+    # excluded from the JE, and that flag isn't part of the simplified columns.
+    duplicate_excluded_flags = duplicate_frame["Automatically Excluded"].fillna(False).astype(bool).tolist()
+    duplicate_frame = _simplify_duplicate_display(duplicate_frame)
     duplicate_headers = list(duplicate_frame.columns)
     dup_end_col = len(duplicate_headers)
     duplicate_excluded_count = result.metrics["Duplicate QuickBooks Rows"]
@@ -561,6 +652,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     review_hold_frame = result.duplicate_analysis.loc[
         result.duplicate_analysis["Disposition"] == "Held for review - excluded from proposed JE pending disposition"
     ].copy()
+    review_hold_frame = _simplify_duplicate_display(review_hold_frame)
     review_hold_frame["Reviewer Disposition"] = "Pending Review"
     review_headers = list(review_hold_frame.columns)
     review_end_col = len(review_headers)
@@ -811,8 +903,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         # Only the excess copy is actually excluded from the JE -- the
         # retained canonical row is shown for audit context but must not be
         # styled as if it, too, had been dropped from the accrual.
-        excluded_flags = duplicate_frame["Automatically Excluded"].fillna(False).astype(bool).tolist()
-        for offset, is_excluded in enumerate(excluded_flags):
+        for offset, is_excluded in enumerate(duplicate_excluded_flags):
             if is_excluded:
                 _apply_duplicate_style(ws, dup_data_row + offset, 1, dup_end_col)
         if "Reviewer Note" in duplicate_headers:
@@ -823,17 +914,13 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         dup_last_row = dup_header_row
 
     _set_widths(ws, 1, dup_end_col, dup_header_row, dup_last_row)
-    if "Other Source Row IDs In Group" in duplicate_headers:
+    if "What Was Found" in duplicate_headers:
         ws.column_dimensions[
-            get_column_letter(duplicate_headers.index("Other Source Row IDs In Group") + 1)
-        ].width = 44
-    if "Disposition" in duplicate_headers:
+            get_column_letter(duplicate_headers.index("What Was Found") + 1)
+        ].width = 52
+    if "Reason" in duplicate_headers:
         ws.column_dimensions[
-            get_column_letter(duplicate_headers.index("Disposition") + 1)
-        ].width = 42
-    if "Policy Note" in duplicate_headers:
-        ws.column_dimensions[
-            get_column_letter(duplicate_headers.index("Policy Note") + 1)
+            get_column_letter(duplicate_headers.index("Reason") + 1)
         ].width = 46
     if "Reviewer Note" in duplicate_headers:
         ws.column_dimensions[
@@ -903,7 +990,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         _format_body_block(ws, review_data_row, review_last_row, 1, review_end_col, SLATE_LIGHT)
         _apply_number_formats(
             ws, review_headers, review_data_row, review_last_row, 1,
-            {"Amount", "Excluded Amount"}, set(),
+            {"Amount"}, set(),
         )
         # Amber, not the red duplicate style: this needs attention, but it
         # is not yet a confirmed duplicate the way an excess copy is.
@@ -914,14 +1001,14 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         review_last_row = review_header_row
 
     _set_widths(ws, 1, review_end_col, review_header_row, review_last_row)
-    if "Policy Note" in review_headers:
+    if "What Was Found" in review_headers:
         ws.column_dimensions[
-            get_column_letter(review_headers.index("Policy Note") + 1)
+            get_column_letter(review_headers.index("What Was Found") + 1)
+        ].width = 52
+    if "Reason" in review_headers:
+        ws.column_dimensions[
+            get_column_letter(review_headers.index("Reason") + 1)
         ].width = 46
-    if "Other Source Row IDs In Group" in review_headers:
-        ws.column_dimensions[
-            get_column_letter(review_headers.index("Other Source Row IDs In Group") + 1)
-        ].width = 44
     if "Reviewer Disposition" in review_headers:
         disposition_col = review_headers.index("Reviewer Disposition") + 1
         ws.column_dimensions[get_column_letter(disposition_col)].width = 40
