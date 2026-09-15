@@ -37,6 +37,21 @@ def test_significant_po_tokens_drops_numbers_and_short_words():
     assert significant_po_tokens(float("nan")) == frozenset()
 
 
+def test_significant_po_tokens_splits_letters_from_digits_with_no_separator():
+    """Real Infinium data glues a name straight onto a reference number
+    with no separator (e.g. 'JWOOD7060', 'ABOLT184225'). Without splitting
+    at the letter/digit boundary, the whole blob is a one-off token that
+    could never equal or resemble anything else again -- splitting it
+    recovers the meaningful name portion and still drops the numeric
+    reference the same way a space-separated number would be dropped."""
+    assert significant_po_tokens("JWOOD7060") == frozenset({"JWOOD"})
+    assert significant_po_tokens("ABOLT184225") == frozenset({"ABOLT"})
+    assert significant_po_tokens("181493AMARILLO B") == frozenset({"AMARILLO"})
+    # A purely-glued word with no digit boundary at all still can't be
+    # split -- that's a known, documented limitation, not a regression.
+    assert significant_po_tokens("POJERRYWOOD") == frozenset({"POJERRYWOOD"})
+
+
 def test_hopper_example_is_a_fuzzy_match():
     """The exact scenario reported: QuickBooks 'Hopper' vs Infinium
     'DAVID HOPPER 2.2' for the same transaction."""

@@ -11,6 +11,46 @@
       "confirmed_date": "2026-09-15",
       "rationale": "Confirmed via golden-master validation against SALES COMPLETE.xlsx (tag A1): QuickBooks PO field records the surname (\"Hopper\"), Infinium OHDESC records only the first name (\"David\") for the same recurring dock-sale customer. No text-similarity rule can bridge a surname and a first name that share no characters.",
       "active": true
+    },
+    {
+      "id": "ALIAS-0002",
+      "terms": [
+        "FAB",
+        "FABRICATION"
+      ],
+      "label": "Midwest Fabrication (dock sales, PPL)",
+      "confirmed_by": "Dylan Janota",
+      "confirmed_date": "2026-09-15",
+      "rationale": "QuickBooks sometimes records the full name (\"Midwest Fabrication\") while Infinium records the abbreviation (\"Midwest Fab\") -- no shared token, so no text-similarity rule could ever bridge \"FABRICATION\" vs \"FAB\" (ratio ~0.43, well under the 0.84 near-miss threshold). \"MIDWEST\" itself is not included since it already matches exactly on both sides; only the divergent variant is aliased.",
+      "active": true
+    },
+    {
+      "id": "ALIAS-0003",
+      "terms": [
+        "JERRYWOOD",
+        "JWOOD",
+        "POJERRYWOOD",
+        "WOOD"
+      ],
+      "label": "Jerry Wood (dock sales, PPL)",
+      "confirmed_by": "Dylan Janota",
+      "confirmed_date": "2026-09-15",
+      "rationale": "Infinium often records this recurring dock-sale customer as a glued reference code rather than the plain name -- e.g. \"JWOOD7060\" (now split by the letter/digit tokenizer fix into \"JWOOD\" + a dropped reference number) or \"JERRYWOOD\" with no space. None of these share a token with QuickBooks' plain \"JERRY WOOD\" without this alias. Note: a glued form with an unrelated word fused on with no digit boundary at all (e.g. \"POJERRYWOOD\") still cannot be split by the tokenizer and stays outside this alias -- that specific pattern would need a deeper tokenizer change, not just an alias entry. Revised: excluded the bare first name \"JERRY\" after confirming it also appears in two other, unrelated dock-sale customers in this same dataset (\"Jerry Potter\" and \"Jerry - Gibbs Electric\", both also $225) -- too generic to safely alias on its own. Revised again: added the literal glued form \"POJERRYWOOD\" (Infinium invoice 221339, 4/27/2026) after finding that leaving it out let the alias resolve to a DIFFERENT candidate (invoice 21017 \"JWOOD7060\", 3/03/2026) with false confidence -- both are $225 and either could plausibly be the true counterpart to the QuickBooks 6/4/2026 row, so this stays a genuine, correctly-unresolved ambiguity between the two until a person confirms which one it actually is.",
+      "active": true
+    },
+    {
+      "id": "ALIAS-0004",
+      "terms": [
+        "ABOLT",
+        "AMA",
+        "BLT",
+        "BOLT"
+      ],
+      "label": "Amarillo Bolt (dock sales, PPL)",
+      "confirmed_by": "Dylan Janota",
+      "confirmed_date": "2026-09-15",
+      "rationale": "Recurring dock-sale customer referenced with inconsistent abbreviations across systems -- e.g. \"ABOLT184225\" (glued reference code, now split by the letter/digit tokenizer fix), or shorthand like \"AMA BOLT\" / \"Amarillo BLT\". Deliberately does NOT include the bare word \"AMARILLO\": the company is based in Amarillo, TX, so many unrelated vendor names in this ledger may also contain \"Amarillo\" (confirmed one such case already exists: \"AMARILLO TRUCK&TRAILER-QUENTIN\", a different business). Aliasing the bare city name would risk merging unrelated vendors; only the bolt-specific terms are linked.",
+      "active": true
     }
   ]
 }

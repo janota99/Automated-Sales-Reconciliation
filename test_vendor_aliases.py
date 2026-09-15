@@ -132,6 +132,63 @@ def test_find_alias_po_matches_ignores_unrelated_rows():
     assert groups == [((0,), (0,))]
 
 
+def test_alias_term_scoped_to_the_specific_vendor_not_a_shared_first_name():
+    """The reported real-world lesson: 'JERRY' alone was nearly included in
+    the Jerry Wood alias, but the same real dataset has two other,
+    unrelated dock-sale customers who also happen to be named Jerry
+    ('Jerry Potter', 'Jerry - Gibbs Electric') at the same $225. A first
+    name that generic must never be a standalone alias term -- only the
+    distinctive compound/abbreviated forms ('WOOD', 'JWOOD', 'JERRYWOOD')
+    are linked, so an unrelated same-first-name customer is never pulled
+    into this alias group."""
+    jerry_wood_alias = VendorAlias(
+        "ALIAS-0003", ["WOOD", "JWOOD", "JERRYWOOD"], "Jerry Wood (dock sales)",
+        "Reviewer", "2026-09-15", "confirmed",
+    )
+    token_map = build_alias_token_map([jerry_wood_alias])
+
+    qb = make_frame(
+        ("QB-POTTER", "Jerry Potter", 22500),
+        ("QB-WOOD", "Jerry Wood 6.4.26", 22500),
+    )
+    inf = make_frame(("INF-JWOOD", "JWOOD7060", 22500))
+
+    groups = find_alias_po_matches(qb, inf, {0, 1}, {0}, token_map)
+    # Only the Wood row may match; Jerry Potter must never be pulled in
+    # just because both QB rows happen to share the first name "Jerry".
+    assert groups == [((1,), (0,))]
+
+
+def test_incomplete_alias_terms_must_not_falsely_resolve_a_real_ambiguity():
+    """The reported real-world lesson: Infinium had TWO $225 candidates for
+    one QuickBooks 'Jerry Wood' row that period -- 'JWOOD7060' and
+    'POJERRYWOOD' (a form the letter/digit tokenizer can't split, since it
+    has no digit boundary). When the alias only covered 'JWOOD' and not
+    the literal 'POJERRYWOOD' blob, it silently resolved to JWOOD7060 with
+    'Confirmed' certainty -- a false confidence, since either candidate
+    could plausibly be the real one and there was no way to tell which.
+    Once both literal forms are in the alias, the pair correctly reverts
+    to a genuine, unresolved ambiguity instead of an accidental pick."""
+    qb = make_frame(("QB-WOOD", "Jerry Wood 6.4.26", 22500))
+    inf = make_frame(
+        ("INF-A", "JWOOD7060", 22500),
+        ("INF-B", "POJERRYWOOD", 22500),
+    )
+
+    incomplete_alias = VendorAlias(
+        "ALIAS-0003", ["WOOD", "JWOOD", "JERRYWOOD"], "Jerry Wood", "Reviewer", "2026-01-01", "confirmed",
+    )
+    groups = find_alias_po_matches(qb, inf, {0}, {0, 1}, build_alias_token_map([incomplete_alias]))
+    assert groups == [((0,), (0,))]  # the bug: falsely "confirms" JWOOD7060 alone
+
+    complete_alias = VendorAlias(
+        "ALIAS-0003", ["WOOD", "JWOOD", "JERRYWOOD", "POJERRYWOOD"], "Jerry Wood",
+        "Reviewer", "2026-01-01", "confirmed",
+    )
+    groups = find_alias_po_matches(qb, inf, {0}, {0, 1}, build_alias_token_map([complete_alias]))
+    assert groups == []  # the fix: both candidates tie, correctly left unresolved
+
+
 def test_alias_explanation_names_the_confirming_record():
     qb = make_frame(("QB1", "Hopper", 67500))
     inf = make_frame(("INF1", "David", 67500))

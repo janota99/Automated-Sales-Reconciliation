@@ -65,7 +65,7 @@ FUZZY_PO_EXPLANATION = (
     "proximity and avoid single-word generic false positives."
 )
 
-_RE_WORD = re.compile(r"[A-Z0-9]+")
+_RE_WORD = re.compile(r"[A-Z]+|[0-9]+")
 _MIN_TOKEN_LENGTH = 3
 _MAX_GROUP_SIZE = 8
 
@@ -86,8 +86,13 @@ _STOP_WORDS = frozenset([
 def significant_po_tokens(value: Any) -> frozenset[str]:
     """Return the significant alphanumeric tokens in a raw PO value.
 
-    Pure numbers and short fragments are dropped to prevent false-positive 
-    containment matches on shared product codes or generic abbreviations.
+    Letters and digits split at their boundary even with no separator
+    (e.g. "JWOOD7060" -> "JWOOD" + "7060", "ABOLT184225" -> "ABOLT" +
+    "184225") -- a concatenated name-plus-reference-number code is common
+    in these exports, and without the split the whole blob would never
+    equal or resemble anything else again. Pure numbers and short
+    fragments are then dropped to prevent false-positive containment
+    matches on shared product codes or generic abbreviations.
     """
     if value is None or pd.isna(value):
         return frozenset()
