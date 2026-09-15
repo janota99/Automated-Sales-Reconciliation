@@ -62,6 +62,7 @@ from duplicates import (
     DUPLICATE_BASIS_INVOICE_ONLY,
     DUPLICATE_BASIS_PO_ONLY,
     DUPLICATE_BASIS_STRICT,
+    NORM_PO,
 )
 from matching import (
     AMOUNT_CENTS,
@@ -1107,10 +1108,10 @@ _LEGACY_MATCHED_SECTIONS = {
     "01 Matched - Historical Clearance",
     "09 Fuzzy Match Review Hold",
 }
-_LEGACY_DUPLICATE_SECTIONS = {
-    "04 Duplicate QuickBooks",
-    "05 Duplicate Infinium",
-}
+_LEGACY_QB_DUPLICATE_SECTIONS = {"04 Duplicate QuickBooks"}
+_LEGACY_INF_DUPLICATE_SECTIONS = {"05 Duplicate Infinium"}
+_LEGACY_DUPLICATE_SECTIONS = _LEGACY_QB_DUPLICATE_SECTIONS | _LEGACY_INF_DUPLICATE_SECTIONS
+_LEGACY_INF_UNMATCHED_SECTION = "03 Unmatched Infinium"
 
 
 def _legacy_section_label(section: str) -> str:
@@ -1136,13 +1137,25 @@ def _legacy_row_values(
     return [row.get(header) for header in headers]
 
 
+def _legacy_norm_po_sort_key(index: Optional[int], frame: pd.DataFrame) -> tuple[bool, str]:
+    """Sort key that puts a blank/unavailable normalized PO last."""
+    value = ""
+    if index is not None and NORM_PO in frame.columns and index in frame.index:
+        value = str(frame.at[index, NORM_PO] or "")
+    return (value == "", value)
+
+
 def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     """A simplified, side-by-side QuickBooks/Infinium sheet styled after the
-    accountant's original hand-built workbook -- one row per confirmed
-    match, colored Excel's standard "Good" green with the exact rule that
-    resolved it (fuzzy or not) spelled out in the Match Method column. This
-    intentionally omits the audit-trail depth of the primary workpaper; the
-    Reconciled Data sheet there remains the full technical record.
+    accountant's original hand-built workbook: every QuickBooks row (sorted
+    by normalized PO), colored by outcome, with its matched Infinium row
+    riding along on the same line when one exists and blank when it
+    doesn't. QuickBooks exceptions repeat on their own Exceptions sheet;
+    Infinium is only shown here (never on Exceptions) and only for rows
+    that actually matter on this sheet -- a confirmed match, an Infinium
+    duplicate (any period), or an unmatched Infinium row from the current
+    selected period. Older-period Infinium noise with no QuickBooks tie
+    is intentionally left out.
     """
     ws = wb.active
     ws.title = "Legacy Reconciliation"
@@ -1155,19 +1168,45 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     inf_end = inf_start + len(inf_headers) - 1
     header_row, data_row = 3, 4
 
-    matched_rows = [
-        record for record in result.paired_rows
-        if record.get("Section") in _LEGACY_MATCHED_SECTIONS
-    ]
-    final_data_row = data_row + max(len(matched_rows), 1) - 1
+    default_year = int(result.metadata.get("fiscal_year") or result.run_timestamp.year)
+    selected_period = result.metadata.get("fiscal_period")
+    inf_period_col = result.inf_mapping.get("period")
 
-    _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | MATCHED", NAVY)
+    def inf_row_period(record: dict) -> Any:
+        iidx = record.get("Infinium Index")
+        if iidx is not None and inf_period_col and iidx in result.inf_work.index:
+            period, _ = parse_fiscal_period(result.inf_work.at[iidx, inf_period_col], default_year)
+            return period
+        return None
+
+    qb_rows = [record for record in result.paired_rows if record.get("QB Index") is not None]
+    inf_only_rows = [
+        record for record in result.paired_rows
+        if record.get("QB Index") is None
+        and record.get("Infinium Index") is not None
+        and (
+            record.get("Section") in _LEGACY_INF_DUPLICATE_SECTIONS
+            or (
+                record.get("Section") == _LEGACY_INF_UNMATCHED_SECTION
+                and selected_period is not None
+                and inf_row_period(record) == int(selected_period)
+            )
+        )
+    ]
+    qb_rows.sort(key=lambda record: _legacy_norm_po_sort_key(record.get("QB Index"), result.qb_work))
+    inf_only_rows.sort(key=lambda record: _legacy_norm_po_sort_key(record.get("Infinium Index"), result.inf_work))
+    all_rows = qb_rows + inf_only_rows
+    final_data_row = data_row + max(len(all_rows), 1) - 1
+    matched_count = sum(1 for record in all_rows if record.get("Section") in _LEGACY_MATCHED_SECTIONS)
+
+    _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | SORTED BY PO", NAVY)
     _write_title_band(ws, 1, method_col, method_col, "MATCH METHOD", SLATE)
-    _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM | MATCHED", TEAL)
+    _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM", TEAL)
     _write_caption_band(
         ws, 2, qb_start, qb_end,
-        f"{len(matched_rows):,} confirmed match(es). Every row here was resolved by the reconciliation "
-        f"engine -- see Match Method for how. Generated {format_central_timestamp(result.run_timestamp)}.",
+        f"Every QuickBooks row, sorted by normalized PO. {matched_count:,} of {len(qb_rows):,} matched -- see "
+        f"the Exceptions sheet for QuickBooks items shown gold/red here. Generated "
+        f"{format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
     _write_caption_band(
@@ -1178,51 +1217,65 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     )
     _write_caption_band(
         ws, 2, inf_start, inf_end,
-        "Every Infinium row shown here has a confirmed QuickBooks counterpart.",
+        "Blank unless matched. Unmatched Infinium rows are shown only for the currently "
+        "selected fiscal period; an Infinium duplicate is shown for any period.",
         TEAL,
     )
 
-    qb_display = pd.DataFrame(
-        [
-            _legacy_row_values(
-                record.get("QB Index"), record.get("QB Record Scope"),
-                result.qb_work, result.qb_secondary_work, qb_headers,
-            )
-            for record in matched_rows
-        ],
-        columns=qb_headers,
-    )
-    inf_display = pd.DataFrame(
-        [
-            _legacy_row_values(
-                record.get("Infinium Index"), record.get("Infinium Record Scope"),
-                result.inf_work, result.inf_secondary_work, inf_headers,
-            )
-            for record in matched_rows
-        ],
-        columns=inf_headers,
-    )
-    _write_dataframe_values(ws, qb_display, header_row, qb_start)
-    ws.cell(header_row, method_col, "Match Method")
-    for offset, record in enumerate(matched_rows, 1):
-        ws.cell(header_row + offset, method_col, f"{record['Match Result']} ({record['Confidence']})")
-    _write_dataframe_values(ws, inf_display, header_row, inf_start)
+    for offset, record in enumerate(all_rows):
+        row = data_row + offset
+        qb_values = _legacy_row_values(
+            record.get("QB Index"), record.get("QB Record Scope"),
+            result.qb_work, result.qb_secondary_work, qb_headers,
+        )
+        inf_values = _legacy_row_values(
+            record.get("Infinium Index"), record.get("Infinium Record Scope"),
+            result.inf_work, result.inf_secondary_work, inf_headers,
+        )
+        for col_offset, value in enumerate(qb_values):
+            ws.cell(row, qb_start + col_offset, excel_safe(value))
+        for col_offset, value in enumerate(inf_values):
+            ws.cell(row, inf_start + col_offset, excel_safe(value))
+        ws.cell(row, method_col, f"{record.get('Match Result', '')} ({record.get('Confidence', '')})")
 
+    ws.cell(header_row, method_col, "Match Method")
+    _write_dataframe_values(ws, pd.DataFrame(columns=qb_headers), header_row, qb_start)
+    _write_dataframe_values(ws, pd.DataFrame(columns=inf_headers), header_row, inf_start)
     _format_header(ws, header_row, qb_start, qb_end, NAVY)
     _format_header(ws, header_row, method_col, method_col, SLATE)
     _format_header(ws, header_row, inf_start, inf_end, TEAL)
-    for row in range(data_row, final_data_row + 1):
-        _apply_good_style(ws, row, qb_start, qb_end)
+
+    for offset, record in enumerate(all_rows):
+        row = data_row + offset
+        section = record.get("Section", "")
+        if section in _LEGACY_MATCHED_SECTIONS:
+            _apply_good_style(ws, row, qb_start, qb_end)
+            _apply_good_style(ws, row, inf_start, inf_end)
+        elif section in _LEGACY_DUPLICATE_SECTIONS:
+            _apply_duplicate_style(ws, row, qb_start, qb_end)
+            _apply_duplicate_style(ws, row, inf_start, inf_end)
+        else:
+            _apply_neutral_style(ws, row, qb_start, qb_end)
+            _apply_neutral_style(ws, row, inf_start, inf_end)
         _apply_method_style(ws, row, method_col, method_col)
-        _apply_good_style(ws, row, inf_start, inf_end)
         ws.cell(row, method_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws.cell(row, method_col).border = _thin_border()
+    if not all_rows:
+        _apply_method_style(ws, data_row, method_col, method_col)
 
     total_row = final_data_row + 1
+    qb_display = pd.DataFrame(
+        [_legacy_row_values(r.get("QB Index"), r.get("QB Record Scope"), result.qb_work, result.qb_secondary_work, qb_headers) for r in qb_rows],
+        columns=qb_headers,
+    )
+    inf_display = pd.DataFrame(
+        [_legacy_row_values(r.get("Infinium Index"), r.get("Infinium Record Scope"), result.inf_work, result.inf_secondary_work, inf_headers) for r in all_rows],
+        columns=inf_headers,
+    )
     _write_total_row(ws, total_row, qb_start, qb_end,
-                     _source_totals(qb_display, result.qb_mapping), qb_headers, "MATCHED TOTAL")
+                     _source_totals(qb_display, result.qb_mapping), qb_headers, "QUICKBOOKS TOTAL")
     _write_total_row(ws, total_row, inf_start, inf_end,
-                     _source_totals(inf_display, result.inf_mapping), inf_headers, "MATCHED TOTAL")
+                     _source_totals(inf_display, result.inf_mapping), inf_headers, "INFINIUM TOTAL (SHOWN)")
     ws.cell(total_row, method_col).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
     ws.cell(total_row, method_col).border = _total_border()
     _apply_number_formats(ws, qb_headers, data_row, total_row, qb_start,
@@ -1233,7 +1286,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _set_widths(ws, inf_start, inf_end, header_row, total_row)
     ws.column_dimensions[get_column_letter(method_col)].width = 46
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
-    if matched_rows:
+    if all_rows:
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(inf_end)}{final_data_row}"
     ws.print_title_rows = "1:3"
     _prepare_sheet(ws)
@@ -1252,17 +1305,24 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
     ws = wb.create_sheet("Exceptions")
     qb_headers = list(result.qb_raw.columns)
     trailer_headers = ["Fiscal Period", "Exception Type", "Explanation"]
-    all_headers = qb_headers + trailer_headers
-    qb_start = 1
-    qb_end = len(qb_headers)
-    trailer_start = qb_end + 1
-    trailer_end = trailer_start + len(trailer_headers) - 1
+    n_qb = len(qb_headers)
+    n_trailer = len(trailer_headers)
 
-    exception_rows = [
-        record for record in result.paired_rows
-        if record.get("Section") not in _LEGACY_MATCHED_SECTIONS
-        and record.get("QB Index") is not None
-    ]
+    # Two independent blocks on one sheet: general QuickBooks exceptions on
+    # the left, excluded QuickBooks duplicate copies on the right -- a
+    # duplicate is a definite, already-decided exclusion, not an open
+    # question like the rest, so it gets its own space rather than being
+    # mixed into the same list.
+    qb_start = 1
+    qb_end = n_qb
+    left_trailer_start = qb_end + 1
+    left_trailer_end = left_trailer_start + n_trailer - 1
+    separator_col = left_trailer_end + 1
+    dup_qb_start = separator_col + 1
+    dup_qb_end = dup_qb_start + n_qb - 1
+    dup_trailer_start = dup_qb_end + 1
+    dup_trailer_end = dup_trailer_start + n_trailer - 1
+
     default_year = int(result.metadata.get("fiscal_year") or result.run_timestamp.year)
     qb_period_col = result.qb_mapping.get("period")
 
@@ -1274,22 +1334,33 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
                 return period
         return None
 
-    exception_rows = sorted(
-        exception_rows, key=lambda record: (row_period(record) is None, row_period(record) or 0)
+    def sort_by_period(records: list[dict]) -> list[dict]:
+        return sorted(records, key=lambda record: (row_period(record) is None, row_period(record) or 0))
+
+    qb_side_rows = [
+        record for record in result.paired_rows
+        if record.get("Section") not in _LEGACY_MATCHED_SECTIONS
+        and record.get("QB Index") is not None
+    ]
+    general_rows = sort_by_period(
+        [r for r in qb_side_rows if r.get("Section") not in _LEGACY_QB_DUPLICATE_SECTIONS]
+    )
+    duplicate_rows = sort_by_period(
+        [r for r in qb_side_rows if r.get("Section") in _LEGACY_QB_DUPLICATE_SECTIONS]
     )
 
     fiscal_summary = build_fiscal_exception_summary(result)
     fiscal_headers = list(fiscal_summary.columns)
     fiscal_end_col = max(len(fiscal_headers), 1)
-    section_end_col = trailer_end
+    section_end_col = dup_trailer_end
 
     _write_title_band(ws, 1, qb_start, section_end_col, "EXCEPTIONS | QUICKBOOKS SIDE | BY FISCAL PERIOD", NAVY)
     _write_caption_band(
         ws, 2, qb_start, section_end_col,
-        f"{len(exception_rows):,} QuickBooks exception(s): unmatched rows, excluded duplicate copies, and "
-        f"every QuickBooks review-hold item. Infinium-only exceptions carry no accrual impact and are not "
-        f"repeated here. Duplicates are shaded red; every other exception is shaded gold. "
-        f"Generated {format_central_timestamp(result.run_timestamp)}.",
+        f"{len(general_rows):,} QuickBooks exception(s) at left (unmatched and review-hold items, shaded "
+        f"gold) and {len(duplicate_rows):,} excluded QuickBooks duplicate copy(ies) at right (shaded red). "
+        f"Infinium-only exceptions carry no accrual impact and are not repeated here. Generated "
+        f"{format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
 
@@ -1320,40 +1391,52 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
 
     header_row = summary_total_row + 3
     data_row = header_row + 1
-    final_data_row = data_row + max(len(exception_rows), 1) - 1
 
-    detail = pd.DataFrame(
-        [
-            _legacy_row_values(record.get("QB Index"), record.get("QB Record Scope"), result.qb_work, None, qb_headers)
-            + [
-                row_period(record),
-                _legacy_section_label(str(record.get("Section", ""))),
-                f"{record.get('Match Result', '')} -- {record.get('Explanation', '')}",
-            ]
-            for record in exception_rows
-        ],
-        columns=all_headers,
+    def write_block(
+        records: list[dict], block_qb_start: int, trailer_start: int, trailer_end: int, style_fn,
+    ) -> int:
+        block_headers = qb_headers + trailer_headers
+        block = pd.DataFrame(
+            [
+                _legacy_row_values(record.get("QB Index"), record.get("QB Record Scope"), result.qb_work, None, qb_headers)
+                + [
+                    row_period(record),
+                    _legacy_section_label(str(record.get("Section", ""))),
+                    f"{record.get('Match Result', '')} -- {record.get('Explanation', '')}",
+                ]
+                for record in records
+            ],
+            columns=block_headers,
+        )
+        _write_dataframe_values(ws, block, header_row, block_qb_start)
+        _format_header(ws, header_row, block_qb_start, block_qb_start + n_qb - 1, NAVY)
+        _format_header(ws, header_row, trailer_start, trailer_end, SLATE)
+        block_final_row = data_row + max(len(records), 1) - 1
+        for offset in range(len(records)):
+            row = data_row + offset
+            style_fn(ws, row, block_qb_start, trailer_end)
+            ws.cell(row, trailer_end).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        _apply_number_formats(ws, qb_headers, data_row, block_final_row, block_qb_start,
+                              {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
+        _set_widths(ws, block_qb_start, block_qb_start + n_qb - 1, header_row, block_final_row)
+        ws.column_dimensions[get_column_letter(trailer_start)].width = 14
+        ws.column_dimensions[get_column_letter(trailer_start + 1)].width = 34
+        ws.column_dimensions[get_column_letter(trailer_end)].width = 60
+        return block_final_row
+
+    general_final_row = write_block(
+        general_rows, qb_start, left_trailer_start, left_trailer_end, _apply_neutral_style,
     )
-    _write_dataframe_values(ws, detail, header_row, qb_start)
-    _format_header(ws, header_row, qb_start, qb_end, NAVY)
-    _format_header(ws, header_row, trailer_start, trailer_end, SLATE)
-    for offset, record in enumerate(exception_rows):
-        row = data_row + offset
-        if record.get("Section") in _LEGACY_DUPLICATE_SECTIONS:
-            _apply_duplicate_style(ws, row, qb_start, trailer_end)
-        else:
-            _apply_neutral_style(ws, row, qb_start, trailer_end)
-        ws.cell(row, trailer_end).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    duplicate_final_row = write_block(
+        duplicate_rows, dup_qb_start, dup_trailer_start, dup_trailer_end, _apply_duplicate_style,
+    )
+    final_data_row = max(general_final_row, duplicate_final_row)
 
-    _apply_number_formats(ws, qb_headers, data_row, final_data_row, qb_start,
-                          {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
-    _set_widths(ws, qb_start, qb_end, header_row, final_data_row)
-    ws.column_dimensions[get_column_letter(trailer_start)].width = 14
-    ws.column_dimensions[get_column_letter(trailer_start + 1)].width = 34
-    ws.column_dimensions[get_column_letter(trailer_end)].width = 60
+    ws.column_dimensions[get_column_letter(separator_col)].width = 3.5
+    ws.column_dimensions[get_column_letter(separator_col)].fill = PatternFill("solid", fgColor=WHITE)
     ws.freeze_panes = f"{get_column_letter(qb_start)}{data_row}"
-    if exception_rows:
-        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(trailer_end)}{final_data_row}"
+    if general_rows:
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(left_trailer_end)}{general_final_row}"
     ws.print_title_rows = "1:2"
     _prepare_sheet(ws)
 

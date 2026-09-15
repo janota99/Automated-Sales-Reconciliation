@@ -183,6 +183,28 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     # Row 2 (the caption band) is fixed at height 30 on this sheet.
     assert recon_ws.row_dimensions[2].height == 30
 
+    # Every QB row (matched or not) is on Legacy Reconciliation, plus the
+    # qualifying Infinium-only rows (any-period duplicate, current-period
+    # unmatched) -- not just confirmed matches.
+    qb_headers = list(result.qb_raw.columns)
+    n_qb = len(qb_headers)
+    qualifying_inf_only = [
+        r for r in result.paired_rows
+        if r.get("QB Index") is None and r.get("Infinium Index") is not None
+        and r.get("Section") in {"03 Unmatched Infinium", "05 Duplicate Infinium"}
+    ]
+    all_qb_rows = [r for r in result.paired_rows if r.get("QB Index") is not None]
+    expected_recon_row_count = len(all_qb_rows) + len(qualifying_inf_only)
+    total_row_number = next(
+        row[0].row for row in recon_ws.iter_rows(min_row=4)
+        if any(str(cell.value or "").endswith("TOTAL") for cell in row)
+    )
+    recon_data_rows = sum(
+        1 for row in recon_ws.iter_rows(min_row=4, max_row=total_row_number - 1)
+        if any(cell.value is not None for cell in row)
+    )
+    assert recon_data_rows == expected_recon_row_count
+
     exceptions_ws = wb["Exceptions"]
     exceptions_text = _worksheet_text(exceptions_ws)
     assert any("Fiscal Period" in text for text in exceptions_text)
@@ -196,23 +218,44 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     }
     assert any(color.endswith(NEUTRAL_GOLD_FILL) for color in fill_colors)
     assert any(color.endswith(DUPLICATE_RED_FILL) for color in fill_colors)
-    # Only QuickBooks-side exceptions are listed -- no Infinium column
-    # block, and the detail row count matches the QB-only exception count.
-    detail_header_row = next(
+
+    # Two independent blocks: general QuickBooks exceptions on the left,
+    # excluded QuickBooks duplicate copies on the right, separated by a
+    # blank column -- no Infinium columns anywhere on this sheet.
+    header_row_cells = next(
         row for row in exceptions_ws.iter_rows()
         if any(cell.value == "Exception Type" for cell in row)
     )
-    assert detail_header_row[0].row  # sanity: header row was found
-    header_row_number = detail_header_row[0].row
-    expected_qb_exceptions = [
-        r for r in result.paired_rows
-        if r.get("Section") not in _LEGACY_MATCHED_SECTIONS_FOR_TEST and r.get("QB Index") is not None
+    header_row_number = header_row_cells[0].row
+    exception_type_cols = [cell.column for cell in header_row_cells if cell.value == "Exception Type"]
+    assert len(exception_type_cols) == 2  # one per block
+    left_col, right_col = sorted(exception_type_cols)
+    # The right block starts n_qb + 3 (trailer) + 1 (separator) columns
+    # after the left block's own "Exception Type" column.
+    assert right_col - left_col == n_qb + 3 + 1
+
+    right_qb_start_col = right_col - 1 - n_qb  # "Exception Type" is trailer offset +1
+    general_pos = [
+        row[0].value for row in exceptions_ws.iter_rows(
+            min_row=header_row_number + 1, min_col=1, max_col=1,
+        ) if row[0].value is not None
     ]
-    detail_row_count = sum(
-        1 for row in exceptions_ws.iter_rows(min_row=header_row_number + 1)
-        if row[0].value is not None
-    )
-    assert detail_row_count == len(expected_qb_exceptions)
+    duplicate_pos = [
+        row[0].value for row in exceptions_ws.iter_rows(
+            min_row=header_row_number + 1, min_col=right_qb_start_col, max_col=right_qb_start_col,
+        ) if row[0].value is not None
+    ]
+    expected_general = [
+        r for r in result.paired_rows
+        if r.get("Section") not in _LEGACY_MATCHED_SECTIONS_FOR_TEST
+        and r.get("QB Index") is not None
+        and r.get("Section") != "04 Duplicate QuickBooks"
+    ]
+    expected_duplicate = [
+        r for r in result.paired_rows if r.get("Section") == "04 Duplicate QuickBooks"
+    ]
+    assert len(general_pos) == len(expected_general)
+    assert len(duplicate_pos) == len(expected_duplicate)
 
     assert "Product Aggregate Summary" in wb.sheetnames
 
