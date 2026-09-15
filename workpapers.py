@@ -42,6 +42,8 @@ from config import (
 )
 from excel_styles import (
     _apply_duplicate_style,
+    _apply_good_style,
+    _apply_neutral_style,
     _apply_number_formats,
     _autofit_workbook_columns,
     _format_body_block,
@@ -70,6 +72,7 @@ from matching import (
     cents_to_float,
     numeric_quantity_sum,
     numeric_sum,
+    parse_fiscal_period,
     valid_cents,
 )
 from utils import excel_safe, format_central_timestamp, format_currency
@@ -1096,6 +1099,292 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
 
     ws.print_title_rows = "1:4"
     _prepare_sheet(ws)
+
+
+_LEGACY_MATCHED_SECTIONS = {
+    "01 Matched",
+    "01 Matched - Historical Clearance",
+    "09 Fuzzy Match Review Hold",
+}
+_LEGACY_DUPLICATE_SECTIONS = {
+    "04 Duplicate QuickBooks",
+    "05 Duplicate Infinium",
+}
+
+
+def _legacy_section_label(section: str) -> str:
+    """Strip the sort-order prefix (e.g. "04 ") from a Section value for a
+    plain, management-facing exception type label."""
+    prefix, _, remainder = str(section).partition(" ")
+    return remainder if prefix.isdigit() and remainder else str(section)
+
+
+def _legacy_row_values(
+    index: Optional[int],
+    scope: Optional[str],
+    primary_frame: Optional[pd.DataFrame],
+    historical_frame: Optional[pd.DataFrame],
+    headers: list[str],
+) -> list[Any]:
+    if index is None:
+        return [None] * len(headers)
+    source = historical_frame if scope == "Historical" and historical_frame is not None else primary_frame
+    if source is None or index not in source.index:
+        return [None] * len(headers)
+    row = source.loc[index]
+    return [row.get(header) for header in headers]
+
+
+def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult) -> None:
+    """A simplified, side-by-side QuickBooks/Infinium sheet styled after the
+    accountant's original hand-built workbook -- one row per confirmed
+    match, colored Excel's standard "Good" green with the exact rule that
+    resolved it (fuzzy or not) spelled out in the Match Method column. This
+    intentionally omits the audit-trail depth of the primary workpaper; the
+    Reconciled Data sheet there remains the full technical record.
+    """
+    ws = wb.active
+    ws.title = "Legacy Reconciliation"
+    qb_headers = list(result.qb_raw.columns)
+    inf_headers = list(result.inf_raw.columns)
+    qb_start = 1
+    method_col = len(qb_headers) + 1
+    inf_start = method_col + 1
+    qb_end = len(qb_headers)
+    inf_end = inf_start + len(inf_headers) - 1
+    header_row, data_row = 3, 4
+
+    matched_rows = [
+        record for record in result.paired_rows
+        if record.get("Section") in _LEGACY_MATCHED_SECTIONS
+    ]
+    final_data_row = data_row + max(len(matched_rows), 1) - 1
+
+    _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | MATCHED", NAVY)
+    _write_title_band(ws, 1, method_col, method_col, "MATCH METHOD", SLATE)
+    _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM | MATCHED", TEAL)
+    _write_caption_band(
+        ws, 2, qb_start, qb_end,
+        f"{len(matched_rows):,} confirmed match(es). Every row here was resolved by the reconciliation "
+        f"engine -- see Match Method for how. Generated {format_central_timestamp(result.run_timestamp)}.",
+        NAVY,
+    )
+    _write_caption_band(
+        ws, 2, method_col, method_col,
+        "States the exact rule that resolved the match, including whether it was a fuzzy "
+        "text-similarity match rather than an exact one.",
+        SLATE,
+    )
+    _write_caption_band(
+        ws, 2, inf_start, inf_end,
+        "Every Infinium row shown here has a confirmed QuickBooks counterpart.",
+        TEAL,
+    )
+
+    qb_display = pd.DataFrame(
+        [
+            _legacy_row_values(
+                record.get("QB Index"), record.get("QB Record Scope"),
+                result.qb_work, result.qb_secondary_work, qb_headers,
+            )
+            for record in matched_rows
+        ],
+        columns=qb_headers,
+    )
+    inf_display = pd.DataFrame(
+        [
+            _legacy_row_values(
+                record.get("Infinium Index"), record.get("Infinium Record Scope"),
+                result.inf_work, result.inf_secondary_work, inf_headers,
+            )
+            for record in matched_rows
+        ],
+        columns=inf_headers,
+    )
+    _write_dataframe_values(ws, qb_display, header_row, qb_start)
+    ws.cell(header_row, method_col, "Match Method")
+    for offset, record in enumerate(matched_rows, 1):
+        ws.cell(header_row + offset, method_col, f"{record['Match Result']} ({record['Confidence']})")
+    _write_dataframe_values(ws, inf_display, header_row, inf_start)
+
+    _format_header(ws, header_row, qb_start, qb_end, NAVY)
+    _format_header(ws, header_row, method_col, method_col, SLATE)
+    _format_header(ws, header_row, inf_start, inf_end, TEAL)
+    for row in range(data_row, final_data_row + 1):
+        _apply_good_style(ws, row, qb_start, inf_end)
+        ws.cell(row, method_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws.cell(row, method_col).border = _thin_border()
+
+    total_row = final_data_row + 1
+    _write_total_row(ws, total_row, qb_start, qb_end,
+                     _source_totals(qb_display, result.qb_mapping), qb_headers, "MATCHED TOTAL")
+    _write_total_row(ws, total_row, inf_start, inf_end,
+                     _source_totals(inf_display, result.inf_mapping), inf_headers, "MATCHED TOTAL")
+    ws.cell(total_row, method_col).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+    ws.cell(total_row, method_col).border = _total_border()
+    _apply_number_formats(ws, qb_headers, data_row, total_row, qb_start,
+                          {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
+    _apply_number_formats(ws, inf_headers, data_row, total_row, inf_start,
+                          {result.inf_mapping["amount"]}, set())
+    _set_widths(ws, qb_start, qb_end, header_row, total_row)
+    _set_widths(ws, inf_start, inf_end, header_row, total_row)
+    ws.column_dimensions[get_column_letter(method_col)].width = 46
+    ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
+    if matched_rows:
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(inf_end)}{final_data_row}"
+    ws.print_title_rows = "1:3"
+    _prepare_sheet(ws)
+
+
+def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) -> None:
+    """A plain, single listing of everything that did not cleanly match --
+    unmatched QuickBooks/Infinium rows, excluded duplicate copies, and
+    every review-hold item -- grouped by fiscal period, styled after the
+    accountant's original exceptions tab. Genuine unresolved items are
+    Excel's standard "Neutral" gold; excluded duplicate copies are "Bad"
+    red, so the two are visually distinct at a glance.
+    """
+    ws = wb.create_sheet("Exceptions")
+    qb_headers = list(result.qb_raw.columns)
+    inf_headers = list(result.inf_raw.columns)
+    trailer_headers = ["Fiscal Period", "Exception Type", "Explanation"]
+    all_headers = qb_headers + inf_headers + trailer_headers
+    qb_start = 1
+    qb_end = len(qb_headers)
+    inf_start = qb_end + 1
+    inf_end = inf_start + len(inf_headers) - 1
+    trailer_start = inf_end + 1
+    trailer_end = trailer_start + len(trailer_headers) - 1
+
+    exception_rows = [
+        record for record in result.paired_rows
+        if record.get("Section") not in _LEGACY_MATCHED_SECTIONS
+    ]
+    default_year = int(result.metadata.get("fiscal_year") or result.run_timestamp.year)
+    qb_period_col = result.qb_mapping.get("period")
+    inf_period_col = result.inf_mapping.get("period")
+
+    def row_period(record: dict) -> Any:
+        qidx = record.get("QB Index")
+        if qidx is not None and qb_period_col and qidx in result.qb_work.index:
+            period, _ = parse_fiscal_period(result.qb_work.at[qidx, qb_period_col], default_year)
+            if period is not None:
+                return period
+        iidx = record.get("Infinium Index")
+        if iidx is not None and inf_period_col and iidx in result.inf_work.index:
+            period, _ = parse_fiscal_period(result.inf_work.at[iidx, inf_period_col], default_year)
+            if period is not None:
+                return period
+        return None
+
+    exception_rows = sorted(
+        exception_rows, key=lambda record: (row_period(record) is None, row_period(record) or 0)
+    )
+
+    fiscal_summary = build_fiscal_exception_summary(result)
+    fiscal_headers = list(fiscal_summary.columns)
+    fiscal_end_col = max(len(fiscal_headers), 1)
+    section_end_col = trailer_end
+
+    _write_title_band(ws, 1, qb_start, section_end_col, "EXCEPTIONS | BY FISCAL PERIOD", NAVY)
+    _write_caption_band(
+        ws, 2, qb_start, section_end_col,
+        f"{len(exception_rows):,} exception(s): unmatched rows, excluded duplicate copies, and every "
+        f"review-hold item. Duplicates are shaded red; every other exception is shaded gold. "
+        f"Generated {format_central_timestamp(result.run_timestamp)}.",
+        NAVY,
+    )
+
+    summary_header_row = 4
+    summary_data_row = summary_header_row + 1
+    _write_dataframe_values(ws, fiscal_summary, summary_header_row, 1)
+    _format_header(ws, summary_header_row, 1, fiscal_end_col, NAVY)
+    if len(fiscal_summary):
+        summary_last_row = summary_data_row + len(fiscal_summary) - 1
+        _format_body_block(ws, summary_data_row, summary_last_row, 1, fiscal_end_col, NAVY_LIGHT)
+        _apply_number_formats(
+            ws, fiscal_headers, summary_data_row, summary_last_row, 1,
+            {"Net Exception Amount"}, {"Exception Count", "Exception Quantity"},
+        )
+    else:
+        summary_last_row = summary_header_row
+    summary_total_row = summary_last_row + 1
+    _write_total_row(
+        ws, summary_total_row, 1, fiscal_end_col,
+        {
+            "Exception Count": float(fiscal_summary["Exception Count"].sum()) if len(fiscal_summary) else 0,
+            "Exception Quantity": float(fiscal_summary["Exception Quantity"].sum()) if len(fiscal_summary) else 0,
+            "Net Exception Amount": float(fiscal_summary["Net Exception Amount"].sum()) if len(fiscal_summary) else 0,
+        },
+        fiscal_headers, "TOTAL EXCEPTIONS",
+    )
+    _set_widths(ws, 1, fiscal_end_col, summary_header_row, summary_total_row)
+
+    header_row = summary_total_row + 3
+    data_row = header_row + 1
+    final_data_row = data_row + max(len(exception_rows), 1) - 1
+
+    detail = pd.DataFrame(
+        [
+            _legacy_row_values(record.get("QB Index"), record.get("QB Record Scope"), result.qb_work, None, qb_headers)
+            + _legacy_row_values(record.get("Infinium Index"), record.get("Infinium Record Scope"), result.inf_work, None, inf_headers)
+            + [
+                row_period(record),
+                _legacy_section_label(str(record.get("Section", ""))),
+                f"{record.get('Match Result', '')} -- {record.get('Explanation', '')}",
+            ]
+            for record in exception_rows
+        ],
+        columns=all_headers,
+    )
+    _write_dataframe_values(ws, detail, header_row, qb_start)
+    _format_header(ws, header_row, qb_start, qb_end, NAVY)
+    _format_header(ws, header_row, inf_start, inf_end, TEAL)
+    _format_header(ws, header_row, trailer_start, trailer_end, SLATE)
+    for offset, record in enumerate(exception_rows):
+        row = data_row + offset
+        if record.get("Section") in _LEGACY_DUPLICATE_SECTIONS:
+            _apply_duplicate_style(ws, row, qb_start, trailer_end)
+        else:
+            _apply_neutral_style(ws, row, qb_start, trailer_end)
+        ws.cell(row, trailer_end).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    _apply_number_formats(ws, qb_headers, data_row, final_data_row, qb_start,
+                          {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
+    _apply_number_formats(ws, inf_headers, data_row, final_data_row, inf_start,
+                          {result.inf_mapping["amount"]}, set())
+    _set_widths(ws, qb_start, qb_end, header_row, final_data_row)
+    _set_widths(ws, inf_start, inf_end, header_row, final_data_row)
+    ws.column_dimensions[get_column_letter(trailer_start)].width = 14
+    ws.column_dimensions[get_column_letter(trailer_start + 1)].width = 34
+    ws.column_dimensions[get_column_letter(trailer_end)].width = 60
+    ws.freeze_panes = f"{get_column_letter(qb_start)}{data_row}"
+    if exception_rows:
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(trailer_end)}{final_data_row}"
+    ws.print_title_rows = "1:2"
+    _prepare_sheet(ws)
+
+
+def build_legacy_workbook(result: ReconciliationResult) -> bytes:
+    """The 'Accountant's Legacy Download' -- a simplified export mirroring
+    the reviewer's original hand-built workbook (QuickBooks left, Infinium
+    right, exceptions on their own tab by fiscal period) with Excel's
+    standard Good/Neutral/Bad coloring, meant to be read on sight without
+    the audit-trail depth of the primary workpaper. The primary workpaper
+    and analytics package are unaffected by this export.
+    """
+    wb = Workbook()
+    wb.properties.creator = "Sales Reconciliation Application"
+    wb.properties.title = f"Sales Reconciliation (Legacy Format) {result.run_id}"
+    wb.properties.subject = "QuickBooks to Infinium reconciliation, accountant's legacy layout"
+    wb.properties.description = (
+        "Simplified accountant's legacy-format export generated from one controlled reconciliation run."
+    )
+    build_legacy_reconciliation_sheet(wb, result)
+    build_legacy_exceptions_sheet(wb, result)
+    build_product_sheet(wb, result)
+    _apply_workbook_run_metadata(wb, result)
+    return _save_workbook_bytes(wb, apply_accountant_row_heights=True)
 
 
 def build_product_sheet(wb: Workbook, result: ReconciliationResult) -> None:

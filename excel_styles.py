@@ -21,6 +21,10 @@ from config import (
     BORDER,
     DUPLICATE_RED_FILL,
     DUPLICATE_RED_TEXT,
+    GOOD_GREEN_FILL,
+    GOOD_GREEN_TEXT,
+    NEUTRAL_GOLD_FILL,
+    NEUTRAL_GOLD_TEXT,
     SLATE,
     SLATE_LIGHT,
     TEXT,
@@ -39,11 +43,15 @@ ALIGN_WRAP_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True
 
 FONT_BODY = Font(name="Segoe UI", size=10, color=TEXT)
 FONT_DUPLICATE = Font(name="Segoe UI", size=10, bold=True, color=DUPLICATE_RED_TEXT)
+FONT_GOOD = Font(name="Segoe UI", size=10, bold=True, color=GOOD_GREEN_TEXT)
+FONT_NEUTRAL = Font(name="Segoe UI", size=10, bold=True, color=NEUTRAL_GOLD_TEXT)
 FONT_TOTAL = Font(name="Segoe UI", size=10, bold=True, color=TEXT)
 FONT_HEADER = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
 FONT_TITLE = Font(name="Segoe UI", size=12, bold=True, color=WHITE)
 
 FILL_DUPLICATE = PatternFill("solid", fgColor=DUPLICATE_RED_FILL)
+FILL_GOOD = PatternFill("solid", fgColor=GOOD_GREEN_FILL)
+FILL_NEUTRAL = PatternFill("solid", fgColor=NEUTRAL_GOLD_FILL)
 FILL_TOTAL = PatternFill("solid", fgColor=TOTAL_FILL)
 FILL_NONE = PatternFill(fill_type=None)
 FILL_CAPTION_BAND = PatternFill("solid", fgColor=SLATE_LIGHT)
@@ -112,6 +120,22 @@ def _apply_duplicate_style(ws, row: int, start_col: int, end_col: int) -> None:
         cell = ws.cell(row, col)
         cell.fill = FILL_DUPLICATE
         cell.font = FONT_DUPLICATE
+
+
+def _apply_good_style(ws, row: int, start_col: int, end_col: int) -> None:
+    """Apply Excel's traditional green good-value style to a matched row."""
+    for col in range(start_col, end_col + 1):
+        cell = ws.cell(row, col)
+        cell.fill = FILL_GOOD
+        cell.font = FONT_GOOD
+
+
+def _apply_neutral_style(ws, row: int, start_col: int, end_col: int) -> None:
+    """Apply Excel's traditional gold neutral-value style to an exception row."""
+    for col in range(start_col, end_col + 1):
+        cell = ws.cell(row, col)
+        cell.fill = FILL_NEUTRAL
+        cell.font = FONT_NEUTRAL
 
 
 def _apply_number_formats(

@@ -19,7 +19,12 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from matching import build_reconciliation
-from workpapers import build_analytics_workbook, build_data_search_dataframe, build_primary_workbook
+from workpapers import (
+    build_analytics_workbook,
+    build_data_search_dataframe,
+    build_legacy_workbook,
+    build_primary_workbook,
+)
 
 EXPECTED_PRIMARY_SHEETS = [
     "Data Search",
@@ -28,6 +33,12 @@ EXPECTED_PRIMARY_SHEETS = [
     "Raw Data",
     "Reconciled Data",
     "Unresolved Exceptions",
+    "Product Aggregate Summary",
+]
+
+EXPECTED_LEGACY_SHEETS = [
+    "Legacy Reconciliation",
+    "Exceptions",
     "Product Aggregate Summary",
 ]
 
@@ -121,6 +132,53 @@ def test_primary_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping
     # The duplicates block gets its own reviewer note column, mirroring the
     # QuickBooks exception table's reviewer workflow.
     assert any(text == "Reviewer Note" for text in unresolved_text)
+
+
+def _fill_matches(cell, hex_color: str) -> bool:
+    rgb = cell.fill.fgColor.rgb
+    return isinstance(rgb, str) and rgb.endswith(hex_color)
+
+
+def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping, make_metadata):
+    from config import DUPLICATE_RED_FILL, GOOD_GREEN_FILL, NEUTRAL_GOLD_FILL
+
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    workbook_bytes = build_legacy_workbook(result)
+    assert len(workbook_bytes) > 0
+
+    wb = load_workbook(io.BytesIO(workbook_bytes))
+    assert wb.sheetnames == EXPECTED_LEGACY_SHEETS
+
+    recon_ws = wb["Legacy Reconciliation"]
+    recon_text = _worksheet_text(recon_ws)
+    assert any("Match Method" in text for text in recon_text)
+    # The one clean 1:1 match (PO100/INV100/$100) must appear, colored Good green.
+    assert any("PO + Invoice + Amount" in text for text in recon_text)
+    data_row_cells = list(recon_ws.iter_rows(min_row=4, max_row=4))[0]
+    assert any(_fill_matches(cell, GOOD_GREEN_FILL) for cell in data_row_cells)
+
+    exceptions_ws = wb["Exceptions"]
+    exceptions_text = _worksheet_text(exceptions_ws)
+    assert any("Fiscal Period" in text for text in exceptions_text)
+    assert any("Exception Type" in text for text in exceptions_text)
+    fill_colors = {
+        cell.fill.fgColor.rgb
+        for row in exceptions_ws.iter_rows()
+        for cell in row
+        if isinstance(cell.fill.fgColor.rgb, str)
+    }
+    assert any(color.endswith(NEUTRAL_GOLD_FILL) for color in fill_colors)
+    assert any(color.endswith(DUPLICATE_RED_FILL) for color in fill_colors)
+
+    assert "Product Aggregate Summary" in wb.sheetnames
+
+
+def test_legacy_workbook_builds_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):
+    result = _build_result_without_duplicates(qb_mapping, inf_mapping, make_metadata)
+    workbook_bytes = build_legacy_workbook(result)
+    assert len(workbook_bytes) > 0
+    wb = load_workbook(io.BytesIO(workbook_bytes))
+    assert wb.sheetnames == EXPECTED_LEGACY_SHEETS
 
 
 def test_data_search_sheet_shows_duplicate_pair_and_clean_match(qb_mapping, inf_mapping, make_metadata):

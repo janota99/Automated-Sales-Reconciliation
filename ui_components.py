@@ -19,7 +19,12 @@ import streamlit as st
 
 from matching import QB_ID, ReconciliationResult, numeric_sum
 from utils import format_currency
-from workpapers import build_analytics_workbook, build_primary_workbook, paired_display_frames
+from workpapers import (
+    build_analytics_workbook,
+    build_legacy_workbook,
+    build_primary_workbook,
+    paired_display_frames,
+)
 
 
 def _render_workbook_exception(label: str, exc: Exception) -> None:
@@ -522,6 +527,32 @@ def render_result(result: ReconciliationResult) -> None:
                 "Download Reconciliation Analytics",
                 data=st.session_state.analytics_workbook,
                 file_name=f"Sales_Reconciliation_Analytics_{result.run_id}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        st.markdown("#### Accountant's legacy format")
+        st.caption(
+            "A simplified export in the original hand-built layout: QuickBooks left, Infinium right, "
+            "matches shaded green. Three sheets: Legacy Reconciliation, Exceptions (by fiscal period), "
+            "and Product Aggregate Summary."
+        )
+        if "legacy_workbook" not in st.session_state:
+            if st.button(
+                "Prepare Legacy Format",
+                use_container_width=True,
+                key=f"prepare_legacy_{result.run_id}",
+            ):
+                try:
+                    with st.spinner("Preparing the legacy-format workbook..."):
+                        st.session_state.legacy_workbook = build_legacy_workbook(result)
+                    st.toast("Legacy-format workbook prepared.", icon="✅")
+                except Exception as exc:
+                    _render_workbook_exception("legacy-format workbook", exc)
+        if "legacy_workbook" in st.session_state:
+            st.download_button(
+                "Download Legacy Format",
+                data=st.session_state.legacy_workbook,
+                file_name=f"Sales_Reconciliation_Legacy_{result.run_id}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
