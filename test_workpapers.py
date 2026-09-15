@@ -22,10 +22,12 @@ from matching import build_reconciliation
 from workpapers import build_analytics_workbook, build_data_search_dataframe, build_primary_workbook
 
 EXPECTED_PRIMARY_SHEETS = [
+    "Data Search",
+    "Data Search QB Source",
+    "Data Search INF Source",
     "Raw Data",
     "Reconciled Data",
     "Unresolved Exceptions",
-    "Data Search",
     "Product Aggregate Summary",
 ]
 
@@ -151,6 +153,42 @@ def test_data_search_sheet_shows_duplicate_pair_and_clean_match(qb_mapping, inf_
     assert excess["Status"] == "Duplicate"
     assert canonical["Duplicate Group ID"] != ""
     assert canonical["Duplicate Group ID"] == excess["Duplicate Group ID"]
+
+
+def test_data_search_sheet_is_first_and_live_searchable(qb_mapping, inf_mapping, make_metadata):
+    """Data Search must be the first sheet a reviewer sees, back its two
+    live-search panels with hidden source sheets (not visible clutter), and
+    drive its results with a FILTER() formula keyed off the two input cells
+    -- not a static table requiring manual filtering."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+
+    assert wb.sheetnames[0] == "Data Search"
+    assert wb["Data Search QB Source"].sheet_state == "hidden"
+    assert wb["Data Search INF Source"].sheet_state == "hidden"
+
+    ws = wb["Data Search"]
+    search_text = _worksheet_text(ws)
+    assert "Enter Invoice #" in search_text
+    assert "Enter PO #" in search_text
+    assert "QUICKBOOKS ITEMS" in search_text
+    assert "INFINIUM ITEMS" in search_text
+
+    qb_formula = ws.cell(9, 1).value
+    assert isinstance(qb_formula, str) and qb_formula.startswith("=")
+    assert "FILTER(" in qb_formula
+    assert "Data Search QB Source" in qb_formula
+    assert "SEARCH(" in qb_formula and "ISNUMBER(" in qb_formula
+    # No stray unbalanced parens -- a direct regression guard for the class
+    # of hand-built-formula bug this codebase has hit before (#NAME?/#REF!
+    # errors from malformed table/range references).
+    assert qb_formula.count("(") == qb_formula.count(")")
+
+    inf_col_count = 9  # Row ID, PO, Invoice, Amount, Status, Match Type, Duplicate Group ID, Matched * Row ID, Detail
+    inf_formula = ws.cell(9, inf_col_count + 2).value
+    assert isinstance(inf_formula, str) and inf_formula.startswith("=")
+    assert "Data Search INF Source" in inf_formula
+    assert inf_formula.count("(") == inf_formula.count(")")
 
 
 def test_fiscal_period_summary_is_promoted_above_the_exception_table(

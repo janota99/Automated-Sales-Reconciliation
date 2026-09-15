@@ -281,8 +281,7 @@ def _resolve_paired_records_bulk(result: ReconciliationResult) -> list[dict[str,
 
 
 def build_raw_data_sheet(wb: Workbook, result: ReconciliationResult) -> None:
-    ws = wb.active
-    ws.title = "Raw Data"
+    ws = wb.create_sheet("Raw Data")
     qb_headers = list(result.qb_raw.columns)
     inf_headers = list(result.inf_raw.columns)
     qb_start = 1
@@ -1255,11 +1254,11 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     wb.properties.creator = "Sales Reconciliation Application"
     wb.properties.title = f"Sales Reconciliation {result.run_id}"
     wb.properties.subject = "QuickBooks to Infinium reconciliation and journal-entry support"
-    wb.properties.description = "Five-sheet accounting workpaper generated from one controlled reconciliation run."
+    wb.properties.description = "Accounting workpaper generated from one controlled reconciliation run."
+    build_data_search_sheet(wb, result)
     build_raw_data_sheet(wb, result)
     build_reconciled_data_sheet(wb, result)
     build_unresolved_sheet(wb, result)
-    build_data_search_sheet(wb, result)
     build_product_sheet(wb, result)
     _apply_workbook_run_metadata(wb, result)
     return _save_workbook_bytes(wb, apply_accountant_row_heights=True)
@@ -1415,19 +1414,157 @@ def build_data_search_dataframe(result: ReconciliationResult) -> pd.DataFrame:
     return pd.DataFrame(records, columns=DATA_SEARCH_COLUMNS)
 
 
+def build_data_search_indexes(result: ReconciliationResult) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split the joined Data Search table into one row-per-QuickBooks-row
+    table and one row-per-Infinium-row table, for the two live search panels.
+
+    Every QuickBooks row appears in exactly one row of the QB table, and
+    every Infinium row appears in exactly one row of the Infinium table --
+    same guarantee as the joined table, since it's just a filtered view of it.
+    """
+    joined = build_data_search_dataframe(result)
+    qb_index = joined.loc[joined["QuickBooks Row ID"].notna(), [
+        "QuickBooks Row ID", "QuickBooks PO", "QuickBooks Invoice", "QuickBooks Amount",
+        "Status", "Match Type", "Duplicate Group ID", "Infinium Row ID", "Detail",
+    ]].rename(columns={
+        "QuickBooks Row ID": "Row ID", "QuickBooks PO": "PO", "QuickBooks Invoice": "Invoice",
+        "QuickBooks Amount": "Amount", "Infinium Row ID": "Matched Infinium Row ID",
+    }).reset_index(drop=True)
+    inf_index = joined.loc[joined["Infinium Row ID"].notna(), [
+        "Infinium Row ID", "Infinium PO", "Infinium Invoice", "Infinium Amount",
+        "Status", "Match Type", "Duplicate Group ID", "QuickBooks Row ID", "Detail",
+    ]].rename(columns={
+        "Infinium Row ID": "Row ID", "Infinium PO": "PO", "Infinium Invoice": "Invoice",
+        "Infinium Amount": "Amount", "QuickBooks Row ID": "Matched QuickBooks Row ID",
+    }).reset_index(drop=True)
+    return qb_index, inf_index
+
+
+def _search_criteria_formula(search_cell_ref: str, column_range: str) -> str:
+    """Boolean array: TRUE for every row when the search cell is blank
+    (no filter applied), else TRUE only where that row contains the typed
+    text (case-insensitive substring match)."""
+    return f'(({search_cell_ref}="")+(({search_cell_ref}<>"")*ISNUMBER(SEARCH({search_cell_ref},{column_range}))))'
+
+
+def _write_search_input(ws, label: str, label_row: int, input_row: int, start_col: int) -> str:
+    ws.cell(label_row, start_col, label)
+    ws.cell(label_row, start_col).font = Font(name="Segoe UI", size=11, bold=True, color=TEXT)
+    ws.merge_cells(start_row=label_row, start_column=start_col, end_row=label_row, end_column=start_col + 2)
+    input_col = start_col + 3
+    input_cell = ws.cell(input_row, input_col, "")
+    ws.merge_cells(start_row=input_row, start_column=input_col, end_row=input_row, end_column=input_col + 2)
+    for col in range(input_col, input_col + 3):
+        cell = ws.cell(input_row, col)
+        cell.fill = PatternFill("solid", fgColor=WHITE)
+        cell.border = _thin_border()
+        cell.font = Font(name="Segoe UI", size=11, color=TEXT)
+    ws.row_dimensions[input_row].height = 20
+    return f"${get_column_letter(input_col)}${input_row}"
+
+
+def _write_search_panel(
+    ws, source_sheet_name: str, index: pd.DataFrame,
+    start_col: int, header_color: str, panel_title: str,
+    panel_header_row: int, column_header_row: int, data_row: int,
+    po_cell_ref: str, invoice_cell_ref: str,
+) -> None:
+    end_col = start_col + len(index.columns) - 1
+    _write_title_band(ws, panel_header_row, start_col, end_col, panel_title, header_color)
+    for offset, header in enumerate(index.columns):
+        ws.cell(column_header_row, start_col + offset, header)
+    _format_header(ws, column_header_row, start_col, end_col, header_color)
+
+    if index.empty:
+        ws.cell(data_row, start_col, "No rows to search.")
+        return
+
+    last_source_row = len(index) + 1  # row 1 on the source sheet is its header
+    columns = list(index.columns)
+    po_col_letter = get_column_letter(columns.index("PO") + 1)
+    invoice_col_letter = get_column_letter(columns.index("Invoice") + 1)
+    data_range = (
+        f"'{source_sheet_name}'!A2:{get_column_letter(len(columns))}{last_source_row}"
+    )
+    po_range = f"'{source_sheet_name}'!{po_col_letter}2:{po_col_letter}{last_source_row}"
+    invoice_range = f"'{source_sheet_name}'!{invoice_col_letter}2:{invoice_col_letter}{last_source_row}"
+    criteria = (
+        f"{_search_criteria_formula(po_cell_ref, po_range)}*"
+        f"{_search_criteria_formula(invoice_cell_ref, invoice_range)}"
+    )
+    formula = (
+        f'=IF(AND({po_cell_ref}="",{invoice_cell_ref}=""),'
+        f'"Type a PO or Invoice # above to search",'
+        f'FILTER({data_range},{criteria},"No matching items found"))'
+    )
+    ws.cell(data_row, start_col, formula)
+    _set_widths(ws, start_col, end_col, panel_header_row, data_row)
+    for offset, header in enumerate(columns):
+        if header in ("Detail",):
+            ws.column_dimensions[get_column_letter(start_col + offset)].width = 46
+        elif header in ("PO", "Invoice"):
+            ws.column_dimensions[get_column_letter(start_col + offset)].width = 22
+
+
 def build_data_search_sheet(wb: Workbook, result: ReconciliationResult) -> None:
-    frame = build_data_search_dataframe(result)
-    caption = (
-        f"{len(frame):,} QuickBooks/Infinium line(s) across every reconciliation population. "
-        "Click the filter arrow on QuickBooks PO, QuickBooks Invoice, Infinium PO, or Infinium "
-        "Invoice and type a value to look up any item. Match Type is populated when Status is "
-        "Infinium Match or Fuzzy Match. Duplicate Group ID is populated whenever this row is "
-        "part of a duplicate pair, even when its own Status is something else -- the retained "
-        "copy of a confirmed duplicate keeps its real status and still feeds the accrual."
+    """A live-search sheet: type a PO or Invoice # once, and matching
+    QuickBooks and Infinium items spill in automatically via Excel's FILTER()
+    dynamic array function -- no manual filtering. Requires Excel 365 or
+    Excel 2021+ (or the free Excel for the web), since FILTER() is a dynamic-
+    array function not available in older desktop Excel.
+    """
+    qb_index, inf_index = build_data_search_indexes(result)
+
+    qb_source_ws = wb.create_sheet("Data Search QB Source")
+    _write_dataframe_values(qb_source_ws, qb_index, 1, 1)
+    qb_source_ws.sheet_state = "hidden"
+
+    inf_source_ws = wb.create_sheet("Data Search INF Source")
+    _write_dataframe_values(inf_source_ws, inf_index, 1, 1)
+    inf_source_ws.sheet_state = "hidden"
+
+    ws = wb.active
+    ws.title = "Data Search"
+
+    qb_cols, inf_cols = len(qb_index.columns), len(inf_index.columns)
+    qb_start, qb_end = 1, qb_cols
+    inf_start = qb_end + 2
+    inf_end = inf_start + inf_cols - 1
+    end_col = inf_end
+
+    _write_title_band(ws, 1, 1, end_col, "DATA SEARCH | TYPE A PO OR INVOICE NUMBER", NAVY)
+    _write_caption_band(
+        ws, 2, 1, end_col,
+        "Type an Invoice # or PO # below (either one, or both to narrow the results) and "
+        "matching QuickBooks and Infinium items appear automatically. Partial text matches "
+        "count, so a few digits are enough. Status shows whether an item is outstanding on the "
+        "accrual list, an error, a duplicate, a fuzzy match, or matched to Infinium; Match Type "
+        "shows how a match was made. Duplicate Group ID is populated even on a duplicate pair's "
+        "retained (accrual) copy, so both members of a pair stay traceable together. Requires "
+        "Excel 365 / Excel 2021+ for the live results (FILTER is a dynamic-array function).",
+        NAVY,
     )
-    _add_standard_data_sheet(
-        wb, "Data Search", "DATA SEARCH | LOOK UP ANY PO OR INVOICE", caption, frame, NAVY,
+
+    invoice_label_row = invoice_input_row = 4
+    po_label_row = po_input_row = 5
+    invoice_cell_ref = _write_search_input(ws, "Enter Invoice #", invoice_label_row, invoice_input_row, 1)
+    po_cell_ref = _write_search_input(ws, "Enter PO #", po_label_row, po_input_row, 1)
+
+    panel_header_row = 7
+    column_header_row = 8
+    data_row = 9
+
+    _write_search_panel(
+        ws, "Data Search QB Source", qb_index, qb_start, NAVY, "QUICKBOOKS ITEMS",
+        panel_header_row, column_header_row, data_row, po_cell_ref, invoice_cell_ref,
     )
+    _write_search_panel(
+        ws, "Data Search INF Source", inf_index, inf_start, TEAL, "INFINIUM ITEMS",
+        panel_header_row, column_header_row, data_row, po_cell_ref, invoice_cell_ref,
+    )
+    ws.column_dimensions[get_column_letter(qb_end + 1)].width = 3.5
+    ws.freeze_panes = f"A{data_row}"
+    _prepare_sheet(ws)
 
 
 def _add_standard_data_sheet(
