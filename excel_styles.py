@@ -126,6 +126,19 @@ def _apply_duplicate_style(ws, row: int, start_col: int, end_col: int) -> None:
         cell.font = FONT_DUPLICATE
 
 
+def _apply_default_alignment(ws, row: int, start_col: int, end_col: int) -> None:
+    """Left-align and border a row the same way _format_body_block's plain
+    cells look, without touching fill or font -- call this alongside a
+    color-status style (_apply_good_style, etc.) so every cell in a row
+    gets a consistent alignment/border regardless of which style painted
+    its color, then let _apply_number_formats override specific columns
+    (amounts, dates, quantities) to right/center afterward."""
+    for col in range(start_col, end_col + 1):
+        cell = ws.cell(row, col)
+        cell.alignment = ALIGN_LEFT_CENTER
+        cell.border = BORDER_THIN
+
+
 def _apply_good_style(ws, row: int, start_col: int, end_col: int) -> None:
     """Apply Excel's traditional green good-value style to a matched row."""
     for col in range(start_col, end_col + 1):
@@ -210,14 +223,38 @@ def _set_widths(
         ws.column_dimensions[get_column_letter(col)].width = min(max(max(lengths, default=0) + 2, minimum), maximum)
 
 
+def _standardize_column_widths(
+    ws, headers: list, start_col: int, fixed_widths: dict,
+) -> None:
+    """After _set_widths has sized columns to their content, override
+    specific columns (matched by exact header name) to a fixed, appropriate
+    width -- so a short code column and a currency column each get a
+    consistent width regardless of what their own content happened to look
+    like, instead of every column being sized independently by chance."""
+    for offset, header in enumerate(headers):
+        if header in fixed_widths:
+            col = start_col + offset
+            ws.column_dimensions[get_column_letter(col)].width = fixed_widths[header]
+
+
 def _autofit_workbook_columns(
     wb: Workbook,
     minimum: float = 10,
     maximum: float = 52,
     sample_rows: int = 750,
+    skip_titles: frozenset = frozenset(),
 ) -> None:
-    """Auto-size columns from a bounded sample instead of rescanning every cell."""
+    """Auto-size columns from a bounded sample instead of rescanning every cell.
+
+    A sheet in `skip_titles` keeps whatever widths its own builder function
+    already set instead of having them overwritten here -- for a sheet with
+    deliberately standardized, type-appropriate widths (see
+    _standardize_column_widths), this content-driven pass would otherwise
+    always win since it runs after every sheet is built.
+    """
     for ws in wb.worksheets:
+        if ws.title in skip_titles:
+            continue
         merged_coordinates: set[str] = set()
         for merged_range in ws.merged_cells.ranges:
             for row in ws.iter_rows(

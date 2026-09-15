@@ -12,13 +12,14 @@ schema change to any ReconciliationResult field gets caught here first.
 """
 
 import io
+from typing import Any
 
 import pandas as pd
 import pytest
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-from matching import build_reconciliation
+from matching import QB_ID, build_reconciliation
 from workpapers import (
     build_analytics_workbook,
     build_data_search_dataframe,
@@ -431,6 +432,48 @@ def test_unresolved_sheet_duplicate_tables_use_simplified_reviewer_columns(
     audit_text = _worksheet_text(analytics_wb["QuickBooks Duplicates"])
     for technical_header in ("Screening Stage", "Normalized PO", "Confirmed Copy Set ID", "Duplicate Rule Version"):
         assert technical_header in audit_text, f"expected full audit column {technical_header!r} to remain"
+
+
+def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Row ID cells in the duplicates and duplicate-review-hold sections
+    must link straight to where that same row was originally listed on
+    Reconciled Data -- and it must be the CORRECT row, not just any link,
+    since a wrong target would be worse than no link at all."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    unresolved_ws = wb["Unresolved Exceptions"]
+    reconciled_ws = wb["Reconciled Data"]
+
+    def reconciled_po_at(row: int) -> Any:
+        return reconciled_ws.cell(row, 1).value  # QB block starts at column A
+
+    qb_po_by_id = result.qb_work.set_index(QB_ID)[qb_mapping["po"]].to_dict()
+
+    def qb_po_for(qb_id: str) -> Any:
+        return qb_po_by_id.get(qb_id)
+
+    linked_cells = [
+        cell for row in unresolved_ws.iter_rows() for cell in row
+        if cell.hyperlink is not None
+    ]
+    assert linked_cells, "expected at least one Row ID hyperlink on Unresolved Exceptions"
+
+    checked = 0
+    for cell in linked_cells:
+        qb_id = str(cell.value)
+        target = cell.hyperlink.target
+        assert target.startswith("#'Reconciled Data'!A")
+        target_row = int(target.rsplit("A", 1)[1])
+        assert reconciled_po_at(target_row) == qb_po_for(qb_id), (
+            f"Row ID {qb_id} links to Reconciled Data row {target_row}, which doesn't match"
+        )
+        # Underline signals "clickable" without erasing a meaningful color
+        # (e.g. a duplicate-excluded row's Row ID stays red, just underlined).
+        assert cell.font.underline == "single"
+        checked += 1
+    assert checked >= 2  # both the duplicates and the review-hold section have at least one row here
 
 
 def test_primary_and_analytics_workbooks_build_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):

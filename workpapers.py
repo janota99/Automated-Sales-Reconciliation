@@ -41,6 +41,7 @@ from config import (
     WHITE,
 )
 from excel_styles import (
+    _apply_default_alignment,
     _apply_duplicate_style,
     _apply_good_style,
     _apply_method_style,
@@ -51,6 +52,7 @@ from excel_styles import (
     _format_header,
     _prepare_sheet,
     _set_widths,
+    _standardize_column_widths,
     _thin_border,
     _total_border,
     _write_caption_band,
@@ -422,6 +424,61 @@ def _paired_display_frames(result: ReconciliationResult) -> tuple[pd.DataFrame, 
     )
 
 
+# Reconciled Data writes exactly one row per result.paired_rows entry, in
+# that same order, starting at this row. Other sheets (Unresolved
+# Exceptions) rely on this exact constant to compute a hyperlink target
+# without re-deriving Reconciled Data's own layout -- keep them in sync.
+RECONCILED_DATA_HEADER_ROW = 3
+RECONCILED_DATA_DATA_ROW = 4
+
+
+def _qb_id_reconciled_data_row_map(result: ReconciliationResult) -> dict[str, int]:
+    """Map every QuickBooks Row ID to the row it occupies on Reconciled
+    Data, so another sheet can link straight to where a row was originally
+    listed instead of leaving a reader to search for it by hand."""
+    mapping: dict[str, int] = {}
+    for offset, record in enumerate(result.paired_rows):
+        qidx = record.get("QB Index")
+        if qidx is None:
+            continue
+        scope = record.get("QB Record Scope")
+        source = (
+            result.qb_secondary_work
+            if scope == "Historical" and result.qb_secondary_work is not None
+            else result.qb_work
+        )
+        if source is None or qidx not in source.index:
+            continue
+        qb_id = source.at[qidx, QB_ID]
+        mapping.setdefault(str(qb_id), RECONCILED_DATA_DATA_ROW + offset)
+    return mapping
+
+
+def _apply_row_id_hyperlink(ws, row: int, col: int, target_row: Optional[int]) -> None:
+    """Turn a Row ID cell into a link straight to that row on Reconciled
+    Data -- if a target couldn't be resolved (e.g. an Infinium-only row,
+    which Reconciled Data still lists but this map doesn't cover), leave
+    the cell as plain text rather than link to nothing.
+
+    Only adds underline to whatever font is already on the cell rather
+    than replacing it outright -- a duplicate-excluded row's Row ID must
+    stay visibly red, not turn hyperlink-blue and lose that signal, while
+    still being clickable.
+    """
+    if target_row is None:
+        return
+    cell = ws.cell(row, col)
+    cell.hyperlink = f"#'Reconciled Data'!A{target_row}"
+    current = cell.font
+    cell.font = Font(
+        name=current.name or "Segoe UI",
+        size=current.size or 10,
+        bold=current.bold,
+        color=current.color or NAVY,
+        underline="single",
+    )
+
+
 def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws = wb.create_sheet("Reconciled Data")
     qb_display, inf_display, match_results = _paired_display_frames(result)
@@ -432,7 +489,7 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
     inf_start = match_col + 1
     qb_end = len(qb_headers)
     inf_end = inf_start + len(inf_headers) - 1
-    header_row, data_row = 3, 4
+    header_row, data_row = RECONCILED_DATA_HEADER_ROW, RECONCILED_DATA_DATA_ROW
     final_data_row = data_row + len(match_results) - 1
 
     _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | RECONCILED", NAVY)
@@ -612,6 +669,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     source_headers = list(result.qb_raw.columns)
     headers = source_headers + ["Exception Status", "Reference Amount Difference", "Reviewer Note"]
     candidate_map = result.candidates.set_index("QuickBooks Row ID").to_dict("index") if not result.candidates.empty else {}
+    qb_id_row_map = _qb_id_reconciled_data_row_map(result)
 
     qb_subset_dict = result.qb_work.loc[result.unmatched_qb].to_dict("index")
     records = []
@@ -910,6 +968,11 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         for offset, is_excluded in enumerate(duplicate_excluded_flags):
             if is_excluded:
                 _apply_duplicate_style(ws, dup_data_row + offset, 1, dup_end_col)
+        # Row ID links straight to where this row was originally listed on
+        # Reconciled Data, so a reviewer never has to search for it by hand.
+        row_id_col = duplicate_headers.index("Row ID") + 1
+        for offset, qb_id in enumerate(duplicate_frame["Row ID"]):
+            _apply_row_id_hyperlink(ws, dup_data_row + offset, row_id_col, qb_id_row_map.get(str(qb_id)))
         if "Reviewer Note" in duplicate_headers:
             note_col = duplicate_headers.index("Reviewer Note") + 1
             for row in range(dup_data_row, dup_last_row + 1):
@@ -1001,6 +1064,13 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         for row in range(review_data_row, review_last_row + 1):
             for col in range(1, review_end_col + 1):
                 ws.cell(row, col).fill = PatternFill("solid", fgColor=AMBER)
+        # Row ID links straight to where this row was originally listed on
+        # Reconciled Data, same as the duplicates section above.
+        review_row_id_col = review_headers.index("Row ID") + 1
+        for offset, qb_id in enumerate(review_hold_frame["Row ID"]):
+            _apply_row_id_hyperlink(
+                ws, review_data_row + offset, review_row_id_col, qb_id_row_map.get(str(qb_id)),
+            )
     else:
         review_last_row = review_header_row
 
@@ -1145,6 +1215,35 @@ def _legacy_norm_po_sort_key(index: Optional[int], frame: pd.DataFrame) -> tuple
     return (value == "", value)
 
 
+# Fixed, type-appropriate widths for a raw source frame's mapped fields --
+# same idea as _apply_number_formats' amount/quantity/date treatment, but
+# for column width. Keyed by role rather than header text so it works
+# whatever the export happens to call these columns (e.g. Infinium's
+# amount field is literally "OHTOTA", which doesn't textually resemble
+# "amount" at all).
+_LEGACY_ROLE_WIDTHS = {"period": 10, "invoice": 16, "po": 18, "amount": 15, "quantity": 12}
+
+
+def _legacy_fixed_widths(mapping: dict[str, Optional[str]]) -> dict[str, float]:
+    widths: dict[str, float] = {}
+    for role, width in _LEGACY_ROLE_WIDTHS.items():
+        column = mapping.get(role)
+        if column:
+            widths[column] = width
+    return widths
+
+
+def _standardize_legacy_widths(ws, headers: list[str], start_col: int, mapping: dict[str, Optional[str]]) -> None:
+    """Apply role-based fixed widths for mapped fields, plus a generic
+    date-column width for any remaining header that looks like a date --
+    the one column type with no dedicated mapping key of its own."""
+    _standardize_column_widths(ws, headers, start_col, _legacy_fixed_widths(mapping))
+    for offset, header in enumerate(headers):
+        header_upper = str(header).upper()
+        if "DATE" in header_upper or "TIMESTAMP" in header_upper:
+            ws.column_dimensions[get_column_letter(start_col + offset)].width = 13
+
+
 def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     """A simplified, side-by-side QuickBooks/Infinium sheet styled after the
     accountant's original hand-built workbook: every QuickBooks row (sorted
@@ -1248,6 +1347,10 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     for offset, record in enumerate(all_rows):
         row = data_row + offset
         section = record.get("Section", "")
+        # Alignment/border first, uniform across the whole row regardless
+        # of outcome, so every cell has a consistent look; the color style
+        # applied next only ever touches fill/font, never alignment.
+        _apply_default_alignment(ws, row, qb_start, inf_end)
         if section in _LEGACY_MATCHED_SECTIONS:
             _apply_good_style(ws, row, qb_start, qb_end)
             _apply_good_style(ws, row, inf_start, inf_end)
@@ -1261,6 +1364,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
         ws.cell(row, method_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws.cell(row, method_col).border = _thin_border()
     if not all_rows:
+        _apply_default_alignment(ws, data_row, qb_start, inf_end)
         _apply_method_style(ws, data_row, method_col, method_col)
 
     total_row = final_data_row + 1
@@ -1282,8 +1386,10 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
                           {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
     _apply_number_formats(ws, inf_headers, data_row, total_row, inf_start,
                           {result.inf_mapping["amount"]}, set())
-    _set_widths(ws, qb_start, qb_end, header_row, total_row)
-    _set_widths(ws, inf_start, inf_end, header_row, total_row)
+    _set_widths(ws, qb_start, qb_end, header_row, total_row, maximum=40)
+    _set_widths(ws, inf_start, inf_end, header_row, total_row, maximum=40)
+    _standardize_legacy_widths(ws, qb_headers, qb_start, result.qb_mapping)
+    _standardize_legacy_widths(ws, inf_headers, inf_start, result.inf_mapping)
     ws.column_dimensions[get_column_letter(method_col)].width = 46
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
     if all_rows:
@@ -1414,11 +1520,13 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
         block_final_row = data_row + max(len(records), 1) - 1
         for offset in range(len(records)):
             row = data_row + offset
+            _apply_default_alignment(ws, row, block_qb_start, trailer_end)
             style_fn(ws, row, block_qb_start, trailer_end)
             ws.cell(row, trailer_end).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         _apply_number_formats(ws, qb_headers, data_row, block_final_row, block_qb_start,
                               {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
-        _set_widths(ws, block_qb_start, block_qb_start + n_qb - 1, header_row, block_final_row)
+        _set_widths(ws, block_qb_start, block_qb_start + n_qb - 1, header_row, block_final_row, maximum=40)
+        _standardize_legacy_widths(ws, qb_headers, block_qb_start, result.qb_mapping)
         ws.column_dimensions[get_column_letter(trailer_start)].width = 14
         ws.column_dimensions[get_column_letter(trailer_start + 1)].width = 34
         ws.column_dimensions[get_column_letter(trailer_end)].width = 60
@@ -1460,7 +1568,14 @@ def build_legacy_workbook(result: ReconciliationResult) -> bytes:
     build_legacy_exceptions_sheet(wb, result)
     build_product_sheet(wb, result)
     _apply_workbook_run_metadata(wb, result)
-    return _save_workbook_bytes(wb, apply_accountant_row_heights=True)
+    # Legacy Reconciliation and Exceptions set their own deliberate,
+    # type-appropriate column widths (see _standardize_legacy_widths) --
+    # skip the workbook-wide content-driven autofit pass for them so those
+    # widths actually stick instead of being overwritten by it.
+    return _save_workbook_bytes(
+        wb, apply_accountant_row_heights=True,
+        skip_autofit_titles=frozenset({"Legacy Reconciliation", "Exceptions"}),
+    )
 
 
 def build_product_sheet(wb: Workbook, result: ReconciliationResult) -> None:
@@ -1581,11 +1696,12 @@ def _save_workbook_bytes(
     wb: Workbook,
     *,
     apply_accountant_row_heights: bool = False,
+    skip_autofit_titles: frozenset = frozenset(),
 ) -> bytes:
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.calculation.calcMode = "auto"
-    _autofit_workbook_columns(wb)
+    _autofit_workbook_columns(wb, skip_titles=skip_autofit_titles)
     _autofit_workbook_rows(wb)  # Dynamically auto-expand the row heights
     # Apply fixed reporting requirements after autofit so they cannot be
     # overwritten by content-dependent height calculations.
