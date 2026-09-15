@@ -229,6 +229,33 @@ def test_fuzzy_po_pass_never_guesses_among_ambiguous_candidates(qb_mapping, inf_
     assert sorted(unmatched_inf) == [0, 1]
 
 
+def test_fuzzy_po_pass_ignores_an_unrelated_near_miss_row(qb_mapping, inf_mapping):
+    """The reported real-world gap: a clean, self-contained Hopper/David
+    Hopper pair was landing in Unmatched/Exceptions because an unrelated
+    row elsewhere in the population ('MYSTERY SHOPPER PROGRAM') near-missed
+    the 'HOPPER' token by raw string similarity and dragged the true pair
+    into an unbounded graph component. Exact-token matches must resolve
+    before near-miss ones are considered, so the unrelated row is left
+    alone and the true pair still clears."""
+    qb = _prepare(
+        [{"PO": "hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6"}],
+        qb_mapping, "QB",
+    )
+    inf = _prepare(
+        [
+            {"PO": "DAVID HOPPER", "Invoice": "99999", "Amount": 675.00, "Period": "6"},
+            {"PO": "MYSTERY SHOPPER PROGRAM", "Invoice": "12345", "Amount": 300.00, "Period": "6"},
+        ],
+        inf_mapping, "INF",
+    )
+    matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
+    assert len(matches) == 1
+    assert matches[0].confidence == "Fuzzy"
+    assert matches[0].qb_rows == [0] and matches[0].inf_rows == [0]
+    assert unmatched_qb == []
+    assert unmatched_inf == [1]
+
+
 def test_perform_matching_enable_fuzzy_false_leaves_hopper_row_unmatched(qb_mapping, inf_mapping):
     """Fuzzy matching is disabled for historical-clearance matching -- a
     Hopper-style row must stay unmatched rather than fuzzy-clear against a

@@ -107,6 +107,27 @@ def test_similar_looking_but_different_surnames_do_not_match():
     )
 
 
+def test_unrelated_word_containing_the_target_does_not_near_miss_match():
+    """'SHOPPER' and 'CHOPPER' both score ~0.92 similarity against 'HOPPER'
+    on ratio() alone (well past the 0.84 threshold) despite being distinct
+    words, not misspellings -- they add an unrelated leading letter rather
+    than typo a shared word. The leading-character requirement in
+    _near_miss_pairs must reject both."""
+    hopper = significant_po_tokens("Hopper")
+    assert not is_fuzzy_po_match(hopper, significant_po_tokens("Shopper"))
+    assert not is_fuzzy_po_match(hopper, significant_po_tokens("Chopper"))
+
+
+def test_allow_near_miss_false_restricts_to_exact_token_overlap():
+    qb_tokens = significant_po_tokens("Hopper")
+    inf_tokens = significant_po_tokens("DAVID HOPPER 2.2")
+    assert is_fuzzy_po_match(qb_tokens, inf_tokens, allow_near_miss=False)
+
+    typo_tokens = significant_po_tokens("HOPER")
+    assert is_fuzzy_po_match(qb_tokens, typo_tokens)
+    assert not is_fuzzy_po_match(qb_tokens, typo_tokens, allow_near_miss=False)
+
+
 # ---------------------------------------------------------------------------
 # find_fuzzy_po_matches
 # ---------------------------------------------------------------------------
@@ -163,3 +184,20 @@ def test_many_to_many_components_are_rejected_even_when_totals_tie_out():
     inf = make_frame(("INF1", "David Hopper 2.2", 10000), ("INF2", "Hopper Trucking", 15000))
     groups = find_fuzzy_po_matches(qb, inf, {0, 1}, {0, 1})
     assert groups == []
+
+
+def test_unrelated_near_miss_row_does_not_void_a_clean_exact_match():
+    """The reported real-world gap: QuickBooks 'Hopper' ($675) and Infinium
+    'DAVID HOPPER' ($675) is a clean, self-contained exact-token 1:1 match.
+    An unrelated Infinium row that merely near-misses 'HOPPER' by raw
+    similarity ('MYSTERY SHOPPER PROGRAM', a different amount, no real
+    relationship) must never be allowed to drag the true pair into the same
+    graph component and void it -- exact-token components are resolved
+    before near-miss ones are even considered."""
+    qb = make_frame(("QB1", "Hopper", 67500))
+    inf = make_frame(
+        ("INF1", "DAVID HOPPER", 67500),
+        ("INF2", "MYSTERY SHOPPER PROGRAM", 30000),
+    )
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0, 1})
+    assert groups == [((0,), (0,))]
