@@ -43,6 +43,14 @@ from fuzzy_po_matching import (
     find_fuzzy_po_matches,
     significant_po_tokens,
 )
+from vendor_aliases import (
+    ALIAS_CONFIDENCE,
+    ALIAS_METHOD,
+    VendorAlias,
+    alias_explanation,
+    build_alias_token_map,
+    find_alias_po_matches,
+)
 
 __all__ = [
     "AMOUNT_CENTS",
@@ -510,6 +518,7 @@ def perform_matching(
     inf: pd.DataFrame,
     *,
     enable_fuzzy: bool = True,
+    vendor_aliases: Optional[list[VendorAlias]] = None,
 ) -> tuple[list[MatchGroup], list[int], list[int], pd.DataFrame]:
     """Match one-to-one first, then unique exact aggregate relationships."""
     remaining_q = set(qb.index)
@@ -615,6 +624,28 @@ def perform_matching(
                 )
                 remaining_q.difference_update(q_rows)
                 remaining_i.difference_update(i_rows)
+
+    # A confirmed vendor alias (e.g. QuickBooks "Hopper" and Infinium
+    # "David" -- the same dock-sale customer referenced by surname on one
+    # system and first name on the other) is a decided fact, not a guess,
+    # so it is checked before the fuzzy pass and posted like any other
+    # exact match rather than held for review -- see vendor_aliases.py.
+    # Runs whether or not fuzzy matching is enabled for this call: an
+    # alias carries none of the text-similarity risk that justifies
+    # skipping fuzzy matching for a historical/secondary population.
+    if vendor_aliases:
+        alias_token_map = build_alias_token_map(vendor_aliases)
+        alias_groups = find_alias_po_matches(qb, inf, remaining_q, remaining_i, alias_token_map)
+        for q_group, i_group in alias_groups:
+            matches.append(
+                MatchGroup(
+                    list(q_group), list(i_group), ALIAS_METHOD, ALIAS_CONFIDENCE,
+                    alias_explanation(qb, inf, q_group, i_group, vendor_aliases, alias_token_map),
+                    group_level=len(q_group) > 1 or len(i_group) > 1,
+                )
+            )
+            remaining_q.difference_update(q_group)
+            remaining_i.difference_update(i_group)
 
     # After every exact one-to-one and grouped-aggregate pass, a small,
     # tightly-bounded fuzzy PO pass covers rows whose PO field is a buyer
@@ -1954,8 +1985,21 @@ def build_rules_and_config(
              "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized PO and exact signed-cent totals agree."},
             {"Priority": 6, "Rule": "Invoice + Aggregate Amount", "Automatic": "Yes, after one-to-one",
              "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized invoice and exact signed-cent totals agree."},
-            {"Priority": 7, "Rule": "Fuzzy PO + Amount (word match, unique) (see fuzzy_po_matching.py)",
+            {"Priority": 7, "Rule": "Confirmed Vendor Alias + Amount (see vendor_aliases.py)",
              "Automatic": "Yes, after every exact pass",
+             "Requirement": (
+                 "Applies only to rows still unresolved after every exact one-to-one and grouped-aggregate "
+                 "pass. Covers PO references that share no text similarity at all (e.g. QuickBooks 'Hopper' "
+                 "vs. Infinium 'David' -- the same dock-sale customer named by surname on one system and "
+                 "first name on the other), where no fuzzy-text rule could ever bridge the gap. Requires a "
+                 "durable, human-confirmed alias record (who confirmed it, when, and why) naming both terms "
+                 "as the same party; the signed amount must still agree exactly, and the same bounded-shape, "
+                 "aggregate-tie-out safeguards as the fuzzy PO pass apply. Because the identity link was "
+                 "already confirmed by a person rather than guessed by the engine, it is tagged 'Confirmed' "
+                 "confidence and posted like an exact match rather than held for review."
+             )},
+            {"Priority": 8, "Rule": "Fuzzy PO + Amount (word match, unique) (see fuzzy_po_matching.py)",
+             "Automatic": "Yes, after every exact pass and the vendor alias pass",
              "Requirement": (
                  "Applies only to rows still unresolved after every exact one-to-one and grouped-aggregate "
                  "pass. The signed amount must still match exactly; the PO comparison is whole-word "
@@ -1965,17 +2009,17 @@ def build_rules_and_config(
                  "Accepted only when the match is unique on both sides; ambiguous candidates are left "
                  "unresolved. Tagged with its own 'Fuzzy' confidence, distinct from every exact-match method."
              )},
-            {"Priority": 8, "Rule": "Ambiguous or many-to-many groups", "Automatic": "No",
+            {"Priority": 9, "Rule": "Ambiguous or many-to-many groups", "Automatic": "No",
              "Requirement": "Overlapping combinations, many-to-many relationships, groups over the safety limits, and nonunique solutions remain unresolved."},
-            {"Priority": 9, "Rule": "Amount variance", "Automatic": "No",
+            {"Priority": 10, "Rule": "Amount variance", "Automatic": "No",
              "Requirement": "Any nonzero cent difference is flagged as an exception; no tolerance is applied."},
-            {"Priority": 10, "Rule": "Fuzzy product classification", "Automatic": "No financial effect",
+            {"Priority": 11, "Rule": "Fuzzy product classification", "Automatic": "No financial effect",
              "Requirement": "Used only for Product Aggregate Summary; never determines transaction matching."},
-            {"Priority": 11, "Rule": "Secondary historical clearance", "Automatic": "Yes, second pass",
-             "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence, including the fuzzy PO pass (Priority 7)."},
-            {"Priority": 12, "Rule": "Unused secondary rows", "Automatic": "Excluded",
+            {"Priority": 12, "Rule": "Secondary historical clearance", "Automatic": "Yes, second pass",
+             "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence, including the fuzzy PO pass (Priority 8). The vendor alias pass (Priority 7) is not applied here -- see build_historical_clearances."},
+            {"Priority": 13, "Rule": "Unused secondary rows", "Automatic": "Excluded",
              "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
-            {"Priority": 13, "Rule": "Strong duplicate canonicalization (see duplicates.py)", "Automatic": "Yes, before matching",
+            {"Priority": 14, "Rule": "Strong duplicate canonicalization (see duplicates.py)", "Automatic": "Yes, before matching",
              "Requirement": (
                  "For same-file rows with populated PO and invoice and identical signed cents, "
                  "the earliest source-position row is retained as the canonical transaction and "
@@ -1984,7 +2028,7 @@ def build_rules_and_config(
                  "assumes the source report grain does not permit legitimate repeated identical lines; "
                  "that report-grain assertion must be documented by the process owner."
              )},
-            {"Priority": 14, "Rule": "Weak duplicate candidates: matched normally, held if unresolved",
+            {"Priority": 15, "Rule": "Weak duplicate candidates: matched normally, held if unresolved",
              "Automatic": "Conditional",
              "Requirement": (
                  "Rows with identical signed cents but only a PO or only an invoice are never "
@@ -1996,26 +2040,26 @@ def build_rules_and_config(
                  "different amounts are never assumed duplicates and remain eligible for controlled "
                  "aggregate matching (Priorities 4-6)."
              )},
-            {"Priority": 15, "Rule": "Historical overlap exclusion", "Automatic": "Yes, before clearance",
+            {"Priority": 16, "Rule": "Historical overlap exclusion", "Automatic": "Yes, before clearance",
              "Requirement": (
                  "Historical files are canonicalized within-file first and only then compared with their "
                  "own primary dataset. Confirmed overlap and every unresolved historical duplicate candidate "
                  "are excluded from clearance while the primary row remains untouched."
              )},
-            {"Priority": 16, "Rule": "Posting hard stops", "Automatic": "Yes",
+            {"Priority": 17, "Rule": "Posting hard stops", "Automatic": "Yes",
              "Requirement": (
                  "Invalid financial amounts, unresolved primary duplicate candidates, and unresolved "
                  "historical duplicate candidates prevent READY TO POST status. Historical review rows "
                  "cannot participate in a clearance."
              )},
-            {"Priority": 17, "Rule": "Reference-matched amount variance review", "Automatic": "Classification only",
+            {"Priority": 18, "Rule": "Reference-matched amount variance review", "Automatic": "Classification only",
              "Requirement": (
                  "After primary and historical matching, mutually unique unresolved rows sharing an exact "
                  "PO and/or invoice but different signed-cent amounts are moved to a separate review hold. "
                  "The full QuickBooks amount, Infinium amount, and potential difference are displayed, but "
                  "the engine never infers which system is correct and never automatically posts either value."
              )},
-            {"Priority": 18, "Rule": "Standardized exception-cause classification", "Automatic": "Reporting only",
+            {"Priority": 19, "Rule": "Standardized exception-cause classification", "Automatic": "Reporting only",
              "Requirement": (
                  "Every unresolved, duplicate, and amount-variance row receives a controlled cause, confidence, "
                  "financial treatment, and related-row evidence. Reconciled Data retains the actual duplicate PO, "
@@ -2290,7 +2334,14 @@ def build_reconciliation(
     inf_secondary_raw: Optional[pd.DataFrame] = None,
     qb_secondary_mapping: Optional[dict[str, Optional[str]]] = None,
     inf_secondary_mapping: Optional[dict[str, Optional[str]]] = None,
+    vendor_aliases: Optional[list[VendorAlias]] = None,
 ) -> ReconciliationResult:
+    # Confirmed vendor aliases (see vendor_aliases.py) are supplied by the
+    # caller rather than auto-loaded from disk here -- this function stays
+    # a pure computation over its arguments (no hidden file I/O, and no
+    # risk of the standing alias store silently changing behavior for a
+    # caller, including a test, that didn't ask for it). The application
+    # entry point loads the standing store and passes it in explicitly.
     qb = prepare_working_frame(qb_raw, qb_mapping, "QB", fiscal_year)
     inf = prepare_working_frame(inf_raw, inf_mapping, "INF", fiscal_year)
     qb_secondary = (
@@ -2367,7 +2418,7 @@ def build_reconciliation(
     )
 
     matches, initially_unmatched_qb, initially_unmatched_inf, candidates = perform_matching(
-        qb_active, inf_active
+        qb_active, inf_active, vendor_aliases=vendor_aliases
     )
 
     # A fuzzy PO/text match is a similarity guess, not a certain relationship,

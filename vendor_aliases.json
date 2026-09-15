@@ -1,0 +1,16 @@
+{
+  "aliases": [
+    {
+      "id": "ALIAS-0001",
+      "terms": [
+        "DAVID",
+        "HOPPER"
+      ],
+      "label": "David Hopper (dock sales, PPL)",
+      "confirmed_by": "Dylan Janota",
+      "confirmed_date": "2026-09-15",
+      "rationale": "Confirmed via golden-master validation against SALES COMPLETE.xlsx (tag A1): QuickBooks PO field records the surname (\"Hopper\"), Infinium OHDESC records only the first name (\"David\") for the same recurring dock-sale customer. No text-similarity rule can bridge a surname and a first name that share no characters.",
+      "active": true
+    }
+  ]
+}

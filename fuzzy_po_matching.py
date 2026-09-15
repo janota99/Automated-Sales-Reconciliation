@@ -16,6 +16,14 @@ Safeguards applied to circumstantial text matches:
   * Isolated clusters: Bipartite graph components are evaluated as a whole. If
     a linked cluster of rows ties out to a zero-variance aggregate sum, the entire
     cluster is cleared simultaneously (supporting 1:1, 1:M, and M:1 relationships).
+  * Unique individual tie-out fallback: a recurring name (e.g. a dock-sale
+    customer with several unrelated transactions that period) can pull more
+    than one same-side row into a component even though only one is the real
+    counterpart -- forcing all of them to sum together is the wrong question
+    in that case. When one side of a component is a single row and the group
+    sum doesn't tie, exactly one candidate on the other side individually
+    matching that row's amount is accepted as the pair; more than one such
+    candidate stays genuinely ambiguous and unresolved. See _resolve_components.
   * Exact-before-typo precedence: exact-token components are resolved first,
     and only rows left unclaimed afterward are considered for near-miss
     (typo-level) matching -- so an unrelated row elsewhere in the population
@@ -29,7 +37,7 @@ from __future__ import annotations
 import difflib
 import re
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pandas as pd
 
@@ -183,11 +191,13 @@ def _build_candidate_edges(
     inf_date_col: Optional[str],
     max_days_variance: int,
     *,
-    allow_near_miss: bool,
+    match_fn: Callable[[frozenset[str], frozenset[str]], bool],
 ) -> list[tuple[int, int]]:
-    """Build candidate (qidx, iidx) edges that pass the temporal and
-    fuzzy-text checks. ``allow_near_miss=False`` restricts text matching to
-    exact token overlap only."""
+    """Build candidate (qidx, iidx) edges that pass the temporal check and
+    ``match_fn`` on the two rows' PO_TOKENS. Shared with the vendor-alias
+    pass (see vendor_aliases.py) so every text-driven matching pass runs
+    through the exact same graph-building and component-acceptance logic
+    -- one implementation to keep correct, not two that could drift apart."""
     edges: list[tuple[int, int]] = []
     for qidx in q_rows:
         qamount = qb.at[qidx, AMOUNT_CENTS]
@@ -210,7 +220,7 @@ def _build_candidate_edges(
                     if abs((q_date - i_date).days) > max_days_variance:
                         continue
 
-            if is_fuzzy_po_match(q_tokens, i_tokens, allow_near_miss=allow_near_miss):
+            if match_fn(q_tokens, i_tokens):
                 edges.append((qidx, iidx))
 
     return edges
@@ -270,14 +280,36 @@ def _resolve_components(
         q_sum = sum(int(qb.at[q, AMOUNT_CENTS]) for q in comp_q)
         i_sum = sum(int(inf.at[i, AMOUNT_CENTS]) for i in comp_i)
         bounded_shape = len(comp_q) == 1 or len(comp_i) == 1
+        within_size_limit = len(comp_q) <= _MAX_GROUP_SIZE and len(comp_i) <= _MAX_GROUP_SIZE
 
-        if (
-            q_sum == i_sum
-            and bounded_shape
-            and len(comp_q) <= _MAX_GROUP_SIZE
-            and len(comp_i) <= _MAX_GROUP_SIZE
-        ):
+        if q_sum == i_sum and bounded_shape and within_size_limit:
             accepted_groups.append((tuple(sorted(comp_q)), tuple(sorted(comp_i))))
+            continue
+
+        # Fallback: a real recurring name (e.g. a dock-sale customer with
+        # several separate transactions that period) can pull more than one
+        # same-side row into the text-match graph even though only one of
+        # them is the genuine counterpart -- a group sum across all of them
+        # is the wrong question to ask (they were never meant to net
+        # together). When one side is a single row and the aggregate sum
+        # doesn't tie, check whether exactly one candidate on the other
+        # side individually matches that row's amount -- a strictly
+        # stronger, more specific signal than a coincidental group sum.
+        # If more than one candidate ties individually, the choice is
+        # genuinely ambiguous and is correctly left unresolved, same as
+        # today (see test_ambiguous_fuzzy_candidates_are_never_guessed).
+        if within_size_limit and len(comp_q) == 1 and len(comp_i) > 1:
+            single_q = next(iter(comp_q))
+            single_amount = int(qb.at[single_q, AMOUNT_CENTS])
+            ties = [i for i in comp_i if int(inf.at[i, AMOUNT_CENTS]) == single_amount]
+            if len(ties) == 1:
+                accepted_groups.append(((single_q,), (ties[0],)))
+        elif within_size_limit and len(comp_i) == 1 and len(comp_q) > 1:
+            single_i = next(iter(comp_i))
+            single_amount = int(inf.at[single_i, AMOUNT_CENTS])
+            ties = [q for q in comp_q if int(qb.at[q, AMOUNT_CENTS]) == single_amount]
+            if len(ties) == 1:
+                accepted_groups.append(((ties[0],), (single_i,)))
 
     return accepted_groups
 
@@ -310,7 +342,7 @@ def find_fuzzy_po_matches(
 
     exact_edges = _build_candidate_edges(
         qb, inf, q_rows, i_rows, qb_date_col, inf_date_col, max_days_variance,
-        allow_near_miss=False,
+        match_fn=lambda a, b: is_fuzzy_po_match(a, b, allow_near_miss=False),
     )
     accepted_groups = _resolve_components(qb, inf, exact_edges)
 
@@ -321,7 +353,7 @@ def find_fuzzy_po_matches(
 
     near_miss_edges = _build_candidate_edges(
         qb, inf, leftover_q, leftover_i, qb_date_col, inf_date_col, max_days_variance,
-        allow_near_miss=True,
+        match_fn=lambda a, b: is_fuzzy_po_match(a, b, allow_near_miss=True),
     )
     accepted_groups.extend(_resolve_components(qb, inf, near_miss_edges))
 

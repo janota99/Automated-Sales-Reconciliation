@@ -29,6 +29,7 @@ from matching import (
     valid_cents,
     validate_reconciliation,
 )
+from vendor_aliases import ALIAS_CONFIDENCE, ALIAS_METHOD, VendorAlias
 
 
 def _prepare(rows, mapping, source, fiscal_year=2026):
@@ -254,6 +255,56 @@ def test_fuzzy_po_pass_ignores_an_unrelated_near_miss_row(qb_mapping, inf_mappin
     assert matches[0].qb_rows == [0] and matches[0].inf_rows == [0]
     assert unmatched_qb == []
     assert unmatched_inf == [1]
+
+
+def test_vendor_alias_resolves_a_pair_no_fuzzy_rule_can_bridge(qb_mapping, inf_mapping):
+    """The reported real-world gap, confirmed against the actual raw data:
+    QuickBooks PO field literally says 'Hopper' (surname) while Infinium's
+    field literally says 'David' (first name) for the same recurring
+    dock-sale customer -- zero shared characters, so no fuzzy-text rule
+    could ever have matched them. A confirmed vendor alias resolves it and
+    is posted like an exact match rather than held for review."""
+    qb = _prepare(
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6"}],
+        qb_mapping, "QB",
+    )
+    inf = _prepare(
+        [{"PO": "David", "Invoice": "99999", "Amount": 675.00, "Period": "6"}],
+        inf_mapping, "INF",
+    )
+    alias = VendorAlias(
+        "ALIAS-0001", ["HOPPER", "DAVID"], "David Hopper (dock sales)",
+        "J. Reviewer", "2026-09-15", "Confirmed via golden-master validation.",
+    )
+    # Without the alias, this pair is unsolvable by fuzzy text matching.
+    matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
+    assert matches == []
+    assert unmatched_qb == [0] and unmatched_inf == [0]
+
+    matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf, vendor_aliases=[alias])
+    assert len(matches) == 1
+    assert matches[0].method == ALIAS_METHOD
+    assert matches[0].confidence == ALIAS_CONFIDENCE
+    assert matches[0].qb_rows == [0] and matches[0].inf_rows == [0]
+    assert unmatched_qb == [] and unmatched_inf == []
+
+
+def test_vendor_alias_match_is_posted_not_held_for_review(qb_mapping, inf_mapping, make_metadata):
+    """Unlike a fuzzy text guess, a confirmed alias is a decided fact and
+    must never be pulled into the fuzzy match review hold."""
+    qb_rows = [{"PO": "Hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6"}]
+    inf_rows = [{"PO": "David", "Invoice": "99999", "Amount": 675.00, "Period": "6"}]
+    alias = VendorAlias(
+        "ALIAS-0001", ["HOPPER", "DAVID"], "David Hopper (dock sales)",
+        "J. Reviewer", "2026-09-15", "Confirmed via golden-master validation.",
+    )
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026, vendor_aliases=[alias],
+    )
+    assert result.metrics["Fuzzy Match Review Hold Rows"] == 0
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert result.metrics["Control Status"] == "PASS"
 
 
 def test_perform_matching_enable_fuzzy_false_leaves_hopper_row_unmatched(qb_mapping, inf_mapping):

@@ -51,6 +51,7 @@ from ingestion import (
     secondary_mapping_panel,
 )
 from matching import APP_VERSION, MATCHING_RULE_VERSION, build_reconciliation
+from vendor_aliases import load_vendor_aliases
 from ui_components import (
     load_app_css,
     render_ingestion_flow,
@@ -849,6 +850,7 @@ def main() -> None:
                     inf_secondary_raw,
                     qb_secondary_mapping,
                     inf_secondary_mapping,
+                    vendor_aliases=load_vendor_aliases(),
                 )
             st.session_state.reconciliation_result = result
             # Workbook bytes are generated only from the Downloads tab. This

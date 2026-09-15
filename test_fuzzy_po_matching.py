@@ -177,11 +177,17 @@ def test_many_to_many_components_are_rejected_even_when_totals_tie_out():
     """matching.py's grouped-matching control only ever accepts a bounded
     one-to-many or many-to-one relationship (one side must be exactly one
     row). A true many-to-many cluster -- multiple QB rows and multiple
-    Infinium rows linked only through shared fuzzy tokens -- must never be
-    accepted here, even if the aggregate sums happen to agree, or it would
-    trip that downstream control and halt the whole reconciliation."""
-    qb = make_frame(("QB1", "Hopper", 10000), ("QB2", "Hopper Logistics", 15000))
-    inf = make_frame(("INF1", "David Hopper 2.2", 10000), ("INF2", "Hopper Trucking", 15000))
+    Infinium rows all linked to each other through shared fuzzy tokens --
+    must never be accepted here, even if the aggregate sums happen to
+    agree, or it would trip that downstream control and halt the whole
+    reconciliation. Both QB rows use the bare token "Hopper" so every
+    pairwise comparison clears the containment ratio and the component is
+    genuinely fully connected on both sides -- not merely bounded with an
+    unrelated extra candidate (see the unique-tie fallback in
+    _resolve_components, covered by test_recurring_name_with_one_true_match_
+    among_several_ties_uniquely)."""
+    qb = make_frame(("QB1", "Hopper", 10000), ("QB2", "Hopper", 15000))
+    inf = make_frame(("INF1", "David Hopper", 10000), ("INF2", "Hopper Trucking", 15000))
     groups = find_fuzzy_po_matches(qb, inf, {0, 1}, {0, 1})
     assert groups == []
 
@@ -201,3 +207,37 @@ def test_unrelated_near_miss_row_does_not_void_a_clean_exact_match():
     )
     groups = find_fuzzy_po_matches(qb, inf, {0}, {0, 1})
     assert groups == [((0,), (0,))]
+
+
+def test_recurring_name_with_one_true_match_among_several_ties_uniquely():
+    """The actual reported real-world case, confirmed against production
+    data: QuickBooks has one 'Hopper' row ($675). Infinium has THREE
+    separate transactions that period all naming the same recurring
+    dock-sale customer 'David Hopper' -- at three different amounts. The
+    group sum across all three obviously doesn't tie to $675, but exactly
+    one of them ($675) ties the QB row's amount individually and
+    unambiguously -- that must resolve as the match, without needing to
+    net the unrelated transactions together or guess among them."""
+    qb = make_frame(("QB1", "Hopper", 67500))
+    inf = make_frame(
+        ("INF1", "DAVID HOPPER 2.2", 67500),
+        ("INF2", "PO HOPPER,DAVID", 247500),
+        ("INF3", "PO DAVID HOPPER SITELINE SERVI", 157500),
+    )
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0, 1, 2})
+    assert groups == [((0,), (0,))]
+
+
+def test_recurring_name_with_two_equal_ties_stays_ambiguous():
+    """If two of the several same-side candidates both individually tie
+    the singleton row's amount, the choice is genuinely ambiguous and must
+    still be left unresolved rather than guessed -- the unique-tie fallback
+    only fires when exactly one candidate matches."""
+    qb = make_frame(("QB1", "Hopper", 67500))
+    inf = make_frame(
+        ("INF1", "DAVID HOPPER 2.2", 67500),
+        ("INF2", "PO HOPPER,DAVID", 67500),
+        ("INF3", "PO DAVID HOPPER SITELINE SERVI", 157500),
+    )
+    groups = find_fuzzy_po_matches(qb, inf, {0}, {0, 1, 2})
+    assert groups == []
