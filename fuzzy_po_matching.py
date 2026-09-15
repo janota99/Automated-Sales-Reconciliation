@@ -9,15 +9,18 @@ Safeguards applied to circumstantial text matches:
   * The aggregate signed-cent amounts of the matched cluster must agree exactly.
   * Tokens must be alphanumeric. Pure numbers and financial stop-words are ignored.
   * Intersection ratio: Shared words must account for >= 60% of the shorter string.
-  * Temporal anchor: If transaction dates are available, candidates must be 
+    A word counts as shared if it matches exactly, or is a near-miss typo of a
+    word on the other side (e.g. "ELIOT" vs "ELLIOT") -- see is_fuzzy_po_match.
+  * Temporal anchor: If transaction dates are available, candidates must be
     within 30 days of each other.
-  * Isolated clusters: Bipartite graph components are evaluated as a whole. If 
+  * Isolated clusters: Bipartite graph components are evaluated as a whole. If
     a linked cluster of rows ties out to a zero-variance aggregate sum, the entire
     cluster is cleared simultaneously (supporting 1:1, 1:M, and M:1 relationships).
 """
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections import defaultdict
 from typing import Any, Optional
@@ -52,6 +55,13 @@ _RE_WORD = re.compile(r"[A-Z0-9]+")
 _MIN_TOKEN_LENGTH = 3
 _MAX_GROUP_SIZE = 8
 
+# A near-miss token pair must clear this similarity ratio to count as a typo
+# of the same word rather than a different word. Calibrated so a one-character
+# insertion/substitution in a 5-7 letter word matches (e.g. HOPER/HOPPER,
+# ELIOT/ELLIOT both score ~0.91) while distinct-but-similar-looking words stay
+# separate (HOPPER/HOOPER scores 0.833; STONE/STORE and SMITH/SMYTH score 0.80).
+_TYPO_SIMILARITY_THRESHOLD = 0.84
+
 # Globally filter lazy data entry and generic corporate entity markers
 _STOP_WORDS = frozenset([
     "INC", "LLC", "LTD", "THE", "AND", "CORP", "COMPANY", "CO", 
@@ -79,21 +89,59 @@ def significant_po_tokens(value: Any) -> frozenset[str]:
     return frozenset(tokens)
 
 
+def _near_miss_pairs(remaining_a: set[str], remaining_b: set[str]) -> list[tuple[str, str]]:
+    """Greedily pair leftover tokens that are typo-level similar (not exact).
+
+    Candidate pairs are consumed highest-similarity-first so a marginal
+    near-miss never "steals" a token that had a better match available on
+    either side.
+    """
+    candidates = sorted(
+        (
+            (difflib.SequenceMatcher(None, a, b).ratio(), a, b)
+            for a in remaining_a if len(a) >= _MIN_TOKEN_LENGTH
+            for b in remaining_b if len(b) >= _MIN_TOKEN_LENGTH
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    used_a: set[str] = set()
+    used_b: set[str] = set()
+    pairs: list[tuple[str, str]] = []
+    for ratio, a, b in candidates:
+        if ratio < _TYPO_SIMILARITY_THRESHOLD:
+            break
+        if a in used_a or b in used_b:
+            continue
+        used_a.add(a)
+        used_b.add(b)
+        pairs.append((a, b))
+    return pairs
+
+
 def is_fuzzy_po_match(tokens_a: frozenset[str], tokens_b: frozenset[str]) -> bool:
-    """True if the token sets intersect with a strong operational ratio."""
+    """True if the token sets intersect (exactly, or by typo) with a strong
+    operational ratio."""
     if not tokens_a or not tokens_b:
         return False
-        
-    intersection = tokens_a.intersection(tokens_b)
-    if not intersection:
+
+    exact = tokens_a & tokens_b
+    near_misses = _near_miss_pairs(tokens_a - exact, tokens_b - exact)
+    matched_count = len(exact) + len(near_misses)
+    if not matched_count:
         return False
-        
-    # Prevent single-word generic false positives unless highly specific
-    if len(intersection) == 1:
-        match_word = list(intersection)[0]
-        if len(match_word) < 6:
-            return False
-            
+
+    # Prevent single-word generic false positives unless highly specific.
+    if matched_count == 1:
+        if exact:
+            match_word = next(iter(exact))
+            if len(match_word) < 6:
+                return False
+        else:
+            word_a, word_b = near_misses[0]
+            if max(len(word_a), len(word_b)) < 6:
+                return False
+
     # Require the intersection to cover the majority of the shorter side, so a
     # short buyer-name note (e.g. "HOPPER") can still match a longer PO field
     # that fully contains it (e.g. "DAVID HOPPER LLC") -- this is the primary
@@ -102,7 +150,7 @@ def is_fuzzy_po_match(tokens_a: frozenset[str], tokens_b: frozenset[str]) -> boo
     # which no genuine buyer-name-vs-PO-field pair ever does.
     # e.g., {"DAVID", "SMITH", "LLC"} vs {"DAVID", "HOPPER"} still fails the ratio
     shorter_len = min(len(tokens_a), len(tokens_b))
-    ratio = len(intersection) / shorter_len
+    ratio = matched_count / shorter_len
 
     return ratio >= 0.60
 

@@ -19,12 +19,13 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from matching import build_reconciliation
-from workpapers import build_analytics_workbook, build_primary_workbook
+from workpapers import build_analytics_workbook, build_data_search_dataframe, build_primary_workbook
 
 EXPECTED_PRIMARY_SHEETS = [
     "Raw Data",
     "Reconciled Data",
     "Unresolved Exceptions",
+    "Data Search",
     "Product Aggregate Summary",
 ]
 
@@ -118,6 +119,38 @@ def test_primary_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping
     # The duplicates block gets its own reviewer note column, mirroring the
     # QuickBooks exception table's reviewer workflow.
     assert any(text == "Reviewer Note" for text in unresolved_text)
+
+
+def test_data_search_sheet_shows_duplicate_pair_and_clean_match(qb_mapping, inf_mapping, make_metadata):
+    """The Data Search sheet must let a reviewer look up any PO/Invoice and
+    see its real status -- including for a duplicate pair, where the
+    retained copy keeps its normal (accrual-relevant) status but must still
+    be identifiable as part of the same duplicate group as the excluded copy."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    assert "Data Search" in wb.sheetnames
+
+    frame = build_data_search_dataframe(result)
+    by_qb_id = frame.set_index("QuickBooks Row ID")
+
+    # PO100/INV100 is a clean 1:1 match -- an ordinary Infinium Match with no
+    # duplicate involvement.
+    matched = by_qb_id.loc["QB-1"]
+    assert matched["Status"] == "Infinium Match"
+    assert "PO + Invoice + Amount" in matched["Match Type"]
+    assert matched["Duplicate Group ID"] == ""
+
+    # QB-2/QB-3 are the PO200/INV200 duplicate pair. QB-2 is the retained
+    # canonical row (matches nothing else, so it's Outstanding) and QB-3 is
+    # the excluded excess copy (Status = Duplicate) -- both must carry the
+    # same Duplicate Group ID.
+    canonical = by_qb_id.loc["QB-2"]
+    excess = by_qb_id.loc["QB-3"]
+    assert canonical["Status"] == "Outstanding (On Accrual List)"
+    assert excess["Status"] == "Duplicate"
+    assert canonical["Duplicate Group ID"] != ""
+    assert canonical["Duplicate Group ID"] == excess["Duplicate Group ID"]
 
 
 def test_fiscal_period_summary_is_promoted_above_the_exception_table(

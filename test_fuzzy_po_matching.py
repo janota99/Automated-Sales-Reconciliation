@@ -79,6 +79,34 @@ def test_completely_unrelated_names_do_not_match():
     assert not is_fuzzy_po_match(tokens_a, tokens_b)
 
 
+def test_single_character_typo_within_a_word_still_matches():
+    """A one-character typo in an otherwise-matching word must not defeat
+    the match -- the reported gap: real invoice/PO pairs where a name is
+    misspelled by a single letter were being rejected outright."""
+    assert is_fuzzy_po_match(
+        significant_po_tokens("HOPER"), significant_po_tokens("HOPPER"),
+    )
+
+
+def test_elliot_electric_hord_matches_eliot_electric():
+    """The reported real-world case: QuickBooks 'ELLIOT ELECTRIC - HORD' vs
+    Infinium 'ELIOT ELECTRIC'. 'ELECTRIC' matches exactly; 'ELLIOT'/'ELIOT'
+    is a one-letter typo of the same name; the extra 'HORD' token doesn't
+    block the match since the ratio is computed against the shorter side."""
+    qb_tokens = significant_po_tokens("ELLIOT ELECTRIC - HORD")
+    inf_tokens = significant_po_tokens("ELIOT ELECTRIC")
+    assert is_fuzzy_po_match(qb_tokens, inf_tokens)
+
+
+def test_similar_looking_but_different_surnames_do_not_match():
+    """A near-miss must still require real similarity -- 'Hopper' and
+    'Hooper' are different, unrelated surnames and must never be fuzzy-
+    matched just because they look alike."""
+    assert not is_fuzzy_po_match(
+        significant_po_tokens("Hopper"), significant_po_tokens("Hooper"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # find_fuzzy_po_matches
 # ---------------------------------------------------------------------------

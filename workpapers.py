@@ -1096,15 +1096,6 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws.column_dimensions["F"].width = max(ws.column_dimensions["F"].width or 0, 52)
 
     ws.print_title_rows = "1:4"
-
-    # Formula protection is active while table filtering, sorting, and row
-    # insertion/deletion remain available for post-generation review work.
-    ws.protection.sheet = True
-    ws.protection.insertRows = False
-    ws.protection.deleteRows = False
-    ws.protection.autoFilter = False
-    ws.protection.sort = False
-    ws.protection.selectUnlockedCells = False
     _prepare_sheet(ws)
 
 
@@ -1264,10 +1255,11 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     wb.properties.creator = "Sales Reconciliation Application"
     wb.properties.title = f"Sales Reconciliation {result.run_id}"
     wb.properties.subject = "QuickBooks to Infinium reconciliation and journal-entry support"
-    wb.properties.description = "Four-sheet accounting workpaper generated from one controlled reconciliation run."
+    wb.properties.description = "Five-sheet accounting workpaper generated from one controlled reconciliation run."
     build_raw_data_sheet(wb, result)
     build_reconciled_data_sheet(wb, result)
     build_unresolved_sheet(wb, result)
+    build_data_search_sheet(wb, result)
     build_product_sheet(wb, result)
     _apply_workbook_run_metadata(wb, result)
     return _save_workbook_bytes(wb, apply_accountant_row_heights=True)
@@ -1314,6 +1306,128 @@ def detailed_ledger_dataframe(result: ReconciliationResult) -> pd.DataFrame:
             
         records.append(output)
     return pd.DataFrame(records)
+
+
+DATA_SEARCH_COLUMNS = [
+    "Status", "Match Type", "Duplicate Group ID",
+    "QuickBooks Row ID", "QuickBooks PO", "QuickBooks Invoice", "QuickBooks Amount",
+    "Infinium Row ID", "Infinium PO", "Infinium Invoice", "Infinium Amount",
+    "Detail",
+]
+
+_DATA_SEARCH_STATUS_BY_SECTION = {
+    "01 Matched": "Infinium Match",
+    "01 Matched - Historical Clearance": "Infinium Match",
+    "02 Unmatched QuickBooks": "Outstanding (On Accrual List)",
+    "03 Unmatched Infinium": "Error",
+    "04 Duplicate QuickBooks": "Duplicate",
+    "05 Duplicate Infinium": "Duplicate",
+    "06 Duplicate Review Hold QuickBooks": "Duplicate",
+    "07 Duplicate Review Hold Infinium": "Duplicate",
+    "08 Reference-Matched Amount Variance Review Hold": "Error",
+    "09 Fuzzy Match Review Hold": "Fuzzy Match",
+}
+
+_DATA_SEARCH_MATCH_TYPE_SECTIONS = {
+    "01 Matched", "01 Matched - Historical Clearance", "09 Fuzzy Match Review Hold",
+}
+
+
+def _data_search_status(record: dict[str, Any]) -> str:
+    section = record.get("Section", "")
+    if section == "02 Unmatched QuickBooks" and "Invalid" in str(record.get("Exception Cause") or ""):
+        return "Error"
+    return _DATA_SEARCH_STATUS_BY_SECTION.get(section, "Error")
+
+
+def build_data_search_dataframe(result: ReconciliationResult) -> pd.DataFrame:
+    """One row per QuickBooks/Infinium line across every reconciliation
+    population, for a plain PO/Invoice lookup: what is this item's status,
+    and if it's a match, what kind.
+
+    Built from the same paired-row resolution used for the Detailed Match
+    Ledger, so every row appearing anywhere in the reconciliation appears
+    here exactly once (validate_reconciliation guarantees this). A row can
+    also carry a Duplicate Group ID even when its own Status is something
+    else -- the retained copy of a confirmed duplicate keeps its real
+    Outstanding/Infinium Match status (it still feeds the accrual) but is
+    still identifiable as part of that duplicate pair.
+    """
+    resolved_records = _resolve_paired_records_bulk(result)
+    qb_display, inf_display, _ = _paired_display_frames(result)
+    qb_disp_dicts = qb_display.to_dict("records")
+    inf_disp_dicts = inf_display.to_dict("records")
+
+    qb_id_map = result.qb_work[QB_ID].to_dict() if result.qb_work is not None else {}
+    inf_id_map = result.inf_work[INF_ID].to_dict() if result.inf_work is not None else {}
+    qb_sec_id_map = result.qb_secondary_work[QB_ID].to_dict() if result.qb_secondary_work is not None else {}
+    inf_sec_id_map = result.inf_secondary_work[INF_ID].to_dict() if result.inf_secondary_work is not None else {}
+
+    qb_po_header = result.qb_mapping.get("po")
+    qb_invoice_header = result.qb_mapping.get("invoice")
+    qb_amount_header = result.qb_mapping.get("amount")
+    inf_po_header = result.inf_mapping.get("po")
+    inf_invoice_header = result.inf_mapping.get("invoice")
+    inf_amount_header = result.inf_mapping.get("amount")
+
+    def duplicate_group_map(report: pd.DataFrame) -> dict[str, str]:
+        if report is None or report.empty:
+            return {}
+        return dict(zip(report["Source Row ID"].astype(str), report["Duplicate Group ID"]))
+
+    qb_dup_groups = duplicate_group_map(result.duplicate_analysis)
+    inf_dup_groups = duplicate_group_map(result.infinium_duplicate_analysis)
+
+    records: list[dict[str, Any]] = []
+    for position, record in enumerate(resolved_records):
+        qidx, iidx = record["QB Index"], record["Infinium Index"]
+        qb_scope = record.get("QB Record Scope")
+        inf_scope = record.get("Infinium Record Scope")
+        active_q_map = qb_sec_id_map if qb_scope == "Historical" else qb_id_map
+        active_i_map = inf_sec_id_map if inf_scope == "Historical" else inf_id_map
+        qb_row_id = active_q_map.get(qidx) if qidx is not None else None
+        inf_row_id = active_i_map.get(iidx) if iidx is not None else None
+        qb_values = qb_disp_dicts[position]
+        inf_values = inf_disp_dicts[position]
+
+        section = record.get("Section", "")
+        match_type = record.get("Match Result", "") if section in _DATA_SEARCH_MATCH_TYPE_SECTIONS else ""
+        duplicate_group_id = (
+            (qb_dup_groups.get(str(qb_row_id)) if qb_row_id is not None else None)
+            or (inf_dup_groups.get(str(inf_row_id)) if inf_row_id is not None else None)
+            or ""
+        )
+
+        records.append({
+            "Status": _data_search_status(record),
+            "Match Type": match_type,
+            "Duplicate Group ID": duplicate_group_id,
+            "QuickBooks Row ID": qb_row_id,
+            "QuickBooks PO": qb_values.get(qb_po_header) if qb_po_header else None,
+            "QuickBooks Invoice": qb_values.get(qb_invoice_header) if qb_invoice_header else None,
+            "QuickBooks Amount": qb_values.get(qb_amount_header) if qb_amount_header else None,
+            "Infinium Row ID": inf_row_id,
+            "Infinium PO": inf_values.get(inf_po_header) if inf_po_header else None,
+            "Infinium Invoice": inf_values.get(inf_invoice_header) if inf_invoice_header else None,
+            "Infinium Amount": inf_values.get(inf_amount_header) if inf_amount_header else None,
+            "Detail": record.get("Exception Cause") or record.get("Explanation") or "",
+        })
+    return pd.DataFrame(records, columns=DATA_SEARCH_COLUMNS)
+
+
+def build_data_search_sheet(wb: Workbook, result: ReconciliationResult) -> None:
+    frame = build_data_search_dataframe(result)
+    caption = (
+        f"{len(frame):,} QuickBooks/Infinium line(s) across every reconciliation population. "
+        "Click the filter arrow on QuickBooks PO, QuickBooks Invoice, Infinium PO, or Infinium "
+        "Invoice and type a value to look up any item. Match Type is populated when Status is "
+        "Infinium Match or Fuzzy Match. Duplicate Group ID is populated whenever this row is "
+        "part of a duplicate pair, even when its own Status is something else -- the retained "
+        "copy of a confirmed duplicate keeps its real status and still feeds the accrual."
+    )
+    _add_standard_data_sheet(
+        wb, "Data Search", "DATA SEARCH | LOOK UP ANY PO OR INVOICE", caption, frame, NAVY,
+    )
 
 
 def _add_standard_data_sheet(

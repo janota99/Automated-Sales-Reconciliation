@@ -111,7 +111,7 @@ PRODUCT_LEXICON = {
         "PPL40", "PP 40 CASE", "PPL 40 CASSE", "PP40",
         "PANHANDLE PURE 40 CASE", "PPL 40 CASE", "PPL 40",
     ],
-    "Plains 24 Case": ["PLAINS", "PLAINS 24", "PLAINS 24 CASE"],
+    "Plains 24 Case": ["PLAINS", "PLAINS 24", "PLAINS 24 CASE", "PLAINS24"],
     "Spring House 24 Case": [
         "SPRING HOUSE", "SPRING HOUSE 24", "SPRING HOUSE 24 CASE", "SH 24",
     ],
