@@ -43,6 +43,7 @@ from config import (
 from excel_styles import (
     _apply_duplicate_style,
     _apply_good_style,
+    _apply_method_style,
     _apply_neutral_style,
     _apply_number_formats,
     _autofit_workbook_columns,
@@ -1211,7 +1212,9 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _format_header(ws, header_row, method_col, method_col, SLATE)
     _format_header(ws, header_row, inf_start, inf_end, TEAL)
     for row in range(data_row, final_data_row + 1):
-        _apply_good_style(ws, row, qb_start, inf_end)
+        _apply_good_style(ws, row, qb_start, qb_end)
+        _apply_method_style(ws, row, method_col, method_col)
+        _apply_good_style(ws, row, inf_start, inf_end)
         ws.cell(row, method_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws.cell(row, method_col).border = _thin_border()
 
@@ -1237,42 +1240,36 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
 
 
 def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) -> None:
-    """A plain, single listing of everything that did not cleanly match --
-    unmatched QuickBooks/Infinium rows, excluded duplicate copies, and
-    every review-hold item -- grouped by fiscal period, styled after the
-    accountant's original exceptions tab. Genuine unresolved items are
-    Excel's standard "Neutral" gold; excluded duplicate copies are "Bad"
-    red, so the two are visually distinct at a glance.
+    """A plain, single listing of QuickBooks-side exceptions only --
+    unmatched QuickBooks rows, excluded duplicate copies, and every
+    QuickBooks review-hold item -- grouped by fiscal period, styled after
+    the accountant's original exceptions tab. Infinium-only exceptions
+    (an unmatched or duplicate Infinium row with no QuickBooks
+    counterpart) carry no accrual impact and are intentionally not
+    repeated here. Genuine unresolved items are Excel's standard
+    "Neutral" gold; excluded duplicate copies are "Bad" red.
     """
     ws = wb.create_sheet("Exceptions")
     qb_headers = list(result.qb_raw.columns)
-    inf_headers = list(result.inf_raw.columns)
     trailer_headers = ["Fiscal Period", "Exception Type", "Explanation"]
-    all_headers = qb_headers + inf_headers + trailer_headers
+    all_headers = qb_headers + trailer_headers
     qb_start = 1
     qb_end = len(qb_headers)
-    inf_start = qb_end + 1
-    inf_end = inf_start + len(inf_headers) - 1
-    trailer_start = inf_end + 1
+    trailer_start = qb_end + 1
     trailer_end = trailer_start + len(trailer_headers) - 1
 
     exception_rows = [
         record for record in result.paired_rows
         if record.get("Section") not in _LEGACY_MATCHED_SECTIONS
+        and record.get("QB Index") is not None
     ]
     default_year = int(result.metadata.get("fiscal_year") or result.run_timestamp.year)
     qb_period_col = result.qb_mapping.get("period")
-    inf_period_col = result.inf_mapping.get("period")
 
     def row_period(record: dict) -> Any:
         qidx = record.get("QB Index")
         if qidx is not None and qb_period_col and qidx in result.qb_work.index:
             period, _ = parse_fiscal_period(result.qb_work.at[qidx, qb_period_col], default_year)
-            if period is not None:
-                return period
-        iidx = record.get("Infinium Index")
-        if iidx is not None and inf_period_col and iidx in result.inf_work.index:
-            period, _ = parse_fiscal_period(result.inf_work.at[iidx, inf_period_col], default_year)
             if period is not None:
                 return period
         return None
@@ -1286,11 +1283,12 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
     fiscal_end_col = max(len(fiscal_headers), 1)
     section_end_col = trailer_end
 
-    _write_title_band(ws, 1, qb_start, section_end_col, "EXCEPTIONS | BY FISCAL PERIOD", NAVY)
+    _write_title_band(ws, 1, qb_start, section_end_col, "EXCEPTIONS | QUICKBOOKS SIDE | BY FISCAL PERIOD", NAVY)
     _write_caption_band(
         ws, 2, qb_start, section_end_col,
-        f"{len(exception_rows):,} exception(s): unmatched rows, excluded duplicate copies, and every "
-        f"review-hold item. Duplicates are shaded red; every other exception is shaded gold. "
+        f"{len(exception_rows):,} QuickBooks exception(s): unmatched rows, excluded duplicate copies, and "
+        f"every QuickBooks review-hold item. Infinium-only exceptions carry no accrual impact and are not "
+        f"repeated here. Duplicates are shaded red; every other exception is shaded gold. "
         f"Generated {format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
@@ -1327,7 +1325,6 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
     detail = pd.DataFrame(
         [
             _legacy_row_values(record.get("QB Index"), record.get("QB Record Scope"), result.qb_work, None, qb_headers)
-            + _legacy_row_values(record.get("Infinium Index"), record.get("Infinium Record Scope"), result.inf_work, None, inf_headers)
             + [
                 row_period(record),
                 _legacy_section_label(str(record.get("Section", ""))),
@@ -1339,7 +1336,6 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
     )
     _write_dataframe_values(ws, detail, header_row, qb_start)
     _format_header(ws, header_row, qb_start, qb_end, NAVY)
-    _format_header(ws, header_row, inf_start, inf_end, TEAL)
     _format_header(ws, header_row, trailer_start, trailer_end, SLATE)
     for offset, record in enumerate(exception_rows):
         row = data_row + offset
@@ -1351,10 +1347,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
 
     _apply_number_formats(ws, qb_headers, data_row, final_data_row, qb_start,
                           {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
-    _apply_number_formats(ws, inf_headers, data_row, final_data_row, inf_start,
-                          {result.inf_mapping["amount"]}, set())
     _set_widths(ws, qb_start, qb_end, header_row, final_data_row)
-    _set_widths(ws, inf_start, inf_end, header_row, final_data_row)
     ws.column_dimensions[get_column_letter(trailer_start)].width = 14
     ws.column_dimensions[get_column_letter(trailer_start + 1)].width = 34
     ws.column_dimensions[get_column_letter(trailer_end)].width = 60
@@ -1445,9 +1438,7 @@ def _autofit_workbook_rows(wb: Workbook) -> None:
             # merged-cell text enter the generic wrapping calculation, which
             # can otherwise expand it to several times the requested height.
             if row_idx == 2:
-                ws.row_dimensions[row_idx].height = (
-                    60 if ws.title == "Product Aggregate Summary" else 15
-                )
+                ws.row_dimensions[row_idx].height = _controlled_row_two_height(ws.title)
                 continue
 
             for cell in row:
@@ -1488,12 +1479,19 @@ def _autofit_workbook_rows(wb: Workbook) -> None:
                 ws.row_dimensions[row_idx].height = None
                 
 
+def _controlled_row_two_height(sheet_title: str) -> int:
+    """Fixed row-2 caption-band height per sheet, overriding autofit."""
+    if sheet_title == "Product Aggregate Summary":
+        return 60
+    if sheet_title == "Legacy Reconciliation":
+        return 30
+    return 15
+
+
 def _apply_accountant_output_row_heights(wb: Workbook) -> None:
     """Apply the controlled row-two presentation required by the workpaper."""
     for ws in wb.worksheets:
-        ws.row_dimensions[2].height = (
-            60 if ws.title == "Product Aggregate Summary" else 15
-        )
+        ws.row_dimensions[2].height = _controlled_row_two_height(ws.title)
 
 
 def _save_workbook_bytes(

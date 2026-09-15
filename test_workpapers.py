@@ -139,10 +139,25 @@ def _fill_matches(cell, hex_color: str) -> bool:
     return isinstance(rgb, str) and rgb.endswith(hex_color)
 
 
+_LEGACY_MATCHED_SECTIONS_FOR_TEST = {
+    "01 Matched", "01 Matched - Historical Clearance", "09 Fuzzy Match Review Hold",
+}
+
+
 def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping, make_metadata):
-    from config import DUPLICATE_RED_FILL, GOOD_GREEN_FILL, NEUTRAL_GOLD_FILL
+    from config import DUPLICATE_RED_FILL, GOOD_GREEN_FILL, METHOD_GREY_FILL, NEUTRAL_GOLD_FILL
 
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    # Sanity check the fixture actually has an Infinium-only exception (the
+    # PO400/INV400 duplicate pair, which has no QuickBooks counterpart) --
+    # otherwise the QB-only filter below would pass vacuously.
+    assert result.metrics["Duplicate Infinium Rows"] == 1
+    infinium_only_exceptions = [
+        r for r in result.paired_rows
+        if r.get("Section") not in _LEGACY_MATCHED_SECTIONS_FOR_TEST and r.get("QB Index") is None
+    ]
+    assert len(infinium_only_exceptions) >= 1
+
     workbook_bytes = build_legacy_workbook(result)
     assert len(workbook_bytes) > 0
 
@@ -154,13 +169,25 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     assert any("Match Method" in text for text in recon_text)
     # The one clean 1:1 match (PO100/INV100/$100) must appear, colored Good green.
     assert any("PO + Invoice + Amount" in text for text in recon_text)
+    header_cells = {cell.value: cell.column for cell in next(recon_ws.iter_rows(min_row=3, max_row=3))}
+    method_col = header_cells["Match Method"]
     data_row_cells = list(recon_ws.iter_rows(min_row=4, max_row=4))[0]
-    assert any(_fill_matches(cell, GOOD_GREEN_FILL) for cell in data_row_cells)
+    # QB and Infinium sides are Good green; the Match Method column between
+    # them is its own grey/dark-bold-black divider, not green.
+    non_method_cells = [c for c in data_row_cells if c.column != method_col]
+    assert any(_fill_matches(cell, GOOD_GREEN_FILL) for cell in non_method_cells)
+    method_cell = next(c for c in data_row_cells if c.column == method_col)
+    assert _fill_matches(method_cell, METHOD_GREY_FILL)
+    assert method_cell.font.color.rgb.endswith("000000")
+    assert method_cell.font.bold is True
+    # Row 2 (the caption band) is fixed at height 30 on this sheet.
+    assert recon_ws.row_dimensions[2].height == 30
 
     exceptions_ws = wb["Exceptions"]
     exceptions_text = _worksheet_text(exceptions_ws)
     assert any("Fiscal Period" in text for text in exceptions_text)
     assert any("Exception Type" in text for text in exceptions_text)
+    assert "QUICKBOOKS SIDE" in " ".join(exceptions_text).upper()
     fill_colors = {
         cell.fill.fgColor.rgb
         for row in exceptions_ws.iter_rows()
@@ -169,6 +196,23 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     }
     assert any(color.endswith(NEUTRAL_GOLD_FILL) for color in fill_colors)
     assert any(color.endswith(DUPLICATE_RED_FILL) for color in fill_colors)
+    # Only QuickBooks-side exceptions are listed -- no Infinium column
+    # block, and the detail row count matches the QB-only exception count.
+    detail_header_row = next(
+        row for row in exceptions_ws.iter_rows()
+        if any(cell.value == "Exception Type" for cell in row)
+    )
+    assert detail_header_row[0].row  # sanity: header row was found
+    header_row_number = detail_header_row[0].row
+    expected_qb_exceptions = [
+        r for r in result.paired_rows
+        if r.get("Section") not in _LEGACY_MATCHED_SECTIONS_FOR_TEST and r.get("QB Index") is not None
+    ]
+    detail_row_count = sum(
+        1 for row in exceptions_ws.iter_rows(min_row=header_row_number + 1)
+        if row[0].value is not None
+    )
+    assert detail_row_count == len(expected_qb_exceptions)
 
     assert "Product Aggregate Summary" in wb.sheetnames
 

@@ -23,6 +23,8 @@ from config import (
     DUPLICATE_RED_TEXT,
     GOOD_GREEN_FILL,
     GOOD_GREEN_TEXT,
+    METHOD_GREY_FILL,
+    METHOD_GREY_TEXT,
     NEUTRAL_GOLD_FILL,
     NEUTRAL_GOLD_TEXT,
     SLATE,
@@ -45,6 +47,7 @@ FONT_BODY = Font(name="Segoe UI", size=10, color=TEXT)
 FONT_DUPLICATE = Font(name="Segoe UI", size=10, bold=True, color=DUPLICATE_RED_TEXT)
 FONT_GOOD = Font(name="Segoe UI", size=10, bold=True, color=GOOD_GREEN_TEXT)
 FONT_NEUTRAL = Font(name="Segoe UI", size=10, bold=True, color=NEUTRAL_GOLD_TEXT)
+FONT_METHOD = Font(name="Segoe UI", size=10, bold=True, color=METHOD_GREY_TEXT)
 FONT_TOTAL = Font(name="Segoe UI", size=10, bold=True, color=TEXT)
 FONT_HEADER = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
 FONT_TITLE = Font(name="Segoe UI", size=12, bold=True, color=WHITE)
@@ -52,6 +55,7 @@ FONT_TITLE = Font(name="Segoe UI", size=12, bold=True, color=WHITE)
 FILL_DUPLICATE = PatternFill("solid", fgColor=DUPLICATE_RED_FILL)
 FILL_GOOD = PatternFill("solid", fgColor=GOOD_GREEN_FILL)
 FILL_NEUTRAL = PatternFill("solid", fgColor=NEUTRAL_GOLD_FILL)
+FILL_METHOD = PatternFill("solid", fgColor=METHOD_GREY_FILL)
 FILL_TOTAL = PatternFill("solid", fgColor=TOTAL_FILL)
 FILL_NONE = PatternFill(fill_type=None)
 FILL_CAPTION_BAND = PatternFill("solid", fgColor=SLATE_LIGHT)
@@ -136,6 +140,15 @@ def _apply_neutral_style(ws, row: int, start_col: int, end_col: int) -> None:
         cell = ws.cell(row, col)
         cell.fill = FILL_NEUTRAL
         cell.font = FONT_NEUTRAL
+
+
+def _apply_method_style(ws, row: int, start_col: int, end_col: int) -> None:
+    """Apply the grey/dark-bold-black divider style that visually separates
+    the QuickBooks side from the Infinium side on a side-by-side sheet."""
+    for col in range(start_col, end_col + 1):
+        cell = ws.cell(row, col)
+        cell.fill = FILL_METHOD
+        cell.font = FONT_METHOD
 
 
 def _apply_number_formats(
