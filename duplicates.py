@@ -20,7 +20,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
-from typing import Any, Hashable, Iterable, Optional
+from types import MappingProxyType
+from typing import Any, Hashable, Iterable, Mapping, Optional
 
 import pandas as pd
 
@@ -682,6 +683,8 @@ def finalize_review_dispositions(
     resolved_ids: Iterable[Any] = (),
     held_ids: Iterable[Any] = (),
     historical_hold_ids: Iterable[Any] = (),
+    excess_ids: Mapping[Any, Any] = MappingProxyType({}),
+    canonical_survivor_ids: Iterable[Any] = (),
 ) -> pd.DataFrame:
     """Patch review-tier rows with their final match outcome.
 
@@ -692,9 +695,24 @@ def finalize_review_dispositions(
 
       * A row in ``resolved_ids`` matched normally -- no exclusion was ever
         needed, so its disposition becomes ``DISPOSITION_REVIEW_RESOLVED``.
+        This also covers a row that personally never matched but whose
+        group has a matched sibling: real evidence the pattern recurs, so
+        it is included in the accrual as an ordinary exception rather than
+        excluded -- callers pass those IDs in ``resolved_ids`` too.
       * A row in ``held_ids`` stayed unresolved -- it is pulled from the
         accrual and marked ``DISPOSITION_REVIEW_HOLD``, requiring a
         documented human decision before the proposed JE is posted.
+      * A row keyed in ``excess_ids`` (mapping excess row ID -> the
+        canonical row ID retained in its place) belongs to a group where NO
+        member matched at all -- with zero corroborating evidence the group
+        is more than one real transaction, only the earliest member is kept
+        and every other member is excluded here, exactly as a confirmed
+        duplicate always has been (``DISPOSITION_EXCLUDED_EXCESS``, no
+        review needed, with ``Canonical Source Row ID`` set to the survivor).
+      * A row in ``canonical_survivor_ids`` is that earliest-listed
+        survivor -- nothing in its group matched, so calling it "resolved
+        via match" would be inaccurate; it becomes ``DISPOSITION_CANONICAL``
+        instead, same label a pre-matching canonical row has always had.
 
     Only rows currently at ``DISPOSITION_REVIEW`` are touched; canonical,
     excess, and cross-scope-overlap rows are left exactly as screening
@@ -705,7 +723,14 @@ def finalize_review_dispositions(
     resolved = {str(value) for value in resolved_ids}
     held = {str(value) for value in held_ids}
     historical_held = {str(value) for value in historical_hold_ids}
-    overlaps = (resolved & held) | (resolved & historical_held) | (held & historical_held)
+    excess_canonical_by_id = {str(key): str(value) for key, value in excess_ids.items()}
+    excess = set(excess_canonical_by_id)
+    canonical_survivors = {str(value) for value in canonical_survivor_ids}
+    all_sets = (resolved, held, historical_held, excess, canonical_survivors)
+    overlaps: set[str] = set()
+    for i, left in enumerate(all_sets):
+        for right in all_sets[i + 1:]:
+            overlaps |= left & right
     if overlaps:
         raise DuplicateScreeningError(
             "Duplicate disposition IDs must be mutually exclusive; overlapping IDs: "
@@ -717,12 +742,14 @@ def finalize_review_dispositions(
     resolved_mask = is_review & row_ids.isin(resolved)
     held_mask = is_review & row_ids.isin(held)
     historical_held_mask = is_review & row_ids.isin(historical_held)
+    excess_mask = is_review & row_ids.isin(excess)
+    canonical_mask = is_review & row_ids.isin(canonical_survivors)
 
     updated.loc[resolved_mask, "Disposition"] = DISPOSITION_REVIEW_RESOLVED
     updated.loc[resolved_mask, "Confidence"] = CONFIDENCE_RESOLVED
     updated.loc[resolved_mask, "Policy Note"] = (
-        "This candidate matched normally during reconciliation; no duplicate "
-        "exclusion was ever applied."
+        "This candidate matched normally during reconciliation, or a group sibling did, "
+        "which is real evidence the pattern recurs; no duplicate exclusion was applied."
     )
 
     updated.loc[held_mask, "Disposition"] = DISPOSITION_REVIEW_HOLD
@@ -747,5 +774,25 @@ def finalize_review_dispositions(
         "This historical candidate requires review and was not permitted to clear a "
         "primary exception. A documented disposition is required before relying on "
         "the historical-clearance result."
+    )
+
+    updated.loc[excess_mask, "Disposition"] = DISPOSITION_EXCLUDED_EXCESS
+    updated.loc[excess_mask, "Confidence"] = CONFIDENCE_CONFIRMED
+    updated.loc[excess_mask, "Automatically Excluded"] = True
+    updated.loc[excess_mask, "Excluded Amount"] = updated.loc[excess_mask, "Amount"]
+    updated.loc[excess_mask, "Canonical Source Row ID"] = row_ids.loc[excess_mask].map(excess_canonical_by_id)
+    updated.loc[excess_mask, "Policy Note"] = (
+        "No member of this duplicate-key group matched during reconciliation, so there is no "
+        "evidence more than one real transaction exists. The earliest-listed member is retained "
+        "in the accrual; this excess copy is excluded, matching how a confirmed duplicate has "
+        "always been treated."
+    )
+
+    updated.loc[canonical_mask, "Disposition"] = DISPOSITION_CANONICAL
+    updated.loc[canonical_mask, "Confidence"] = CONFIDENCE_CONFIRMED
+    updated.loc[canonical_mask, "Policy Note"] = (
+        "No member of this duplicate-key group matched during reconciliation. This earliest-"
+        "listed member is retained in the accrual as the sole representative of the group; "
+        "every other member is excluded as an excess copy."
     )
     return updated

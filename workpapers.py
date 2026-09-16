@@ -454,29 +454,100 @@ def _qb_id_reconciled_data_row_map(result: ReconciliationResult) -> dict[str, in
     return mapping
 
 
-def _apply_row_id_hyperlink(ws, row: int, col: int, target_row: Optional[int]) -> None:
-    """Turn a Row ID cell into a link straight to that row on Reconciled
-    Data -- if a target couldn't be resolved (e.g. an Infinium-only row,
-    which Reconciled Data still lists but this map doesn't cover), leave
-    the cell as plain text rather than link to nothing.
+def _apply_row_id_hyperlink(
+    ws, row: int, col: int, target_row: Optional[int], target_sheet: str = "Reconciled Data",
+) -> None:
+    """Turn a cell into a link straight to a specific row on another sheet
+    -- if a target couldn't be resolved, leave the cell as plain text
+    rather than link to nothing.
 
-    Only adds underline to whatever font is already on the cell rather
-    than replacing it outright -- a duplicate-excluded row's Row ID must
-    stay visibly red, not turn hyperlink-blue and lose that signal, while
-    still being clickable.
+    Keeps whatever font color is already on the cell rather than
+    replacing it outright -- a duplicate-excluded row's Row ID must stay
+    visibly red, not turn hyperlink-blue and lose that signal -- but
+    always forces bold plus an underline, so a link is easy to spot at a
+    glance regardless of which color/status it's sitting on top of.
     """
     if target_row is None:
         return
     cell = ws.cell(row, col)
-    cell.hyperlink = f"#'Reconciled Data'!A{target_row}"
+    cell.hyperlink = f"#'{target_sheet}'!A{target_row}"
     current = cell.font
     cell.font = Font(
         name=current.name or "Segoe UI",
         size=current.size or 10,
-        bold=current.bold,
+        bold=True,
         color=current.color or NAVY,
         underline="single",
     )
+
+
+def _find_rows_by_cell_value(ws, target_values: set[str]) -> dict[str, int]:
+    """Scan an already-built worksheet for the row each of these exact
+    cell values landed on -- used to link back to a sheet whose row
+    layout (fiscal-period summary length, KPI rows, stacked sections)
+    isn't a simple, safely-reusable formula the way Reconciled Data's is.
+    """
+    found: dict[str, int] = {}
+    if not target_values:
+        return found
+    for row in ws.iter_rows():
+        for cell in row:
+            value = cell.value
+            if value is None:
+                continue
+            text = str(value)
+            if text in target_values and text not in found:
+                found[text] = cell.row
+    return found
+
+
+_UNRESOLVED_SHEET_LINKABLE_DISPOSITIONS = frozenset({
+    "Retained canonical row",
+    "Excluded excess copy",
+    "Held for review - excluded from proposed JE pending disposition",
+})
+
+
+def _link_reconciled_data_to_unresolved_exceptions(wb: Workbook, result: ReconciliationResult) -> None:
+    """The reverse direction of the Row ID links on Unresolved Exceptions:
+    for every QuickBooks row shown there as a duplicate or a duplicate
+    review-hold item, add a matching link on its Reconciled Data row back
+    to where it was originally listed as an exception -- so a reviewer
+    working from either sheet can always jump to the other.
+    """
+    if result.duplicate_analysis.empty:
+        return
+    linkable = result.duplicate_analysis.loc[
+        result.duplicate_analysis["Disposition"].isin(_UNRESOLVED_SHEET_LINKABLE_DISPOSITIONS)
+    ]
+    target_qb_ids = set(linkable["Source Row ID"].astype(str))
+    if not target_qb_ids:
+        return
+
+    unresolved_ws = wb["Unresolved Exceptions"]
+    reconciled_ws = wb["Reconciled Data"]
+    unresolved_row_by_id = _find_rows_by_cell_value(unresolved_ws, target_qb_ids)
+    if not unresolved_row_by_id:
+        return
+
+    match_col = next(
+        (
+            cell.column for cell in reconciled_ws[RECONCILED_DATA_HEADER_ROW]
+            if cell.value == "Match Result"
+        ),
+        None,
+    )
+    if match_col is None:
+        return
+    reconciled_row_by_id = _qb_id_reconciled_data_row_map(result)
+    for qb_id, unresolved_row in unresolved_row_by_id.items():
+        reconciled_row = reconciled_row_by_id.get(qb_id)
+        if reconciled_row is None:
+            continue
+        _apply_row_id_hyperlink(
+            reconciled_ws, reconciled_row, match_col, unresolved_row,
+            target_sheet="Unresolved Exceptions",
+        )
 
 
 def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> None:
@@ -1745,6 +1816,7 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     build_raw_data_sheet(wb, result)
     build_reconciled_data_sheet(wb, result)
     build_unresolved_sheet(wb, result)
+    _link_reconciled_data_to_unresolved_exceptions(wb, result)
     build_product_sheet(wb, result)
     _apply_workbook_run_metadata(wb, result)
     return _save_workbook_bytes(wb, apply_accountant_row_heights=True)

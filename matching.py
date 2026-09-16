@@ -513,6 +513,81 @@ def _group_candidates(
     )
 
 
+def _duplicate_cluster_key(frame: pd.DataFrame, idx: int) -> Optional[tuple[str, str, str, int]]:
+    """The identity a row shares with every other row it is genuinely
+    indistinguishable from: full PO+Invoice+Amount agreement, or PO+Amount
+    agreement with invoice blank on the row (nothing is being ignored --
+    there simply is no invoice), or the symmetric Invoice+Amount case."""
+    amount = qb_amount = frame.at[idx, AMOUNT_CENTS]
+    if pd.isna(amount):
+        return None
+    po = frame.at[idx, NORM_PO]
+    invoice = frame.at[idx, NORM_INV]
+    has_po = bool(po)
+    has_invoice = bool(invoice)
+    if has_po and has_invoice:
+        return ("STRICT", str(po), str(invoice), int(amount))
+    if has_po:
+        return ("PO_ONLY", str(po), "", int(amount))
+    if has_invoice:
+        return ("INVOICE_ONLY", "", str(invoice), int(amount))
+    return None
+
+
+_CLUSTER_KEY_METHOD = {
+    "STRICT": ("PO + Invoice + Amount", "Strong"),
+    "PO_ONLY": ("PO + Amount", "Moderate"),
+    "INVOICE_ONLY": ("Invoice + Amount", "Strong"),
+}
+
+
+def _duplicate_cluster_pairs(
+    qb: pd.DataFrame,
+    inf: pd.DataFrame,
+    remaining_q: set[int],
+    remaining_i: set[int],
+) -> list[MatchGroup]:
+    """Pair up to min(count) rows within a same-key cluster of rows that
+    are genuinely indistinguishable from each other -- e.g. two QuickBooks
+    rows sharing the exact same PO, invoice, and amount. The ordinary
+    one-to-one passes above intentionally refuse to guess among candidates
+    that AREN'T uniquely identifiable (there could be a real difference
+    between them the pass just can't see), and that stays exactly as
+    conservative as before. This is a different situation: cluster members
+    carry no distinguishing information at all, so pairing them by stable
+    source-file order is exactly as correct as any other pairing -- there
+    is nothing to get wrong. Only fires for a key with 2+ rows on at least
+    one side; a key that is already unique on both sides was already
+    matched (or not) by the ordinary passes above.
+    """
+    q_groups: dict[tuple, list[int]] = defaultdict(list)
+    for idx in sorted(remaining_q, key=lambda i: qb.at[i, SOURCE_POS]):
+        key = _duplicate_cluster_key(qb, idx)
+        if key is not None:
+            q_groups[key].append(idx)
+    i_groups: dict[tuple, list[int]] = defaultdict(list)
+    for idx in sorted(remaining_i, key=lambda i: inf.at[i, SOURCE_POS]):
+        key = _duplicate_cluster_key(inf, idx)
+        if key is not None:
+            i_groups[key].append(idx)
+
+    groups: list[MatchGroup] = []
+    for key, q_list in q_groups.items():
+        i_list = i_groups.get(key, [])
+        if len(q_list) < 2 and len(i_list) < 2:
+            continue
+        method, confidence = _CLUSTER_KEY_METHOD[key[0]]
+        explanation = (
+            f"Unique {method.lower()} agreement is not possible here because more than one row "
+            "shares the exact same key -- but every row sharing it is financially identical, so "
+            "pairing them in stable source order is exactly as correct as any other pairing. "
+            "Any group member left over is accounted for separately rather than assumed away."
+        )
+        for qidx, iidx in zip(q_list, i_list):
+            groups.append(MatchGroup([qidx], [iidx], method, confidence, explanation))
+    return groups
+
+
 def perform_matching(
     qb: pd.DataFrame,
     inf: pd.DataFrame,
@@ -530,8 +605,10 @@ def perform_matching(
          "Unique normalized PO, invoice, and signed amount agree."),
         ((NORM_PO, AMOUNT_CENTS), "PO + Amount", "Moderate",
          "Unique normalized PO and signed amount agree."),
-        ((NORM_INV, AMOUNT_CENTS), "Invoice + Amount", "Moderate",
-         "Unique normalized invoice and signed amount agree."),
+        ((NORM_INV, AMOUNT_CENTS), "Invoice + Amount", "Strong",
+         "Unique normalized invoice and signed amount agree -- invoice number is the "
+         "designated secondary reconciliation check, so a unique match on it carries the "
+         "same confidence as a PO match even when the PO itself doesn't agree."),
     ]
 
     def unique_rows(
@@ -569,6 +646,14 @@ def perform_matching(
         )
         remaining_q.difference_update(int(qidx) for qidx, _ in pair_indexes)
         remaining_i.difference_update(int(iidx) for _, iidx in pair_indexes)
+
+    # Same-key duplicate clusters (see _duplicate_cluster_pairs): rows that
+    # couldn't match above purely because they weren't globally unique, even
+    # though they carry no distinguishing information from their siblings.
+    for group in _duplicate_cluster_pairs(qb, inf, remaining_q, remaining_i):
+        matches.append(group)
+        remaining_q.difference_update(group.qb_rows)
+        remaining_i.difference_update(group.inf_rows)
 
     grouped_passes = [
         (
@@ -1978,7 +2063,10 @@ def build_rules_and_config(
             {"Priority": 2, "Rule": "PO + Amount", "Automatic": "Yes",
              "Requirement": "One unique remaining row per dataset; normalized PO and exact signed cents agree."},
             {"Priority": 3, "Rule": "Invoice + Amount", "Automatic": "Yes",
-             "Requirement": "One unique remaining row per dataset; normalized invoice and exact signed cents agree."},
+             "Requirement": "One unique remaining row per dataset; normalized invoice and exact signed cents agree. "
+             "Tagged 'Strong' confidence, the same as Priority 1 -- invoice number is the designated secondary "
+             "reconciliation check, not a lesser one, so a unique match on it is trusted just as much even when "
+             "the PO itself is missing or doesn't agree."},
             {"Priority": 4, "Rule": "PO + Invoice + Aggregate Amount", "Automatic": "Yes, after one-to-one",
              "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized PO and invoice and exact signed-cent totals agree."},
             {"Priority": 5, "Rule": "PO + Aggregate Amount", "Automatic": "Yes, after one-to-one",
@@ -2019,26 +2107,34 @@ def build_rules_and_config(
              "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence, including the fuzzy PO pass (Priority 8). The vendor alias pass (Priority 7) is not applied here -- see build_historical_clearances."},
             {"Priority": 13, "Rule": "Unused secondary rows", "Automatic": "Excluded",
              "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
-            {"Priority": 14, "Rule": "Strong duplicate canonicalization (see duplicates.py)", "Automatic": "Yes, before matching",
+            {"Priority": 14, "Rule": "QuickBooks duplicate-key groups: matched normally, evidence-based accrual (see duplicates.py)", "Automatic": "Conditional",
              "Requirement": (
-                 "For same-file rows with populated PO and invoice and identical signed cents, "
-                 "the earliest source-position row is retained as the canonical transaction and "
-                 "only later payload-identical copies are excluded. The candidate business-key group "
-                 "and payload-confirmed copy set receive separate stable IDs. Automatic exclusion "
+                 "QuickBooks is the sole accrual basis, so a same-file group sharing PO+invoice+amount, "
+                 "or PO+amount with invoice blank on every member, or invoice+amount with PO blank on "
+                 "every member, is never pre-collapsed before matching -- every member stays fully active "
+                 "and eligible to match through every pass above -- including the duplicate-cluster pairing "
+                 "that runs immediately after Priorities 1-3 (see _duplicate_cluster_pairs in matching.py), "
+                 "which lets one member pair with a genuine Infinium counterpart even though the group "
+                 "isn't globally unique on its own. Once matching and historical clearance complete, the "
+                 "group is decided as a whole: if ANY member matched, every unmatched member is included "
+                 "in the accrual as its own ordinary exception -- real evidence the pattern recurs, not a "
+                 "data-entry duplicate. If NO member matched at all, only the earliest-listed member is "
+                 "kept as an exception and every other member is excluded, exactly as a confirmed "
+                 "duplicate has always been treated. Automatic exclusion in the zero-evidence case still "
                  "assumes the source report grain does not permit legitimate repeated identical lines; "
                  "that report-grain assertion must be documented by the process owner."
              )},
-            {"Priority": 15, "Rule": "Weak duplicate candidates: matched normally, held if unresolved",
+            {"Priority": 15, "Rule": "Infinium duplicate-key groups: matched normally, held if unresolved",
              "Automatic": "Conditional",
              "Requirement": (
-                 "Rows with identical signed cents but only a PO or only an invoice are never "
-                 "auto-excluded up front -- they remain fully active and eligible to match through "
-                 "every pass above. A candidate that matches proceeds normally with no exclusion. A "
-                 "candidate that is still unresolved once matching and historical clearance complete is "
-                 "removed from provisional JE support and placed in Duplicate Review Hold. The run is "
-                 "non-postable until a documented human disposition is completed. Rows sharing a reference with "
-                 "different amounts are never assumed duplicates and remain eligible for controlled "
-                 "aggregate matching (Priorities 4-6)."
+                 "Infinium carries no accrual effect of its own, so it keeps the original policy: rows "
+                 "with identical signed cents but only a PO or only an invoice are never auto-excluded "
+                 "up front -- they remain fully active and eligible to match through every pass above. A "
+                 "candidate that matches proceeds normally with no exclusion. A candidate that is still "
+                 "unresolved once matching and historical clearance complete is removed from provisional "
+                 "reporting and placed in Duplicate Review Hold pending a documented human disposition. "
+                 "Rows sharing a reference with different amounts are never assumed duplicates and remain "
+                 "eligible for controlled aggregate matching (Priorities 4-6)."
              )},
             {"Priority": 16, "Rule": "Historical overlap exclusion", "Automatic": "Yes, before clearance",
              "Requirement": (
@@ -2366,10 +2462,18 @@ def build_reconciliation(
     # are reported for review without automatic exclusion. Historical frames
     # are additionally compared with their own primary population so an
     # overlapping historical row cannot clear an opposing primary exception.
+    # QuickBooks is the sole accrual basis, so a same-key group here is never
+    # pre-collapsed before matching is attempted -- every member stays active
+    # and eligible to match normally (see _duplicate_cluster_pairs), and the
+    # post-matching accounting below decides how many of them really belong
+    # in the accrual based on how many the group actually ties out against
+    # Infinium. Infinium duplicates keep the original pre-matching collapse
+    # since Infinium carries no accrual effect of its own.
     qb_screen = screen_duplicates(
         qb, QB_ID, "QuickBooks", "Primary",
-        "Strong groups retain one canonical row; only excess copies are excluded from the JE.",
-        auto_exclude_strict=True,
+        "Every group member stays active for matching; see the post-matching duplicate "
+        "accounting for how many of an unresolved group end up in the accrual.",
+        auto_exclude_strict=False,
     )
     inf_screen = screen_duplicates(
         inf, INF_ID, "Infinium", "Primary",
@@ -2447,21 +2551,69 @@ def build_reconciliation(
         inf_secondary_active,
     )
 
-    # Weak-basis (PO-only or invoice-only) duplicate candidates were never
-    # excluded from matching -- they stayed active and could resolve
-    # normally. Now that matching and historical clearance are both final,
-    # split them by outcome: one that matched needs no further action, but
-    # one that is still unresolved must never quietly inflate the proposed
-    # JE just because nobody happened to open the duplicates worksheet. It
-    # is pulled into its own Duplicate Review Hold population instead.
-    duplicate_review_hold_qb = sorted(set(unmatched_qb) & set(qb_screen.suspected_rows))
+    # QuickBooks duplicate-key groups stayed fully active through matching
+    # instead of being pre-collapsed (see the QB screen_duplicates call
+    # above). Now that matching and historical clearance are both final,
+    # decide -- per group -- how many of them really belong in the accrual:
+    #   * If ANY member of the group matched, every member that didn't is
+    #     an ordinary accrual exception in its own right. A real match
+    #     elsewhere in the group is evidence the pattern genuinely recurs,
+    #     not a data-entry duplicate, so it must never be quietly dropped.
+    #   * If NO member of the group matched at all, there is zero evidence
+    #     more than one real transaction exists -- only the earliest-listed
+    #     member is kept as an exception and the rest are excluded, exactly
+    #     as a confirmed duplicate has always been treated.
+    qb_group_id_by_index: dict[int, str] = {}
+    if not qb_screen.report.empty:
+        qb_report_group_by_id = (
+            qb_screen.report.set_index("Source Row ID")["Duplicate Group ID"].to_dict()
+        )
+        qb_group_id_by_index = {
+            idx: qb_report_group_by_id[qb.at[idx, QB_ID]]
+            for idx in qb_screen.suspected_rows
+            if qb.at[idx, QB_ID] in qb_report_group_by_id
+        }
+    qb_duplicate_groups: dict[str, list[int]] = defaultdict(list)
+    for idx, group_id in qb_group_id_by_index.items():
+        qb_duplicate_groups[group_id].append(idx)
+
+    qb_zero_evidence_excess: list[int] = []
+    resolved_suspected_qb_ids: set[Any] = set()
+    canonical_survivor_qb_ids: set[Any] = set()
+    excess_canonical_qb_ids: dict[Any, Any] = {}
+    for members in qb_duplicate_groups.values():
+        matched_members = [idx for idx in members if idx not in unmatched_qb]
+        unmatched_members = [idx for idx in members if idx in unmatched_qb]
+        if matched_members:
+            resolved_suspected_qb_ids.update(qb.at[idx, QB_ID] for idx in members)
+        elif unmatched_members:
+            # Nothing in this group matched at all, so the survivor is not
+            # "resolved via a match" -- it is retained as the group's sole
+            # canonical representative, same as a pre-matching canonical row.
+            ordered = sorted(unmatched_members, key=lambda idx: qb.at[idx, SOURCE_POS])
+            survivor_id = qb.at[ordered[0], QB_ID]
+            canonical_survivor_qb_ids.add(survivor_id)
+            qb_zero_evidence_excess.extend(ordered[1:])
+            for idx in ordered[1:]:
+                excess_canonical_qb_ids[qb.at[idx, QB_ID]] = survivor_id
+    # The QB exclusion set now includes both any pre-matching exclusions
+    # (there are none while auto_exclude_strict=False, but this stays
+    # correct if that ever changes) and the post-matching zero-evidence
+    # excess rows decided above -- every downstream consumer of "which QB
+    # rows are excluded duplicates" must use this, not qb_screen.duplicate_rows
+    # directly, or it will silently see the pre-matching-only, now-stale view.
+    duplicate_qb_rows_final = sorted(set(qb_screen.duplicate_rows) | set(qb_zero_evidence_excess))
+
+    duplicate_review_hold_qb: list[int] = []
+    held_suspected_qb_ids: set[Any] = set()
+    unmatched_qb = sorted(set(unmatched_qb) - set(qb_zero_evidence_excess))
+
+    # Infinium carries no accrual effect of its own, so its weak-basis
+    # duplicate candidates keep the original policy: stay active through
+    # matching, and anything still unresolved afterward is held for review
+    # rather than silently assumed one way or the other.
     duplicate_review_hold_inf = sorted(set(unmatched_inf) & set(inf_screen.suspected_rows))
-    unmatched_qb = sorted(set(unmatched_qb) - set(duplicate_review_hold_qb))
     unmatched_inf = sorted(set(unmatched_inf) - set(duplicate_review_hold_inf))
-    resolved_suspected_qb_ids = {
-        qb.at[idx, QB_ID] for idx in qb_screen.suspected_rows if idx not in duplicate_review_hold_qb
-    }
-    held_suspected_qb_ids = {qb.at[idx, QB_ID] for idx in duplicate_review_hold_qb}
     resolved_suspected_inf_ids = {
         inf.at[idx, INF_ID] for idx in inf_screen.suspected_rows if idx not in duplicate_review_hold_inf
     }
@@ -2483,14 +2635,33 @@ def build_reconciliation(
         set(unmatched_inf).difference(amount_variance_review_hold_inf)
     )
 
+    # Finalized (post-matching) duplicate reports are computed here, before
+    # build_paired_rows, because the QuickBooks accounting above now makes a
+    # genuinely post-matching decision (excess vs. ordinary exception) that
+    # qb_screen.report -- fixed at pre-matching screening time -- cannot
+    # reflect; paired_rows and the audit report must both read the same,
+    # final disposition rather than the two silently disagreeing.
+    qb_primary_duplicate_report = finalize_review_dispositions(
+        qb_screen.report,
+        resolved_ids=resolved_suspected_qb_ids,
+        held_ids=held_suspected_qb_ids,
+        excess_ids=excess_canonical_qb_ids,
+        canonical_survivor_ids=canonical_survivor_qb_ids,
+    )
+    inf_primary_duplicate_report = finalize_review_dispositions(
+        inf_screen.report,
+        resolved_ids=resolved_suspected_inf_ids,
+        held_ids=held_suspected_inf_ids,
+    )
+
     paired_rows = build_paired_rows(
         matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf, candidates,
-        qb_screen.duplicate_rows, inf_screen.duplicate_rows,
+        duplicate_qb_rows_final, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_analysis,
         fuzzy_hold_groups,
-        qb_screen.report,
-        inf_screen.report,
+        qb_primary_duplicate_report,
+        inf_primary_duplicate_report,
     )
     normalization = build_normalization_detail(qb, inf, qb_mapping, inf_mapping)
     assessments = build_match_assessments(
@@ -2499,7 +2670,7 @@ def build_reconciliation(
     )
     method_summary = build_method_summary(
         matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf,
-        qb_screen.duplicate_rows, inf_screen.duplicate_rows,
+        duplicate_qb_rows_final, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
         fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
@@ -2508,11 +2679,6 @@ def build_reconciliation(
         qb, inf, unmatched_qb, unmatched_inf, candidates,
         amount_variance_analysis, paired_rows,
         fuzzy_match_review_hold_analysis,
-    )
-    qb_primary_duplicate_report = finalize_review_dispositions(
-        qb_screen.report,
-        resolved_ids=resolved_suspected_qb_ids,
-        held_ids=held_suspected_qb_ids,
     )
     qb_secondary_duplicate_report = (
         finalize_review_dispositions(
@@ -2527,11 +2693,6 @@ def build_reconciliation(
     duplicate_analysis = combine_duplicate_reports(
         qb_primary_duplicate_report,
         qb_secondary_duplicate_report,
-    )
-    inf_primary_duplicate_report = finalize_review_dispositions(
-        inf_screen.report,
-        resolved_ids=resolved_suspected_inf_ids,
-        held_ids=held_suspected_inf_ids,
     )
     inf_secondary_duplicate_report = (
         finalize_review_dispositions(
@@ -2555,7 +2716,7 @@ def build_reconciliation(
     )
     controls = build_controls(
         qb, inf, matches, historical_clearances, unmatched_qb, unmatched_inf,
-        qb_screen.duplicate_rows, inf_screen.duplicate_rows,
+        duplicate_qb_rows_final, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
         fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
@@ -2617,7 +2778,7 @@ def build_reconciliation(
     if inf[AMOUNT_CENTS].isna().any():
         posting_blockers.append("invalid Infinium amounts")
     automatic_duplicate_exclusions = bool(
-        qb_screen.duplicate_rows
+        duplicate_qb_rows_final
         or inf_screen.duplicate_rows
         or (qb_secondary_screen and qb_secondary_screen.duplicate_rows)
         or (inf_secondary_screen and inf_secondary_screen.duplicate_rows)
@@ -2659,8 +2820,8 @@ def build_reconciliation(
         "Unresolved QuickBooks Amount": cents_to_float(unmatched_q_cents),
         "Unmatched Infinium Rows": len(unmatched_inf),
         "Unmatched Infinium Amount": cents_to_float(_amount_total(inf, unmatched_inf)),
-        "Duplicate QuickBooks Rows": len(qb_screen.duplicate_rows),
-        "Duplicate QuickBooks Amount": cents_to_float(_amount_total(qb, qb_screen.duplicate_rows)),
+        "Duplicate QuickBooks Rows": len(duplicate_qb_rows_final),
+        "Duplicate QuickBooks Amount": cents_to_float(_amount_total(qb, duplicate_qb_rows_final)),
         "Duplicate Infinium Rows": len(inf_screen.duplicate_rows),
         "Duplicate Infinium Amount": cents_to_float(_amount_total(inf, inf_screen.duplicate_rows)),
         "Suspected QuickBooks Duplicate Rows": len(qb_screen.suspected_rows),
@@ -2778,11 +2939,11 @@ def build_reconciliation(
         inf_secondary_work=inf_secondary,
         qb_secondary_mapping=qb_secondary_mapping,
         inf_secondary_mapping=inf_secondary_mapping,
-        duplicate_qb_rows=qb_screen.duplicate_rows,
+        duplicate_qb_rows=duplicate_qb_rows_final,
         duplicate_inf_rows=inf_screen.duplicate_rows,
         duplicate_qb_secondary_rows=qb_secondary_screen.duplicate_rows if qb_secondary_screen else [],
         duplicate_inf_secondary_rows=inf_secondary_screen.duplicate_rows if inf_secondary_screen else [],
-        suspected_qb_rows=qb_screen.suspected_rows,
+        suspected_qb_rows=sorted(set(qb_screen.suspected_rows) - set(qb_zero_evidence_excess)),
         suspected_inf_rows=inf_screen.suspected_rows,
         suspected_qb_secondary_rows=qb_secondary_screen.suspected_rows if qb_secondary_screen else [],
         suspected_inf_secondary_rows=inf_secondary_screen.suspected_rows if inf_secondary_screen else [],

@@ -460,7 +460,12 @@ def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
     ]
     assert linked_cells, "expected at least one Row ID hyperlink on Unresolved Exceptions"
 
+    match_col = next(
+        cell.column for cell in reconciled_ws[3] if cell.value == "Match Result"
+    )
+
     checked = 0
+    round_trips_checked = 0
     for cell in linked_cells:
         qb_id = str(cell.value)
         target = cell.hyperlink.target
@@ -470,10 +475,24 @@ def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
             f"Row ID {qb_id} links to Reconciled Data row {target_row}, which doesn't match"
         )
         # Underline signals "clickable" without erasing a meaningful color
-        # (e.g. a duplicate-excluded row's Row ID stays red, just underlined).
+        # (e.g. a duplicate-excluded row's Row ID stays red, just underlined),
+        # and bold makes every link easy to spot regardless of its color.
         assert cell.font.underline == "single"
+        assert cell.font.bold is True
         checked += 1
+
+        # Round trip: Reconciled Data's Match Result cell on that same row
+        # must link back to exactly the Unresolved Exceptions row we started
+        # from -- bidirectional, not just forward.
+        reverse_cell = reconciled_ws.cell(target_row, match_col)
+        if reverse_cell.hyperlink is not None:
+            reverse_target = reverse_cell.hyperlink.target
+            assert reverse_target == f"#'Unresolved Exceptions'!A{cell.row}"
+            assert reverse_cell.font.bold is True
+            assert reverse_cell.font.underline == "single"
+            round_trips_checked += 1
     assert checked >= 2  # both the duplicates and the review-hold section have at least one row here
+    assert round_trips_checked >= 2  # every linked row above must round-trip back
 
 
 def test_primary_and_analytics_workbooks_build_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):
@@ -543,16 +562,44 @@ def test_render_result_duplicate_badge_never_raises(qb_mapping, inf_mapping, mak
 
 
 def _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata):
+    """QuickBooks weak-basis duplicates no longer land in Duplicate Review
+    Hold under the current policy (see test_full_reconciliation_detects_
+    blank_reference_duplicates and test_weak_basis_review_hold_does_not_
+    block_control_status in test_matching.py) -- a zero-evidence group is
+    now resolved immediately (one canonical exception, the rest excluded)
+    rather than deferred to a human. The "Duplicate Review Hold" section on
+    Unresolved Exceptions is kept for the structural case of a future
+    QuickBooks policy that defers again, so its rendering is tested here
+    by patching a real result's duplicate_analysis into that state directly
+    rather than by re-deriving it through build_reconciliation, since no
+    QuickBooks input can produce it anymore.
+    """
     qb_rows = [
         {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
         {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
         {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1"},
     ]
     inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1"}]
-    return build_reconciliation(
+    result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
+    held_qb_ids = set(result.qb_work.loc[[0, 1], QB_ID])
+    patched = result.duplicate_analysis.copy()
+    held_mask = patched["Source Row ID"].isin(held_qb_ids)
+    patched.loc[held_mask, "Disposition"] = "Held for review - excluded from proposed JE pending disposition"
+    patched.loc[held_mask, "Confidence"] = "Hold"
+    patched.loc[held_mask, "Automatically Excluded"] = True
+    patched.loc[held_mask, "Canonical Source Row ID"] = ""
+    result.duplicate_analysis = patched
+    result.duplicate_review_hold_qb_rows = [0, 1]
+    result.duplicate_qb_rows = []
+    result.metrics["Duplicate Review Hold QuickBooks Rows"] = 2
+    result.metrics["Duplicate Review Hold QuickBooks Amount"] = 50.0
+    result.metrics["Duplicate QuickBooks Rows"] = 0
+    result.metrics["Duplicate QuickBooks Amount"] = 0.0
+    result.metrics["Posting Status"] = "REVIEW REQUIRED"
+    return result
 
 
 def test_duplicate_review_hold_section_renders_with_documented_disposition_dropdown(
@@ -561,7 +608,9 @@ def test_duplicate_review_hold_section_renders_with_documented_disposition_dropd
     """The Duplicate Review Hold section must appear after the duplicates
     section (before the JE), list the held items, and give the reviewer a
     controlled-vocabulary, editable place to record a documented decision
-    -- not just a static, uneditable list."""
+    -- not just a static, uneditable list. (See _build_result_with_review_
+    hold for why this state is patched in rather than produced by a real
+    QuickBooks scenario under the current policy.)"""
     result = _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata)
     assert result.metrics["Posting Status"] == "REVIEW REQUIRED"
     assert result.metrics["Duplicate Review Hold QuickBooks Rows"] == 2
