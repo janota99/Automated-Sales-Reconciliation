@@ -360,6 +360,33 @@ def test_fiscal_period_summary_is_promoted_above_the_exception_table(
     assert fiscal_row <= 10
 
 
+def test_unresolved_sheet_has_a_status_color_legend(qb_mapping, inf_mapping, make_metadata):
+    """A reviewer opening this workpaper cold has no other way to learn what
+    each status fill means, so a color key must be present, sit between the
+    KPI cards and the fiscal-period section, and cover the sheet's actual
+    status colors (duplicate red, urgent red, pending amber, current
+    green)."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    workbook_bytes = build_primary_workbook(result)
+    ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
+
+    def first_row_containing(needle: str) -> int:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value and needle in str(cell.value):
+                    return cell.row
+        raise AssertionError(f"{needle!r} not found in sheet")
+
+    legend_row = first_row_containing("Confirmed duplicate")
+    fiscal_row = first_row_containing("QUICKBOOKS EXCEPTIONS BY FISCAL PERIOD")
+    kpi_row = first_row_containing("Proposed JE support total")
+
+    assert kpi_row < legend_row < fiscal_row
+    legend_texts = [str(cell.value) for cell in ws[legend_row] if cell.value]
+    assert any("duplicate" in text.lower() for text in legend_texts)
+    assert any("urgent" in text.lower() for text in legend_texts)
+
+
 def test_duplicates_and_je_sit_ten_rows_below_the_exceptions_total(
     qb_mapping, inf_mapping, make_metadata,
 ):

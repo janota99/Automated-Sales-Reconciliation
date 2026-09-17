@@ -15,6 +15,7 @@ from matching import (
     FUZZY_MATCH_CLASSIFICATION_GROUPED,
     FUZZY_MATCH_CLASSIFICATION_SINGLE,
     MatchGroup,
+    build_fiscal_exception_summary,
     build_fuzzy_match_review_holds,
     build_reconciliation,
     cents_or_zero,
@@ -605,6 +606,38 @@ def test_full_reconciliation_detects_blank_reference_duplicates(qb_mapping, inf_
     }
     basis_values = set(result.duplicate_analysis["Duplicate Basis"])
     assert "Invoice + Amount (PO blank on both rows)" in basis_values
+
+
+def test_fiscal_exception_summary_treats_one_and_two_periods_behind_as_routine(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """A prior-period-close trickle is normal: an unresolved QuickBooks
+    exception dated 1 or 2 fiscal periods behind the selected reporting
+    period is a routine "Prior-Period Exception", not the alarming
+    "Prior-Period Urgent Exception" label -- that label is reserved for a
+    gap wider than PRIOR_PERIOD_URGENT_THRESHOLD periods, which signals a
+    genuinely stale item worth investigating now."""
+    qb_rows = [
+        {"PO": "PO-CUR", "Invoice": "INV-CUR", "Amount": 10.00, "Qty": 1, "Period": "5"},   # current
+        {"PO": "PO-P4", "Invoice": "INV-P4", "Amount": 20.00, "Qty": 1, "Period": "4"},     # 1 behind
+        {"PO": "PO-P3", "Invoice": "INV-P3", "Amount": 30.00, "Qty": 1, "Period": "3"},     # 2 behind
+        {"PO": "PO-P2", "Invoice": "INV-P2", "Amount": 40.00, "Qty": 1, "Period": "2"},     # 3 behind
+        {"PO": "PO-P1", "Invoice": "INV-P1", "Amount": 50.00, "Qty": 1, "Period": "1"},     # 4 behind
+    ]
+    inf_rows = [
+        {"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "5"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(fiscal_period=5), 2026,
+    )
+    summary = build_fiscal_exception_summary(result)
+    classification_by_period = dict(zip(summary["Fiscal Period"], summary["Period Classification"]))
+    assert classification_by_period["PD-05"] == "Current Reporting Period"
+    assert classification_by_period["PD-04"] == "Prior-Period Exception"
+    assert classification_by_period["PD-03"] == "Prior-Period Exception"
+    assert classification_by_period["PD-02"] == "Prior-Period Urgent Exception"
+    assert classification_by_period["PD-01"] == "Prior-Period Urgent Exception"
 
 
 def test_weak_basis_pair_resolved_via_match_proceeds_normally(qb_mapping, inf_mapping, make_metadata):

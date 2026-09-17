@@ -31,6 +31,8 @@ from config import (
     ACCOUNTING_QUANTITY_FORMAT,
     AMBER,
     CENTRAL_TIMEZONE,
+    DUPLICATE_RED_FILL,
+    DUPLICATE_RED_TEXT,
     FONT_NAME,
     GREEN_LIGHT,
     NAVY,
@@ -73,6 +75,7 @@ from duplicates import (
 from matching import (
     AMOUNT_CENTS,
     INF_ID,
+    PRIOR_PERIOD_URGENT_THRESHOLD,
     QB_ID,
     ReconciliationResult,
     build_fiscal_exception_summary,
@@ -768,6 +771,37 @@ def _write_kpi_band(
         col += 2
 
 
+# Status-fill meanings used across this sheet -- a swatch and a short label
+# per entry, so a reviewer opening the file cold doesn't need tribal
+# knowledge of what each color means. (fill, text_color_or_None, label)
+_STATUS_COLOR_LEGEND: list[tuple] = [
+    (DUPLICATE_RED_FILL, DUPLICATE_RED_TEXT, "Confirmed duplicate - excluded from JE"),
+    (RED_LIGHT, None, "Prior-period urgent exception / control fail"),
+    (AMBER, None, "Pending review / routine prior-period exception"),
+    (GREEN_LIGHT, None, "Current period / control pass"),
+]
+
+
+def _write_color_legend(ws, row: int, start_col: int, end_col: int) -> None:
+    """A compact color key: a small filled swatch immediately followed by
+    its label, packed left to right with no gap between entries -- same
+    tight-packing idea as _write_kpi_band, applied to a legend instead of a
+    KPI card."""
+    col = start_col
+    for fill_color, text_color, label in _STATUS_COLOR_LEGEND:
+        if col + 1 > end_col:
+            break
+        swatch = ws.cell(row, col)
+        swatch.fill = PatternFill("solid", fgColor=fill_color)
+        swatch.border = _thin_border()
+        ws.merge_cells(start_row=row, start_column=col + 1, end_row=row, end_column=col + 2)
+        label_cell = ws.cell(row, col + 1, label)
+        label_cell.font = Font(name=FONT_NAME, size=8, italic=True, color=text_color or TEXT)
+        label_cell.alignment = Alignment(horizontal="left", vertical="center")
+        col += 4
+    ws.row_dimensions[row].height = 14
+
+
 def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws = wb.create_sheet("Unresolved Exceptions")
 
@@ -882,6 +916,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ),
     ]
     _write_kpi_band(ws, 3, 4, kpis, end_col)
+    _write_color_legend(ws, 5, 1, end_col)
 
     # QuickBooks exceptions by fiscal period -- promoted above the detail
     # tables so period-level review (count and net amount per period) never
@@ -913,8 +948,9 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     _write_caption_band(
         ws, fiscal_caption_row, 1, fiscal_section_end_col,
         (
-            f"Selected current reporting period: PD-{int(selected_period):02d}. Every other valid QuickBooks fiscal "
-            f"period is classified as a prior-period urgent exception. {quantity_note}"
+            f"Selected current reporting period: PD-{int(selected_period):02d}. A QuickBooks fiscal period up to "
+            f"{PRIOR_PERIOD_URGENT_THRESHOLD} period(s) behind is a routine prior-period exception; anything "
+            f"older is classified as a prior-period urgent exception. {quantity_note}"
             if has_fiscal_period and selected_period is not None
             else f"No current reporting period was selected. Exceptions are summarized by source period without current/prior classification. {quantity_note}"
             if has_fiscal_period

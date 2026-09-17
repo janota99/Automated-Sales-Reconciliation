@@ -85,6 +85,11 @@ MATCHING_RULE_VERSION = "2026.09-STREAMLINED-DUPLICATE-OUTPUT"
 MAX_GROUP_POOL_ROWS = 20
 MAX_GROUP_SIZE = 8
 
+# A QuickBooks exception dated this many fiscal periods (or fewer) behind the
+# selected reporting period is routine -- prior-period close activity is
+# still normal at that distance. Only a wider gap escalates to "urgent".
+PRIOR_PERIOD_URGENT_THRESHOLD = 2
+
 QB_ID = "__REC_QB_ID"
 INF_ID = "__REC_INF_ID"
 PRODUCT_STANDARD = "__REC_PRODUCT_STANDARD"
@@ -2291,15 +2296,23 @@ def build_fiscal_exception_summary(result: ReconciliationResult) -> pd.DataFrame
             return "Reporting Period Not Selected"
         if int(value) == int(selected_period):
             return "Current Reporting Period"
+        periods_behind = int(selected_period) - int(value)
+        # A row from the immediate prior period (or the one before that) is
+        # routine -- the prior period's close is often still trickling in
+        # when this period's reconciliation runs. Only a gap wider than that
+        # signals a genuinely stale, investigate-now exception.
+        if 0 < periods_behind <= PRIOR_PERIOD_URGENT_THRESHOLD:
+            return "Prior-Period Exception"
         return "Prior-Period Urgent Exception"
 
     work["Period Classification"] = work["__PERIOD_NUMBER"].map(classify)
     work["__URGENCY_SORT"] = work["Period Classification"].map(
         {
             "Prior-Period Urgent Exception": 1,
-            "Unspecified Period - Review": 2,
-            "Reporting Period Not Selected": 3,
-            "Current Reporting Period": 4,
+            "Prior-Period Exception": 2,
+            "Unspecified Period - Review": 3,
+            "Reporting Period Not Selected": 4,
+            "Current Reporting Period": 5,
         }
     )
     summary = (
