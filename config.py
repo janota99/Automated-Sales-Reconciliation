@@ -19,8 +19,12 @@ SLATE = "475569"
 SLATE_LIGHT = "F2F5F8"
 AMBER = "FFF3CD"
 ORANGE = "FCE8D5"
-DUPLICATE_RED_FILL = "FFC7CE"
-DUPLICATE_RED_TEXT = "9C0006"
+# Softened from the original bright Excel "Bad" red (FFC7CE/9C0006) -- eye
+# strain when a reviewer is scanning hundreds of exception rows was the
+# reported problem. A muted pastel background with a dark, legible maroon
+# text keeps the "this is a problem" signal without the harshness.
+DUPLICATE_RED_FILL = "F8D7DA"
+DUPLICATE_RED_TEXT = "72232B"
 GOOD_GREEN_FILL = "C6EFCE"
 GOOD_GREEN_TEXT = "006100"
 NEUTRAL_GOLD_FILL = "FFEB9C"
@@ -33,3 +37,25 @@ WHITE = "FFFFFF"
 TEXT = "172B4D"
 BORDER = "D5DDE4"
 TOTAL_FILL = "E2E8F0"
+
+# Every workbook cell is explicitly set to this UI font (see
+# _apply_workbook_default_font in excel_styles.py, plus each Font(...) call
+# throughout this module) rather than leaving anything on Excel's Calibri
+# theme default.
+FONT_NAME = "Segoe UI"
+# Applied specifically to amount/quantity/invoice-and-PO-like columns: a
+# true monospaced font so every digit occupies the same width, making a
+# column of numbers easy to scan straight down rather than a UI font's
+# proportional (if fairly tabular) figures.
+FONT_NAME_NUMERIC = "Consolas"
+
+# True Excel "Accounting" format: the currency symbol is locked to the far
+# left of the cell, thousands separators and a fixed two-decimal tail keep
+# every value's decimal point vertically aligned with its neighbors, and a
+# lone "-" (not "$0.00") marks a zero. Negatives still render in red,
+# consistent with the rest of the workbook's number formats.
+ACCOUNTING_CURRENCY_FORMAT = '_($* #,##0.00_);[Red]_($* (#,##0.00);_($* "-"??_);_(@_)'
+# Same alignment behavior, without the currency symbol, for quantity/count
+# columns that should still line up decimal-for-decimal.
+ACCOUNTING_QUANTITY_FORMAT = '_(* #,##0.00_);[Red]_(* (#,##0.00);_(* "-"??_);_(@_)'
+ACCOUNTING_COUNT_FORMAT = '_(* #,##0_);[Red]_(* (#,##0);_(* "-"??_);_(@_)'

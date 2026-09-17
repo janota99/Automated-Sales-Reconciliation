@@ -26,8 +26,12 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableColumn, TableStyleInfo
 
 from config import (
+    ACCOUNTING_COUNT_FORMAT,
+    ACCOUNTING_CURRENCY_FORMAT,
+    ACCOUNTING_QUANTITY_FORMAT,
     AMBER,
     CENTRAL_TIMEZONE,
+    FONT_NAME,
     GREEN_LIGHT,
     NAVY,
     NAVY_LIGHT,
@@ -316,8 +320,11 @@ def build_raw_data_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     )
     _write_dataframe_values(ws, result.qb_raw, header_row, qb_start)
     _write_dataframe_values(ws, result.inf_raw, header_row, inf_start)
-    _format_header(ws, header_row, qb_start, qb_end, NAVY)
-    _format_header(ws, header_row, inf_start, inf_end, TEAL)
+    qb_amount_cols = {result.qb_mapping["amount"]}
+    qb_quantity_cols = {result.qb_mapping.get("quantity") or ""}
+    inf_amount_cols = {result.inf_mapping["amount"]}
+    _format_header(ws, header_row, qb_start, qb_end, NAVY, qb_headers, qb_amount_cols, qb_quantity_cols)
+    _format_header(ws, header_row, inf_start, inf_end, TEAL, inf_headers, inf_amount_cols)
     _format_body_block(ws, data_row, data_row + len(result.qb_raw) - 1, qb_start, qb_end, NAVY_LIGHT)
     _format_body_block(ws, data_row, data_row + len(result.inf_raw) - 1, inf_start, inf_end, TEAL_LIGHT)
     for source_index in _duplicate_source_indexes(result, "QuickBooks"):
@@ -331,9 +338,9 @@ def build_raw_data_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     _write_total_row(ws, qb_total_row, qb_start, qb_end, _source_totals(result.qb_raw, result.qb_mapping), qb_headers, "SOURCE TOTAL")
     _write_total_row(ws, inf_total_row, inf_start, inf_end, _source_totals(result.inf_raw, result.inf_mapping), inf_headers, "SOURCE TOTAL")
     _apply_number_formats(ws, qb_headers, data_row, qb_total_row, qb_start,
-                          {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
+                          qb_amount_cols, qb_quantity_cols)
     _apply_number_formats(ws, inf_headers, data_row, inf_total_row, inf_start,
-                          {result.inf_mapping["amount"]}, set())
+                          inf_amount_cols, set())
     ws.column_dimensions[get_column_letter(separator_col)].width = 3.5
     ws.column_dimensions[get_column_letter(separator_col)].fill = PatternFill("solid", fgColor=WHITE)
     _set_widths(ws, qb_start, qb_end, header_row, qb_total_row)
@@ -473,7 +480,7 @@ def _apply_row_id_hyperlink(
     cell.hyperlink = f"#'{target_sheet}'!A{target_row}"
     current = cell.font
     cell.font = Font(
-        name=current.name or "Segoe UI",
+        name=current.name or FONT_NAME,
         size=current.size or 10,
         bold=True,
         color=current.color or NAVY,
@@ -582,9 +589,12 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
     for offset, value in enumerate(match_results, 1):
         ws.cell(header_row + offset, match_col, value)
     _write_dataframe_values(ws, inf_display, header_row, inf_start)
-    _format_header(ws, header_row, qb_start, qb_end, NAVY)
+    qb_amount_cols = {result.qb_mapping["amount"]}
+    qb_quantity_cols = {result.qb_mapping.get("quantity") or ""}
+    inf_amount_cols = {result.inf_mapping["amount"]}
+    _format_header(ws, header_row, qb_start, qb_end, NAVY, qb_headers, qb_amount_cols, qb_quantity_cols)
     _format_header(ws, header_row, match_col, match_col, SLATE)
-    _format_header(ws, header_row, inf_start, inf_end, TEAL)
+    _format_header(ws, header_row, inf_start, inf_end, TEAL, inf_headers, inf_amount_cols)
     _format_body_block(ws, data_row, final_data_row, qb_start, qb_end, NAVY_LIGHT)
     _format_body_block(ws, data_row, final_data_row, match_col, match_col, SLATE_LIGHT)
     _format_body_block(ws, data_row, final_data_row, inf_start, inf_end, TEAL_LIGHT)
@@ -617,11 +627,11 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
             _apply_duplicate_style(ws, row, inf_start, inf_end)
         if record.get("QB Record Scope") == "Historical":
             ws.cell(row, qb_end).font = Font(
-                name="Segoe UI", size=10, bold=True, color=NAVY
+                name=FONT_NAME, size=10, bold=True, color=NAVY
             )
         if record.get("Infinium Record Scope") == "Historical":
             ws.cell(row, inf_end).font = Font(
-                name="Segoe UI", size=10, bold=True, color=TEAL
+                name=FONT_NAME, size=10, bold=True, color=TEAL
             )
         ws.cell(row, match_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
@@ -632,13 +642,13 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
                      _source_totals(result.inf_raw, result.inf_mapping), inf_headers, "RECONCILED TOTAL")
     ws.cell(total_row, match_col, f"Control: {result.metrics['Control Status']}")
     ws.cell(total_row, match_col).fill = PatternFill("solid", fgColor=GREEN_LIGHT if result.metrics["Control Status"] == "PASS" else RED_LIGHT)
-    ws.cell(total_row, match_col).font = Font(name="Segoe UI", size=10, bold=True, color=TEXT)
+    ws.cell(total_row, match_col).font = Font(name=FONT_NAME, size=10, bold=True, color=TEXT)
     ws.cell(total_row, match_col).border = _total_border()
     ws.cell(total_row, match_col).alignment = Alignment(horizontal="center", vertical="center")
     _apply_number_formats(ws, qb_headers, data_row, total_row, qb_start,
-                          {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
+                          qb_amount_cols, qb_quantity_cols)
     _apply_number_formats(ws, inf_headers, data_row, total_row, inf_start,
-                          {result.inf_mapping["amount"]}, set())
+                          inf_amount_cols, set())
     _set_widths(ws, qb_start, qb_end, header_row, total_row)
     _set_widths(ws, inf_start, inf_end, header_row, total_row)
     ws.column_dimensions[get_column_letter(match_col)].width = 43
@@ -726,6 +736,36 @@ def _simplify_duplicate_display(frame: pd.DataFrame) -> pd.DataFrame:
     for column in optional_columns:
         simplified[column] = frame[column].values
     return simplified
+
+
+def _write_kpi_band(
+    ws, label_row: int, value_row: int, kpis: list[tuple], end_col: int, start_col: int = 1,
+) -> None:
+    """Render a row of KPI cards packed tightly at the left: each card
+    merges two columns so its label and value keep a fixed, compact width
+    regardless of how wide the data columns beneath happen to be, and
+    cards sit directly against each other with no empty gap column between
+    them -- unlike spacing cards across every-other column of a wide data
+    table, which stretches the band across the full sheet width."""
+    col = start_col
+    for label, value, number_format in kpis:
+        if col + 1 > end_col:
+            break
+        ws.merge_cells(start_row=label_row, start_column=col, end_row=label_row, end_column=col + 1)
+        ws.merge_cells(start_row=value_row, start_column=col, end_row=value_row, end_column=col + 1)
+        ws.cell(label_row, col, label)
+        ws.cell(value_row, col, value)
+        ws.cell(label_row, col).font = Font(name=FONT_NAME, size=9, bold=True, color=SLATE)
+        ws.cell(value_row, col).font = Font(name=FONT_NAME, size=12, bold=True, color=NAVY)
+        ws.cell(label_row, col).alignment = Alignment(horizontal="left", vertical="center")
+        ws.cell(value_row, col).alignment = Alignment(horizontal="left", vertical="center")
+        ws.cell(value_row, col).number_format = number_format
+        ws.cell(value_row, col).protection = Protection(locked=True)
+        for row in (label_row, value_row):
+            for c in (col, col + 1):
+                ws.cell(row, c).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+                ws.cell(row, c).border = _thin_border()
+        col += 2
 
 
 def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
@@ -824,36 +864,24 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     )
 
     kpis = [
-        ("Unresolved rows", f"=IFERROR(ROWS({qb_amount_column_expr}),0)", '#,##0'),
+        ("Unresolved rows", f"=IFERROR(ROWS({qb_amount_column_expr}),0)", ACCOUNTING_COUNT_FORMAT),
         (
             "Gross debits",
             f'=SUMIF({qb_amount_column_expr},">0",{qb_amount_column_expr})',
-            '$#,##0.00;[Red]($#,##0.00);-',
+            ACCOUNTING_CURRENCY_FORMAT,
         ),
         (
             "Credits",
             f'=ABS(SUMIF({qb_amount_column_expr},"<0",{qb_amount_column_expr}))',
-            '$#,##0.00;[Red]($#,##0.00);-',
+            ACCOUNTING_CURRENCY_FORMAT,
         ),
         (
             "Proposed JE support total",
             f"={qb_amount_sum_expr}",
-            '$#,##0.00;[Red]($#,##0.00);-',
+            ACCOUNTING_CURRENCY_FORMAT,
         ),
     ]
-    for idx, (label, value, number_format) in enumerate(kpis):
-        start = 1 + idx * 2
-        if start > end_col:
-            break
-        ws.cell(3, start, label)
-        ws.cell(4, start, value)
-        ws.cell(3, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
-        ws.cell(4, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
-        ws.cell(4, start).number_format = number_format
-        ws.cell(4, start).protection = Protection(locked=True)
-        for row in (3, 4):
-            ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-            ws.cell(row, start).border = _thin_border()
+    _write_kpi_band(ws, 3, 4, kpis, end_col)
 
     # QuickBooks exceptions by fiscal period -- promoted above the detail
     # tables so period-level review (count and net amount per period) never
@@ -896,7 +924,11 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         NAVY,
     )
     _write_dataframe_values(ws, fiscal_summary, fiscal_header_row, 1)
-    _format_header(ws, fiscal_header_row, 1, fiscal_end_col, NAVY)
+    _format_header(
+        ws, fiscal_header_row, 1, fiscal_end_col, NAVY,
+        headers=fiscal_headers, amount_columns={"Net Exception Amount"},
+        quantity_columns={"Exception Count", "Exception Quantity"},
+    )
     if len(fiscal_summary):
         fiscal_last_row = fiscal_data_row + len(fiscal_summary) - 1
         _format_body_block(ws, fiscal_data_row, fiscal_last_row, 1, fiscal_end_col, NAVY_LIGHT)
@@ -932,17 +964,22 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
 
     header_row = fiscal_total_row + 3
     data_row = header_row + 1
+    qb_quantity_header = result.qb_mapping.get("quantity")
     _write_dataframe_values(ws, frame, header_row, 1)
-    _format_header(ws, header_row, 1, end_col, NAVY)
+    _format_header(
+        ws, header_row, 1, end_col, NAVY,
+        headers=headers, amount_columns={result.qb_mapping["amount"]},
+        quantity_columns={qb_quantity_header or ""},
+    )
     if len(frame):
         _format_body_block(ws, data_row, data_row + len(frame) - 1, 1, end_col, NAVY_LIGHT)
         duplicate_qb_rows = _duplicate_source_indexes(result, "QuickBooks")
         for offset, qidx in enumerate(result.unmatched_qb):
             row = data_row + offset
-            ws.cell(row, source_headers.index(result.qb_mapping["amount"]) + 1).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+            ws.cell(row, source_headers.index(result.qb_mapping["amount"]) + 1).number_format = ACCOUNTING_CURRENCY_FORMAT
             ws.cell(row, len(source_headers) + 1).fill = PatternFill("solid", fgColor=AMBER)
             ws.cell(row, len(source_headers) + 1).alignment = Alignment(wrap_text=True, vertical="center")
-            ws.cell(row, len(source_headers) + 2).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+            ws.cell(row, len(source_headers) + 2).number_format = ACCOUNTING_CURRENCY_FORMAT
             if int(qidx) in duplicate_qb_rows:
                 _apply_duplicate_style(ws, row, 1, end_col)
     total_row = data_row + len(frame)
@@ -951,10 +988,9 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         {result.qb_mapping["amount"]: cents_to_float(net)}, headers,
         "PROPOSED JE SUPPORT TOTAL",
     )
-    ws.cell(total_row, amount_col_position).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+    ws.cell(total_row, amount_col_position).number_format = ACCOUNTING_CURRENCY_FORMAT
 
     qb_summed_headers = {result.qb_mapping["amount"]}
-    qb_quantity_header = result.qb_mapping.get("quantity")
     if qb_quantity_header and qb_quantity_header in headers:
         qb_summed_headers.add(qb_quantity_header)
     _add_exception_table(
@@ -993,8 +1029,8 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     # far enough to read as clearly separate from the exception detail,
     # close enough to stay on the same review pass.
     duplicate_kpis = [
-        ("Duplicate QuickBooks items excluded", duplicate_excluded_count, '#,##0'),
-        ("Amount excluded from JE", duplicate_amount_total, '$#,##0.00;[Red]($#,##0.00);-'),
+        ("Duplicate QuickBooks items excluded", duplicate_excluded_count, ACCOUNTING_COUNT_FORMAT),
+        ("Amount excluded from JE", duplicate_amount_total, ACCOUNTING_CURRENCY_FORMAT),
         ("JE inclusion", "Excluded", 'General'),
     ]
     dup_title_row = total_row + 10
@@ -1010,22 +1046,13 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         "QUICKBOOKS DUPLICATES EXCLUDED FROM JE | REVIEW", NAVY,
     )
     _write_caption_band(ws, dup_caption_row, 1, section_end_col, duplicate_caption, NAVY)
-    for idx, (label, value, number_format) in enumerate(duplicate_kpis):
-        start = 1 + idx * 2
-        if start > dup_end_col:
-            break
-        ws.cell(dup_kpi_label_row, start, label)
-        ws.cell(dup_kpi_value_row, start, value)
-        ws.cell(dup_kpi_label_row, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
-        ws.cell(dup_kpi_value_row, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
-        ws.cell(dup_kpi_value_row, start).number_format = number_format
-        ws.cell(dup_kpi_value_row, start).protection = Protection(locked=True)
-        for row in (dup_kpi_label_row, dup_kpi_value_row):
-            ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-            ws.cell(row, start).border = _thin_border()
+    _write_kpi_band(ws, dup_kpi_label_row, dup_kpi_value_row, duplicate_kpis, dup_end_col)
 
     _write_dataframe_values(ws, duplicate_frame, dup_header_row, 1)
-    _format_header(ws, dup_header_row, 1, dup_end_col, NAVY)
+    _format_header(
+        ws, dup_header_row, 1, dup_end_col, NAVY,
+        headers=duplicate_headers, amount_columns={"Amount"},
+    )
     if len(duplicate_frame):
         dup_last_row = dup_data_row + len(duplicate_frame) - 1
         _format_body_block(ws, dup_data_row, dup_last_row, 1, dup_end_col, NAVY_LIGHT)
@@ -1103,26 +1130,17 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     _write_caption_band(ws, review_caption_row, 1, review_section_end_col, review_caption, SLATE)
 
     review_kpis = [
-        ("Items held for review", review_hold_count, '#,##0'),
-        ("Amount excluded from JE", review_hold_amount, '$#,##0.00;[Red]($#,##0.00);-'),
+        ("Items held for review", review_hold_count, ACCOUNTING_COUNT_FORMAT),
+        ("Amount excluded from JE", review_hold_amount, ACCOUNTING_CURRENCY_FORMAT),
         ("JE inclusion", "Excluded pending disposition", 'General'),
     ]
-    for idx, (label, value, number_format) in enumerate(review_kpis):
-        start = 1 + idx * 2
-        if start > review_end_col:
-            break
-        ws.cell(review_kpi_label_row, start, label)
-        ws.cell(review_kpi_value_row, start, value)
-        ws.cell(review_kpi_label_row, start).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
-        ws.cell(review_kpi_value_row, start).font = Font(name="Segoe UI", size=12, bold=True, color=NAVY)
-        ws.cell(review_kpi_value_row, start).number_format = number_format
-        ws.cell(review_kpi_value_row, start).protection = Protection(locked=True)
-        for row in (review_kpi_label_row, review_kpi_value_row):
-            ws.cell(row, start).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-            ws.cell(row, start).border = _thin_border()
+    _write_kpi_band(ws, review_kpi_label_row, review_kpi_value_row, review_kpis, review_end_col)
 
     _write_dataframe_values(ws, review_hold_frame, review_header_row, 1)
-    _format_header(ws, review_header_row, 1, review_end_col, SLATE)
+    _format_header(
+        ws, review_header_row, 1, review_end_col, SLATE,
+        headers=review_headers, amount_columns={"Amount"},
+    )
     if len(review_hold_frame):
         review_last_row = review_data_row + len(review_hold_frame) - 1
         _format_body_block(ws, review_data_row, review_last_row, 1, review_end_col, SLATE_LIGHT)
@@ -1220,11 +1238,14 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws.cell(je_data_row, 5, 0.0)
     ws.cell(je_data_row + 1, 4, 0.0)
     ws.cell(je_data_row + 1, 5, je_amount_formula)
-    _format_header(ws, je_header_row, 1, len(je_headers), SLATE)
+    _format_header(
+        ws, je_header_row, 1, len(je_headers), SLATE,
+        headers=je_headers, amount_columns={"Debit", "Credit"},
+    )
     _format_body_block(ws, je_data_row, je_data_row + len(je_frame) - 1, 1, len(je_headers), SLATE_LIGHT)
     for row in range(je_data_row, je_data_row + len(je_frame)):
-        ws.cell(row, 4).number_format = '$#,##0.00;[Red]($#,##0.00);-'
-        ws.cell(row, 5).number_format = '$#,##0.00;[Red]($#,##0.00);-'
+        ws.cell(row, 4).number_format = ACCOUNTING_CURRENCY_FORMAT
+        ws.cell(row, 5).number_format = ACCOUNTING_CURRENCY_FORMAT
     je_total_row = je_data_row + len(je_frame)
     _write_total_row(
         ws, je_total_row, 1, len(je_headers),
@@ -1668,7 +1689,10 @@ def build_product_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         NAVY,
     )
     _write_dataframe_values(ws, frame.reindex(columns=headers), 3, 1)
-    _format_header(ws, 3, 1, 3, NAVY)
+    _format_header(
+        ws, 3, 1, 3, NAVY,
+        headers=headers, amount_columns={"Product Value"}, quantity_columns={"Product Quantity"},
+    )
     if len(frame):
         _format_body_block(ws, 4, 3 + len(frame), 1, 3, NAVY_LIGHT)
     total_row = 4 + len(frame)
@@ -2007,7 +2031,7 @@ def _search_criteria_formula(search_cell_ref: str, column_range: str) -> str:
 
 def _write_search_input(ws, label: str, label_row: int, input_row: int, start_col: int) -> str:
     ws.cell(label_row, start_col, label)
-    ws.cell(label_row, start_col).font = Font(name="Segoe UI", size=11, bold=True, color=TEXT)
+    ws.cell(label_row, start_col).font = Font(name=FONT_NAME, size=11, bold=True, color=TEXT)
     ws.merge_cells(start_row=label_row, start_column=start_col, end_row=label_row, end_column=start_col + 2)
     input_col = start_col + 3
     input_cell = ws.cell(input_row, input_col, "")
@@ -2016,7 +2040,7 @@ def _write_search_input(ws, label: str, label_row: int, input_row: int, start_co
         cell = ws.cell(input_row, col)
         cell.fill = PatternFill("solid", fgColor=WHITE)
         cell.border = _thin_border()
-        cell.font = Font(name="Segoe UI", size=11, color=TEXT)
+        cell.font = Font(name=FONT_NAME, size=11, color=TEXT)
     ws.row_dimensions[input_row].height = 20
     return f"${get_column_letter(input_col)}${input_row}"
 
@@ -2031,7 +2055,10 @@ def _write_search_panel(
     _write_title_band(ws, panel_header_row, start_col, end_col, panel_title, header_color)
     for offset, header in enumerate(index.columns):
         ws.cell(column_header_row, start_col + offset, header)
-    _format_header(ws, column_header_row, start_col, end_col, header_color)
+    _format_header(
+        ws, column_header_row, start_col, end_col, header_color,
+        headers=list(index.columns), amount_columns={"Amount"},
+    )
 
     if index.empty:
         ws.cell(data_row, start_col, "No rows to search.")
@@ -2207,9 +2234,9 @@ def build_analytics_summary_sheet(wb: Workbook, result: ReconciliationResult) ->
             for c in (col, col + 1):
                 ws.cell(r, c).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
                 ws.cell(r, c).border = _thin_border()
-        ws.cell(row, col).font = Font(name="Segoe UI", size=9, bold=True, color=SLATE)
+        ws.cell(row, col).font = Font(name=FONT_NAME, size=9, bold=True, color=SLATE)
         ws.cell(row + 1, col).font = Font(
-            name="Segoe UI", size=13, bold=True,
+            name=FONT_NAME, size=13, bold=True,
             color=NAVY if value != "FAIL" else "9C0006",
         )
         ws.cell(row + 1, col).number_format = number_format
@@ -2218,15 +2245,15 @@ def build_analytics_summary_sheet(wb: Workbook, result: ReconciliationResult) ->
     posting_status = result.metrics.get("Posting Status", "READY TO POST")
     ws.cell(start, 1, "MODEL STATUS")
     ws.cell(start, 2, result.metrics["Control Status"])
-    ws.cell(start, 1).font = Font(name="Segoe UI", size=11, bold=True, color=WHITE)
+    ws.cell(start, 1).font = Font(name=FONT_NAME, size=11, bold=True, color=WHITE)
     ws.cell(start, 1).fill = PatternFill("solid", fgColor=SLATE)
-    ws.cell(start, 2).font = Font(name="Segoe UI", size=11, bold=True, color=TEXT)
+    ws.cell(start, 2).font = Font(name=FONT_NAME, size=11, bold=True, color=TEXT)
     ws.cell(start, 2).fill = PatternFill("solid", fgColor=GREEN_LIGHT if result.metrics["Control Status"] == "PASS" else RED_LIGHT)
     ws.cell(start, 3, "POSTING STATUS")
     ws.cell(start, 4, posting_status)
-    ws.cell(start, 3).font = Font(name="Segoe UI", size=11, bold=True, color=WHITE)
+    ws.cell(start, 3).font = Font(name=FONT_NAME, size=11, bold=True, color=WHITE)
     ws.cell(start, 3).fill = PatternFill("solid", fgColor=SLATE)
-    ws.cell(start, 4).font = Font(name="Segoe UI", size=11, bold=True, color=TEXT)
+    ws.cell(start, 4).font = Font(name=FONT_NAME, size=11, bold=True, color=TEXT)
     ws.cell(start, 4).fill = PatternFill(
         "solid", fgColor=GREEN_LIGHT if posting_status == "READY TO POST" else AMBER
     )

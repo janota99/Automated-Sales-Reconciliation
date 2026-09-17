@@ -18,9 +18,14 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from config import (
+    ACCOUNTING_COUNT_FORMAT,
+    ACCOUNTING_CURRENCY_FORMAT,
+    ACCOUNTING_QUANTITY_FORMAT,
     BORDER,
     DUPLICATE_RED_FILL,
     DUPLICATE_RED_TEXT,
+    FONT_NAME,
+    FONT_NAME_NUMERIC,
     GOOD_GREEN_FILL,
     GOOD_GREEN_TEXT,
     METHOD_GREY_FILL,
@@ -43,14 +48,14 @@ ALIGN_RIGHT_CENTER = Alignment(horizontal="right", vertical="center")
 ALIGN_CENTER_CENTER = Alignment(horizontal="center", vertical="center")
 ALIGN_WRAP_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-FONT_BODY = Font(name="Segoe UI", size=10, color=TEXT)
-FONT_DUPLICATE = Font(name="Segoe UI", size=10, bold=True, color=DUPLICATE_RED_TEXT)
-FONT_GOOD = Font(name="Segoe UI", size=10, bold=True, color=GOOD_GREEN_TEXT)
-FONT_NEUTRAL = Font(name="Segoe UI", size=10, bold=True, color=NEUTRAL_GOLD_TEXT)
-FONT_METHOD = Font(name="Segoe UI", size=10, bold=True, color=METHOD_GREY_TEXT)
-FONT_TOTAL = Font(name="Segoe UI", size=10, bold=True, color=TEXT)
-FONT_HEADER = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
-FONT_TITLE = Font(name="Segoe UI", size=12, bold=True, color=WHITE)
+FONT_BODY = Font(name=FONT_NAME, size=10, color=TEXT)
+FONT_DUPLICATE = Font(name=FONT_NAME, size=10, bold=True, color=DUPLICATE_RED_TEXT)
+FONT_GOOD = Font(name=FONT_NAME, size=10, bold=True, color=GOOD_GREEN_TEXT)
+FONT_NEUTRAL = Font(name=FONT_NAME, size=10, bold=True, color=NEUTRAL_GOLD_TEXT)
+FONT_METHOD = Font(name=FONT_NAME, size=10, bold=True, color=METHOD_GREY_TEXT)
+FONT_TOTAL = Font(name=FONT_NAME, size=10, bold=True, color=TEXT)
+FONT_HEADER = Font(name=FONT_NAME, size=10, bold=True, color=WHITE)
+FONT_TITLE = Font(name=FONT_NAME, size=12, bold=True, color=WHITE)
 
 FILL_DUPLICATE = PatternFill("solid", fgColor=DUPLICATE_RED_FILL)
 FILL_GOOD = PatternFill("solid", fgColor=GOOD_GREEN_FILL)
@@ -83,17 +88,99 @@ def _total_border() -> Border:
     return BORDER_TOTAL
 
 
-def _format_header(ws, row: int, start_col: int, end_col: int, color: str) -> None:
-    # Instantiate custom fills and borders once per block, not once per cell
+_MONOSPACE_EXACT_HEADERS = {
+    "PO", "PO NUMBER", "PO#", "PO #", "P.O.", "P.O. NUMBER", "P.O NUMBER",
+}
+
+ALIGN_WRAP_RIGHT = Alignment(horizontal="right", vertical="center", wrap_text=True)
+ALIGN_WRAP_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def _infer_column_style(
+    header: str,
+    amount_columns: frozenset = frozenset(),
+    quantity_columns: frozenset = frozenset(),
+) -> tuple:
+    """Classify a column from its header text -- or explicit membership in
+    amount_columns/quantity_columns, which name the real mapped field so
+    this still works when a header doesn't textually resemble its meaning
+    (e.g. Infinium's amount field is literally "OHTOTA"). Returns
+    (alignment, number_format, is_numeric_dense); is_numeric_dense also
+    covers text-typed high-density number columns (invoice/PO numbers)
+    that get no numeric format of their own but still read better in a
+    monospaced/tabular font. Shared by _apply_number_formats (the data
+    cells) and _format_header (so the header lines up with its data).
+    """
+    header_upper = str(header).upper()
+    if any(term in header_upper for term in ("VALID", "GROUP-LEVEL", "AUTOMATIC")):
+        return ALIGN_CENTER_CENTER, None, False
+    if any(term in header_upper for term in ("PERCENT", "RATE", "SHARE")):
+        return ALIGN_RIGHT_CENTER, "0.0%", True
+    if any(term in header_upper for term in ("COUNT", "ROWS", "CANDIDATE COUNT")):
+        return ALIGN_RIGHT_CENTER, ACCOUNTING_COUNT_FORMAT, True
+    if header in amount_columns or any(
+        term in header_upper
+        for term in ("AMOUNT", "VALUE", "VARIANCE", "DIFFERENCE", "BALANCE", "EXPOSURE", "TOLERANCE")
+    ):
+        return ALIGN_RIGHT_CENTER, ACCOUNTING_CURRENCY_FORMAT, True
+    if header in quantity_columns or any(term in header_upper for term in ("QUANTITY", "QTY")):
+        return ALIGN_RIGHT_CENTER, ACCOUNTING_QUANTITY_FORMAT, True
+    if "DATE" in header_upper or "TIMESTAMP" in header_upper:
+        return ALIGN_CENTER_CENTER, "yyyy-mm-dd", False
+    if "INVOICE" in header_upper or header_upper in _MONOSPACE_EXACT_HEADERS:
+        return None, None, True
+    return None, None, False
+
+
+def _numeric_font(cell) -> Font:
+    """The cell's current font, swapped to the monospaced numeric face --
+    every digit the same width, so a column of invoice numbers or amounts
+    lines up for scanning -- while keeping its size/bold/color/underline."""
+    current = cell.font
+    return Font(
+        name=FONT_NAME_NUMERIC,
+        size=current.size,
+        bold=current.bold,
+        italic=current.italic,
+        color=current.color,
+        underline=current.underline,
+    )
+
+
+def _format_header(
+    ws,
+    row: int,
+    start_col: int,
+    end_col: int,
+    color: str,
+    headers: list = None,
+    amount_columns: frozenset = frozenset(),
+    quantity_columns: frozenset = frozenset(),
+) -> None:
+    """Paint a header band. Pass `headers` (left-to-right, matching the
+    column range) to align each header with its own column's data --
+    right over a right-aligned numeric column, centered over a centered
+    one, left (wrapped) otherwise -- rather than every header defaulting
+    to left, which reads oddly sitting over right-aligned figures. Without
+    `headers`, every column in the range is left-aligned and wrapped as
+    before.
+    """
     header_fill = PatternFill("solid", fgColor=color)
     header_border = Border(bottom=Side(style="medium", color=color))
-    
-    for col in range(start_col, end_col + 1):
+
+    for offset, col in enumerate(range(start_col, end_col + 1)):
         cell = ws.cell(row, col)
         cell.fill = header_fill
         cell.font = FONT_HEADER
-        cell.alignment = ALIGN_WRAP_LEFT
         cell.border = header_border
+        alignment = ALIGN_WRAP_LEFT
+        if headers is not None and offset < len(headers):
+            inferred_align, _, _ = _infer_column_style(headers[offset], amount_columns, quantity_columns)
+            if inferred_align is ALIGN_RIGHT_CENTER:
+                alignment = ALIGN_WRAP_RIGHT
+            elif inferred_align is ALIGN_CENTER_CENTER:
+                alignment = ALIGN_WRAP_CENTER
+        cell.alignment = alignment
     ws.row_dimensions[row].height = 34
 
 
@@ -175,38 +262,19 @@ def _apply_number_formats(
 ) -> None:
     for offset, header in enumerate(headers):
         col = start_col + offset
-        header_upper = str(header).upper()
-        
-        # Determine the target alignment and format string for the entire column first
-        target_align = None
-        target_format = None
-        
-        if any(term in header_upper for term in ("VALID", "GROUP-LEVEL", "AUTOMATIC")):
-            target_align = ALIGN_CENTER_CENTER
-        elif any(term in header_upper for term in ("PERCENT", "RATE", "SHARE")):
-            target_format = "0.0%"
-            target_align = ALIGN_RIGHT_CENTER
-        elif any(term in header_upper for term in ("COUNT", "ROWS", "CANDIDATE COUNT")):
-            target_format = '#,##0;[Red](#,##0);-'
-            target_align = ALIGN_RIGHT_CENTER
-        elif header in amount_columns or any(term in header_upper for term in ("AMOUNT", "VALUE", "VARIANCE", "DIFFERENCE", "BALANCE", "EXPOSURE", "TOLERANCE")):
-            target_format = '$#,##0.00;[Red]($#,##0.00);-'
-            target_align = ALIGN_RIGHT_CENTER
-        elif header in quantity_columns or any(term in header_upper for term in ("QUANTITY", "QTY", "COUNT", "ROWS")):
-            target_format = '#,##0.00;[Red](#,##0.00);-'
-            target_align = ALIGN_RIGHT_CENTER
-        elif "DATE" in header_upper or "TIMESTAMP" in header_upper:
-            target_format = "yyyy-mm-dd"
-            target_align = ALIGN_CENTER_CENTER
-            
-        # Apply only if a rule matched
-        if target_align or target_format:
-            for row in range(start_row, end_row + 1):
-                cell = ws.cell(row, col)
-                if target_align:
-                    cell.alignment = target_align
-                if target_format:
-                    cell.number_format = target_format
+        target_align, target_format, is_numeric_dense = _infer_column_style(
+            header, amount_columns, quantity_columns,
+        )
+        if not (target_align or target_format or is_numeric_dense):
+            continue
+        for row in range(start_row, end_row + 1):
+            cell = ws.cell(row, col)
+            if target_align:
+                cell.alignment = target_align
+            if target_format:
+                cell.number_format = target_format
+            if is_numeric_dense:
+                cell.font = _numeric_font(cell)
 
 
 def _set_widths(
@@ -240,7 +308,7 @@ def _standardize_column_widths(
 def _autofit_workbook_columns(
     wb: Workbook,
     minimum: float = 10,
-    maximum: float = 52,
+    maximum: float = 38,
     sample_rows: int = 750,
     skip_titles: frozenset = frozenset(),
 ) -> None:
@@ -351,8 +419,13 @@ def _write_total_row(
     for offset, header in enumerate(headers):
         if header in totals:
             cell = ws.cell(row, start_col + offset, totals[header])
-            cell.number_format = '$#,##0.00;[Red]($#,##0.00);-' if "amount" in header.lower() or "value" in header.lower() else '#,##0.00;[Red](#,##0.00);-'
+            cell.number_format = (
+                ACCOUNTING_CURRENCY_FORMAT
+                if "amount" in header.lower() or "value" in header.lower()
+                else ACCOUNTING_QUANTITY_FORMAT
+            )
             cell.alignment = ALIGN_RIGHT_CENTER
+            cell.font = _numeric_font(cell)
     ws.row_dimensions[row].height = 23
 
 
