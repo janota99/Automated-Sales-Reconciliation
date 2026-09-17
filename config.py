@@ -55,7 +55,8 @@ FONT_NAME_NUMERIC = "Consolas"
 # lone "-" (not "$0.00") marks a zero. Negatives still render in red,
 # consistent with the rest of the workbook's number formats.
 ACCOUNTING_CURRENCY_FORMAT = '_($* #,##0.00_);[Red]_($* (#,##0.00);_($* "-"??_);_(@_)'
-# Same alignment behavior, without the currency symbol, for quantity/count
-# columns that should still line up decimal-for-decimal.
-ACCOUNTING_QUANTITY_FORMAT = '_(* #,##0.00_);[Red]_(* (#,##0.00);_(* "-"??_);_(@_)'
+# Same alignment behavior, without the currency symbol, for quantity
+# columns -- whole numbers only (a quantity of units sold has no
+# fractional part), still comma-separated and accounting-aligned.
+ACCOUNTING_QUANTITY_FORMAT = '_(* #,##0_);[Red]_(* (#,##0);_(* "-"??_);_(@_)'
 ACCOUNTING_COUNT_FORMAT = '_(* #,##0_);[Red]_(* (#,##0);_(* "-"??_);_(@_)'
