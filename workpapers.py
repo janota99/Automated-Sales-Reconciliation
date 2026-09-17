@@ -741,6 +741,58 @@ def _simplify_duplicate_display(frame: pd.DataFrame) -> pd.DataFrame:
     return simplified
 
 
+_AMOUNT_VARIANCE_WHAT_MATCHED = {
+    "High-likelihood amount variance": "Same PO and Invoice",
+    "Critical possible sign reversal": "Same PO and Invoice",
+    "Strong invoice-linked amount variance": "Same Invoice only",
+    "PO-linked amount variance": "Same PO only",
+}
+
+
+def _amount_variance_reason(row: dict) -> str:
+    if row.get("Possible Sign Reversal"):
+        return (
+            "Same magnitude, opposite sign -- check whether one system recorded this "
+            "as a credit and the other as a debit before treating it as a plain typo."
+        )
+    return (
+        "References agree but the dollar amount does not -- most likely a data-entry "
+        "error on one side. Verify against source documents; do not accrue either "
+        "amount until it's resolved."
+    )
+
+
+def _simplify_amount_variance_display(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce an amount_variance_analysis-shaped frame (see
+    build_reference_amount_variances in matching.py) to a small, plain-
+    English view for the "Unresolved Exceptions" sheet -- the full
+    technical schema (Reference Evidence, Mutually Unique Reference,
+    Posting Disposition, etc.) stays intact on result.amount_variance_analysis
+    for the Analytics workbook and validate_reconciliation."""
+    columns = [
+        "Variance ID", "QuickBooks Row ID", "Infinium Row ID", "What Matched",
+        "QuickBooks Amount", "Infinium Amount", "Difference", "Likely Cause", "Reviewer Note",
+    ]
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    records = frame.to_dict("records")
+    simplified = pd.DataFrame({
+        "Variance ID": frame["Variance ID"].values,
+        "QuickBooks Row ID": frame["QuickBooks Row ID"].values,
+        "Infinium Row ID": frame["Infinium Row ID"].values,
+        "What Matched": [
+            _AMOUNT_VARIANCE_WHAT_MATCHED.get(row.get("Classification"), "Reference agreement")
+            for row in records
+        ],
+        "QuickBooks Amount": frame["QuickBooks Amount"].values,
+        "Infinium Amount": frame["Infinium Amount"].values,
+        "Difference": frame["Potential Difference"].values,
+        "Likely Cause": [_amount_variance_reason(row) for row in records],
+    })
+    simplified["Reviewer Note"] = ""
+    return simplified
+
+
 def _write_kpi_band(
     ws, label_row: int, value_row: int, kpis: list[tuple], end_col: int, start_col: int = 1,
 ) -> None:
@@ -778,6 +830,7 @@ _STATUS_COLOR_LEGEND: list[tuple] = [
     (DUPLICATE_RED_FILL, DUPLICATE_RED_TEXT, "Confirmed duplicate - excluded from JE"),
     (RED_LIGHT, None, "Prior-period urgent exception / control fail"),
     (AMBER, None, "Pending review / routine prior-period exception"),
+    (ORANGE, None, "Reference matches, amount differs - likely data entry error"),
     (GREEN_LIGHT, None, "Current period / control pass"),
 ]
 
@@ -865,6 +918,20 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     review_end_col = len(review_headers)
     review_hold_count = result.metrics["Duplicate Review Hold QuickBooks Rows"]
     review_hold_amount = result.metrics["Duplicate Review Hold QuickBooks Amount"]
+
+    # Reference-matched amount variances (see build_reference_amount_variances
+    # in matching.py): a QuickBooks row and an Infinium row are the only
+    # mutually unique candidate for each other on a shared PO and/or invoice,
+    # but their signed amounts disagree. Both rows are already withheld from
+    # their ordinary unresolved populations upstream -- this section is where
+    # that withholding becomes visible to a reviewer instead of the rows
+    # simply vanishing from the exceptions list.
+    variance_frame = _simplify_amount_variance_display(result.amount_variance_analysis)
+    variance_headers = list(variance_frame.columns)
+    variance_end_col = len(variance_headers)
+    variance_count = result.metrics["Reference-Matched Amount Variance Rows"]
+    variance_qb_amount = result.metrics["Amount Variance Review Hold QuickBooks Amount"]
+    variance_inf_amount = result.metrics["Amount Variance Review Hold Infinium Amount"]
 
     unmatched_qb_amounts = result.qb_work.loc[result.unmatched_qb, AMOUNT_CENTS].tolist()
     amounts = [cents_or_zero(val) for val in unmatched_qb_amounts]
@@ -1075,7 +1142,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     dup_kpi_value_row = dup_title_row + 3
     dup_header_row = dup_title_row + 5
     dup_data_row = dup_header_row + 1
-    section_end_col = max(end_col, dup_end_col, review_end_col)
+    section_end_col = max(end_col, dup_end_col, review_end_col, variance_end_col)
 
     _write_title_band(
         ws, dup_title_row, 1, section_end_col,
@@ -1228,7 +1295,95 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
             for row in range(review_data_row, review_last_row + 1):
                 ws.cell(row, disposition_col).protection = Protection(locked=False)
 
-    je_title_row = review_last_row + 3
+    # Reference-Matched Amount Variance: a QuickBooks row and an Infinium
+    # row are each other's only mutually unique candidate on a shared PO
+    # and/or invoice, but the signed amounts disagree. Neither side's
+    # amount is accrued or posted -- the likely explanation is a data-entry
+    # error on one system, not a real unresolved transaction.
+    variance_title_row = review_last_row + 3
+    variance_caption_row = variance_title_row + 1
+    variance_kpi_label_row = variance_title_row + 2
+    variance_kpi_value_row = variance_title_row + 3
+    variance_header_row = variance_title_row + 5
+    variance_data_row = variance_header_row + 1
+    variance_section_end_col = section_end_col
+
+    variance_caption = (
+        f"{variance_count:,} row(s) share a PO and/or invoice with exactly one unresolved "
+        "Infinium row, but the dollar amounts don't agree. Both sides are withheld from their "
+        "ordinary exception/accrual populations above rather than being posted at either amount -- "
+        "this is very likely a data-entry error on one system, not a genuine open transaction. "
+        "Verify against source documents and correct the source record; nothing here should be "
+        "added to the JE as-is."
+        if variance_count
+        else "No reference-matched amount variances were identified."
+    )
+    _write_title_band(
+        ws, variance_title_row, 1, variance_section_end_col,
+        "REFERENCE-MATCHED AMOUNT VARIANCE | LIKELY DATA ENTRY ERROR - NOT ACCRUED", SLATE,
+    )
+    _write_caption_band(ws, variance_caption_row, 1, variance_section_end_col, variance_caption, SLATE)
+
+    variance_kpis = [
+        ("Items requiring review", variance_count, ACCOUNTING_COUNT_FORMAT),
+        ("QuickBooks amount withheld", variance_qb_amount, ACCOUNTING_CURRENCY_FORMAT),
+        ("Infinium amount withheld", variance_inf_amount, ACCOUNTING_CURRENCY_FORMAT),
+        ("JE inclusion", "Excluded - not accrued", 'General'),
+    ]
+    _write_kpi_band(ws, variance_kpi_label_row, variance_kpi_value_row, variance_kpis, variance_end_col)
+
+    _write_dataframe_values(ws, variance_frame, variance_header_row, 1)
+    _format_header(
+        ws, variance_header_row, 1, variance_end_col, SLATE,
+        headers=variance_headers, amount_columns={"QuickBooks Amount", "Infinium Amount", "Difference"},
+    )
+    if len(variance_frame):
+        variance_last_row = variance_data_row + len(variance_frame) - 1
+        _format_body_block(ws, variance_data_row, variance_last_row, 1, variance_end_col, SLATE_LIGHT)
+        _apply_number_formats(
+            ws, variance_headers, variance_data_row, variance_last_row, 1,
+            {"QuickBooks Amount", "Infinium Amount", "Difference"}, set(),
+        )
+        # Orange, distinct from the duplicate-red and review-amber styles
+        # used elsewhere on this sheet: this isn't a duplicate and isn't
+        # merely pending review -- it's a likely data-quality error.
+        for row in range(variance_data_row, variance_last_row + 1):
+            for col in range(1, variance_end_col + 1):
+                ws.cell(row, col).fill = PatternFill("solid", fgColor=ORANGE)
+        # Row ID links straight to where each row was originally listed on
+        # Reconciled Data, same as the duplicates/review-hold sections above.
+        variance_qb_col = variance_headers.index("QuickBooks Row ID") + 1
+        for offset, qb_id in enumerate(variance_frame["QuickBooks Row ID"]):
+            _apply_row_id_hyperlink(
+                ws, variance_data_row + offset, variance_qb_col, qb_id_row_map.get(str(qb_id)),
+            )
+        if "Reviewer Note" in variance_headers:
+            variance_note_col = variance_headers.index("Reviewer Note") + 1
+            for row in range(variance_data_row, variance_last_row + 1):
+                ws.cell(row, variance_note_col).protection = Protection(locked=False)
+    else:
+        variance_last_row = variance_header_row
+
+    _set_widths(ws, 1, variance_end_col, variance_header_row, variance_last_row)
+    if "Likely Cause" in variance_headers:
+        ws.column_dimensions[
+            get_column_letter(variance_headers.index("Likely Cause") + 1)
+        ].width = 52
+    if "Reviewer Note" in variance_headers:
+        variance_note_letter = get_column_letter(variance_headers.index("Reviewer Note") + 1)
+        ws.column_dimensions[variance_note_letter].width = 36
+        if len(variance_frame):
+            variance_validation = DataValidation(
+                type="textLength", operator="lessThanOrEqual", formula1="1000", allow_blank=True
+            )
+            variance_validation.error = "Reviewer notes are limited to 1,000 characters."
+            variance_validation.errorTitle = "Note too long"
+            ws.add_data_validation(variance_validation)
+            variance_validation.add(
+                f"{variance_note_letter}{variance_data_row}:{variance_note_letter}{variance_last_row}"
+            )
+
+    je_title_row = variance_last_row + 3
     je_caption_row = je_title_row + 1
     je_header_row = je_title_row + 2
     je_data_row = je_header_row + 1

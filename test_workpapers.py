@@ -387,6 +387,43 @@ def test_unresolved_sheet_has_a_status_color_legend(qb_mapping, inf_mapping, mak
     assert any("urgent" in text.lower() for text in legend_texts)
 
 
+def test_reference_matched_amount_variance_is_excluded_from_accrual_and_shown_separately(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """A QuickBooks row and an Infinium row that are each other's only
+    candidate on a shared PO/invoice, but disagree on amount, must never be
+    posted at either amount: not counted as an ordinary unresolved
+    QuickBooks exception (and therefore never accrued), but still visible
+    to a reviewer in a dedicated "likely data entry error" section rather
+    than silently disappearing from the workpaper."""
+    qb_rows = [
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 100.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 90.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.unmatched_qb == []
+    assert len(result.amount_variance_analysis) == 1
+    assert result.metrics["Reference-Matched Amount Variance Rows"] == 1
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+
+    workbook_bytes = build_primary_workbook(result)
+    ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
+    sheet_text = _worksheet_text(ws)
+
+    assert any("REFERENCE-MATCHED AMOUNT VARIANCE" in text for text in sheet_text)
+    assert any(text == "QB-1" for text in sheet_text)
+    assert any(text == "INF-1" for text in sheet_text)
+    assert any(isinstance(v, (int, float)) and v == 100.0 for v in [c.value for row in ws.iter_rows() for c in row])
+    assert any(isinstance(v, (int, float)) and v == 90.0 for v in [c.value for row in ws.iter_rows() for c in row])
+    # It must not also appear as an ordinary exception row/PROPOSED JE total contributor.
+    assert not any(text == "Unmatched QuickBooks" for text in sheet_text)
+
+
 def test_duplicates_and_je_sit_ten_rows_below_the_exceptions_total(
     qb_mapping, inf_mapping, make_metadata,
 ):
