@@ -323,6 +323,11 @@ def test_data_search_sheet_is_first_and_live_searchable(qb_mapping, inf_mapping,
     qb_formula = ws.cell(9, 1).value
     assert isinstance(qb_formula, str) and qb_formula.startswith("=")
     assert "FILTER(" in qb_formula
+    # FILTER is a post-2016 dynamic-array "future function" -- Excel always
+    # stores it internally with an _xlfn. prefix, and a file written without
+    # that prefix (openpyxl's default) is exactly what triggers Excel's "we
+    # found a problem with some content" repair prompt on open.
+    assert "_xlfn.FILTER(" in qb_formula
     assert "Data Search QB Source" in qb_formula
     assert "SEARCH(" in qb_formula and "ISNUMBER(" in qb_formula
     # No stray unbalanced parens -- a direct regression guard for the class

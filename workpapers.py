@@ -2534,7 +2534,12 @@ def _write_search_panel(
     formula = (
         f'=IF(AND({po_cell_ref}="",{invoice_cell_ref}=""),'
         f'"Type a PO or Invoice # above to search",'
-        f'FILTER({data_range},{criteria},"No matching items found"))'
+        # FILTER is a post-2016 "future function" -- Excel itself always
+        # stores these internally with an _xlfn. prefix, and a file written
+        # without it (as openpyxl does by default) reads as a malformed
+        # formula, which is exactly what triggers Excel's "we found a
+        # problem with some content" repair prompt on open.
+        f'_xlfn.FILTER({data_range},{criteria},"No matching items found"))'
     )
     ws.cell(data_row, start_col, formula)
     _set_widths(ws, start_col, end_col, panel_header_row, data_row)
