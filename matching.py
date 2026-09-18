@@ -53,14 +53,18 @@ from vendor_aliases import (
 )
 
 __all__ = [
+    "AMBIGUOUS_DUPLICATE_COLUMNS",
     "AMOUNT_CENTS",
     "AMOUNT_VARIANCE_COLUMNS",
     "APP_VERSION",
     "INF_ID",
     "MATCHING_RULE_VERSION",
+    "PO_REUSE_ERROR_COLUMNS",
     "QB_ID",
     "ReconciliationResult",
+    "build_ambiguous_duplicate_candidates",
     "build_fiscal_exception_summary",
+    "build_po_reuse_errors",
     "build_reference_amount_variances",
     "build_reconciliation",
     "cents_or_zero",
@@ -72,6 +76,7 @@ __all__ = [
     "numeric_sum",
     "parse_amount_cents",
     "parse_fiscal_period",
+    "po_reuse_error_qb_index_map",
     "valid_cents",
 ]
 
@@ -201,6 +206,9 @@ class ReconciliationResult:
     duplicate_review_hold_inf_rows: list[int] = field(default_factory=list)
     amount_variance_review_hold_qb_rows: list[int] = field(default_factory=list)
     amount_variance_review_hold_inf_rows: list[int] = field(default_factory=list)
+    ambiguous_duplicate_analysis: pd.DataFrame = field(default_factory=pd.DataFrame)
+    ambiguous_duplicate_qb_rows: list[int] = field(default_factory=list)
+    po_reuse_errors: pd.DataFrame = field(default_factory=pd.DataFrame)
     fuzzy_match_review_hold_analysis: pd.DataFrame = field(default_factory=pd.DataFrame)
     fuzzy_match_review_hold_qb_rows: list[int] = field(default_factory=list)
     fuzzy_match_review_hold_inf_rows: list[int] = field(default_factory=list)
@@ -998,6 +1006,204 @@ def build_reference_amount_variances(
     )
 
 
+AMBIGUOUS_DUPLICATE_COLUMNS = [
+    "Ambiguous ID", "Classification", "Confidence",
+    "QuickBooks Row ID", "QuickBooks Row Index", "Normalized PO", "Normalized Invoice",
+    "QuickBooks Amount", "Candidate Count", "Candidate Infinium Row IDs",
+    "Candidate Infinium Amounts", "Accrual Treatment", "Posting Disposition",
+    "Explanation", "Manual Decision", "Reviewed By", "Review Timestamp", "Review Rationale",
+]
+
+
+def build_ambiguous_duplicate_candidates(
+    qb: pd.DataFrame,
+    inf: pd.DataFrame,
+    unmatched_qb: list[int],
+    unmatched_inf: list[int],
+) -> tuple[pd.DataFrame, list[int]]:
+    """Identify unresolved QuickBooks rows whose normalized PO and/or
+    invoice is shared by more than one still-unresolved Infinium row.
+
+    This runs after build_reference_amount_variances, against whatever
+    remains unresolved on both sides: a row already paired off there (a
+    clean, mutually unique 1:1 reference relationship) never reaches here.
+    What's left with 2+ textual candidates has no single Infinium row it
+    can be tied to at all -- the correct correspondence can't be
+    determined from the reference fields alone, so rather than posting the
+    QuickBooks amount as an ordinary exception, the row is withheld from
+    accrual and itemized here as an ambiguous duplicate pending manual
+    research, distinct from both a confirmed (same-side) duplicate and a
+    reference-matched amount variance.
+    """
+    q_indexes = sorted(set(int(idx) for idx in unmatched_qb))
+    i_indexes = sorted(set(int(idx) for idx in unmatched_inf))
+    if not q_indexes or not i_indexes:
+        return pd.DataFrame(columns=AMBIGUOUS_DUPLICATE_COLUMNS), []
+
+    po_groups: dict[str, list[int]] = defaultdict(list)
+    inv_groups: dict[str, list[int]] = defaultdict(list)
+    for iidx in sorted(i_indexes, key=lambda row: inf.at[row, SOURCE_POS]):
+        po = inf.at[iidx, NORM_PO]
+        if po:
+            po_groups[po].append(iidx)
+        invoice = inf.at[iidx, NORM_INV]
+        if invoice:
+            inv_groups[invoice].append(iidx)
+
+    records: list[dict[str, Any]] = []
+    held_q: list[int] = []
+    for qidx in q_indexes:
+        q_po = qb.at[qidx, NORM_PO]
+        q_inv = qb.at[qidx, NORM_INV]
+        candidate_indexes: set[int] = set(po_groups.get(q_po, [])) if q_po else set()
+        if q_inv:
+            candidate_indexes.update(inv_groups.get(q_inv, []))
+        if len(candidate_indexes) < 2:
+            continue
+        candidate_list = sorted(candidate_indexes, key=lambda row: inf.at[row, SOURCE_POS])
+        q_amount = qb.at[qidx, AMOUNT_CENTS]
+        records.append({
+            "Ambiguous ID": f"AMBIG-{len(records) + 1:06d}",
+            "Classification": "Ambiguous Duplicate - Multiple Candidates",
+            "Confidence": "Review",
+            "QuickBooks Row ID": qb.at[qidx, QB_ID],
+            "QuickBooks Row Index": qidx,
+            "Normalized PO": q_po,
+            "Normalized Invoice": q_inv,
+            "QuickBooks Amount": cents_to_float(q_amount) if valid_cents(q_amount) else None,
+            "Candidate Count": len(candidate_list),
+            "Candidate Infinium Row IDs": "; ".join(str(inf.at[iidx, INF_ID]) for iidx in candidate_list),
+            "Candidate Infinium Amounts": "; ".join(
+                f"{cents_to_float(inf.at[iidx, AMOUNT_CENTS]):,.2f}"
+                if valid_cents(inf.at[iidx, AMOUNT_CENTS]) else "invalid/missing"
+                for iidx in candidate_list
+            ),
+            "Accrual Treatment": (
+                "Excluded from automatic JE; the correct Infinium correspondence cannot "
+                "be determined from the reference fields alone"
+            ),
+            "Posting Disposition": "REVIEW REQUIRED - DO NOT POST",
+            "Explanation": (
+                f"{len(candidate_list)} unresolved Infinium rows share this row's normalized PO "
+                "and/or invoice. The program will not guess which one, if any, corresponds to "
+                "this QuickBooks row."
+            ),
+            "Manual Decision": None,
+            "Reviewed By": None,
+            "Review Timestamp": None,
+            "Review Rationale": None,
+        })
+        held_q.append(qidx)
+
+    return pd.DataFrame(records, columns=AMBIGUOUS_DUPLICATE_COLUMNS), sorted(held_q)
+
+
+PO_REUSE_ERROR_COLUMNS = [
+    "PO Reuse ID", "Normalized PO", "QuickBooks Total", "Infinium Total",
+    "Difference", "QuickBooks Row Count", "Infinium Row Count",
+    "QuickBooks Row IDs", "QuickBooks Row Indexes",
+    "Infinium Row IDs", "Infinium Row Indexes",
+    "Explanation",
+]
+
+
+def build_po_reuse_errors(
+    qb: pd.DataFrame,
+    inf: pd.DataFrame,
+    unmatched_qb: list[int],
+    unmatched_inf: list[int],
+) -> pd.DataFrame:
+    """Identify a normalized PO reused across 2+ rows in the remaining
+    unresolved QuickBooks pool whose grouped total does not tie exactly to
+    the grouped Infinium total for the same PO among the rows still
+    unresolved there.
+
+    This is a classification and reporting pass, not a matching pass: a PO
+    whose grouped totals DO tie exactly was already accepted as a real
+    match by the grouped-aggregate pass in perform_matching (see
+    _group_candidates) and never reaches here unresolved. Rows flagged
+    here are NOT removed from unmatched_qb -- unlike a duplicate, an
+    amount variance, or an ambiguous-candidate row, a PO Re-use Error stays
+    in the ordinary QuickBooks accrual population; this function only
+    gives it its own traceable classification and grouped detail instead
+    of leaving it as several undifferentiated individual exceptions.
+
+    Zero tolerance is applied (a difference of even one cent is flagged),
+    consistent with this application's established "no tolerance" amount
+    policy (see the Amount Variance rule in build_rules_and_config).
+    """
+    q_indexes = sorted(set(int(idx) for idx in unmatched_qb))
+    i_indexes = sorted(set(int(idx) for idx in unmatched_inf))
+    if not q_indexes:
+        return pd.DataFrame(columns=PO_REUSE_ERROR_COLUMNS)
+
+    q_po_groups: dict[str, list[int]] = defaultdict(list)
+    for idx in sorted(q_indexes, key=lambda row: qb.at[row, SOURCE_POS]):
+        po = qb.at[idx, NORM_PO]
+        if po:
+            q_po_groups[po].append(idx)
+
+    i_po_groups: dict[str, list[int]] = defaultdict(list)
+    for idx in sorted(i_indexes, key=lambda row: inf.at[row, SOURCE_POS]):
+        po = inf.at[idx, NORM_PO]
+        if po:
+            i_po_groups[po].append(idx)
+
+    records: list[dict[str, Any]] = []
+    for po, q_rows in q_po_groups.items():
+        if len(q_rows) < 2:
+            continue
+        if any(not valid_cents(qb.at[idx, AMOUNT_CENTS]) for idx in q_rows):
+            # An invalid/missing amount already has its own dedicated
+            # classification; a grouped total built partly from a missing
+            # value would be misleading, not a real re-use error.
+            continue
+        q_total = sum(int(qb.at[idx, AMOUNT_CENTS]) for idx in q_rows)
+        i_rows = [idx for idx in i_po_groups.get(po, []) if valid_cents(inf.at[idx, AMOUNT_CENTS])]
+        i_total = sum(int(inf.at[idx, AMOUNT_CENTS]) for idx in i_rows)
+        difference = q_total - i_total
+        if difference == 0:
+            # Grouped totals agree exactly -- preserve whatever resolution
+            # or review treatment already applies; this is not an error.
+            continue
+        records.append({
+            "PO Reuse ID": f"POREUSE-{len(records) + 1:06d}",
+            "Normalized PO": po,
+            "QuickBooks Total": cents_to_float(q_total),
+            "Infinium Total": cents_to_float(i_total),
+            "Difference": cents_to_float(difference),
+            "QuickBooks Row Count": len(q_rows),
+            "Infinium Row Count": len(i_rows),
+            "QuickBooks Row IDs": "; ".join(qb.at[idx, QB_ID] for idx in q_rows),
+            "QuickBooks Row Indexes": "; ".join(str(idx) for idx in q_rows),
+            "Infinium Row IDs": "; ".join(inf.at[idx, INF_ID] for idx in i_rows) if i_rows else "(none)",
+            "Infinium Row Indexes": "; ".join(str(idx) for idx in i_rows),
+            "Explanation": (
+                f"PO {po} appears {len(q_rows)} times in the unresolved QuickBooks pool with a "
+                f"grouped total of {cents_to_float(q_total)}. The corresponding Infinium total for "
+                f"this PO among unresolved Infinium rows is {cents_to_float(i_total)} -- a difference "
+                f"of {cents_to_float(difference)}. No tolerance is applied. These rows remain in the "
+                "QuickBooks accrual pending investigation."
+            ),
+        })
+    return pd.DataFrame(records, columns=PO_REUSE_ERROR_COLUMNS)
+
+
+def po_reuse_error_qb_index_map(po_reuse_errors: pd.DataFrame) -> dict[int, str]:
+    """Explode the grouped PO Re-use Error report into a per-QuickBooks-row
+    lookup (row index -> PO Reuse ID), for row-level Exception Cause/Status
+    labeling in build_paired_rows and the Unresolved Exceptions worksheet."""
+    mapping: dict[int, str] = {}
+    if po_reuse_errors.empty:
+        return mapping
+    for record in po_reuse_errors.to_dict("records"):
+        for token in str(record["QuickBooks Row Indexes"]).split(";"):
+            token = token.strip()
+            if token:
+                mapping[int(token)] = str(record["PO Reuse ID"])
+    return mapping
+
+
 FUZZY_MATCH_REVIEW_COLUMNS = [
     "Fuzzy Match ID", "Classification", "Confidence", "Match Basis",
     "QuickBooks Row IDs", "QuickBooks Row Indexes", "Infinium Row IDs",
@@ -1263,6 +1469,8 @@ def build_paired_rows(
     duplicate_review_hold_qb_rows: list[int],
     duplicate_review_hold_inf_rows: list[int],
     amount_variance_analysis: pd.DataFrame,
+    ambiguous_duplicate_analysis: pd.DataFrame,
+    po_reuse_errors: pd.DataFrame,
     fuzzy_review_hold_groups: list[MatchGroup],
     qb_duplicate_report: Optional[pd.DataFrame] = None,
     inf_duplicate_report: Optional[pd.DataFrame] = None,
@@ -1456,6 +1664,27 @@ def build_paired_rows(
                     ),
                 }
             )
+    if not ambiguous_duplicate_analysis.empty:
+        for ambiguous in ambiguous_duplicate_analysis.to_dict("records"):
+            rows.append(
+                {
+                    "Section": "10 Ambiguous Duplicate QuickBooks",
+                    "Match ID": ambiguous["Ambiguous ID"],
+                    "Match Result": ambiguous["Classification"],
+                    "QB Index": int(ambiguous["QuickBooks Row Index"]),
+                    "Infinium Index": None,
+                    "QB Record Scope": "Primary",
+                    "Infinium Record Scope": None,
+                    "Group Sequence": 1,
+                    "Confidence": ambiguous["Confidence"],
+                    "Explanation": (
+                        f"{ambiguous['Candidate Count']} unresolved Infinium rows share this "
+                        f"row's normalized PO and/or invoice ({ambiguous['Candidate Infinium Row IDs']}). "
+                        "The program will not guess which one, if any, corresponds to this row, "
+                        "so nothing is posted pending documented review."
+                    ),
+                }
+            )
     for group in fuzzy_review_hold_groups:
         ordered_q = sorted(group.qb_rows, key=lambda idx: qb.at[idx, SOURCE_POS])
         ordered_i = sorted(group.inf_rows, key=lambda idx: inf.at[idx, SOURCE_POS])
@@ -1505,17 +1734,23 @@ def build_paired_rows(
         amount_variance_analysis.set_index("Variance ID").to_dict("index")
         if not amount_variance_analysis.empty else {}
     )
+    ambiguous_detail = (
+        ambiguous_duplicate_analysis.set_index("Ambiguous ID").to_dict("index")
+        if not ambiguous_duplicate_analysis.empty else {}
+    )
+    po_reuse_qb_map = po_reuse_error_qb_index_map(po_reuse_errors)
+    po_reuse_detail = (
+        po_reuse_errors.set_index("PO Reuse ID").to_dict("index")
+        if not po_reuse_errors.empty else {}
+    )
     unresolved_q_indexes = [
         int(row["QB Index"])
         for row in rows
         if row.get("Section") == "02 Unmatched QuickBooks"
         and row.get("QB Index") is not None
     ]
-    unresolved_po_groups: dict[str, list[int]] = defaultdict(list)
     unresolved_invoice_groups: dict[str, list[int]] = defaultdict(list)
     for idx in unresolved_q_indexes:
-        if qb.at[idx, NORM_PO]:
-            unresolved_po_groups[qb.at[idx, NORM_PO]].append(idx)
         if qb.at[idx, NORM_INV]:
             unresolved_invoice_groups[qb.at[idx, NORM_INV]].append(idx)
 
@@ -1552,9 +1787,8 @@ def build_paired_rows(
         if section == "02 Unmatched QuickBooks":
             qidx = int(row["QB Index"])
             q_invoice = qb.at[qidx, NORM_INV]
-            q_po = qb.at[qidx, NORM_PO]
             invoice_group = unresolved_invoice_groups.get(q_invoice, [])
-            po_group = unresolved_po_groups.get(q_po, [])
+            po_reuse_id = po_reuse_qb_map.get(qidx)
             if (
                 q_invoice
                 and len(invoice_group) > 1
@@ -1566,15 +1800,20 @@ def build_paired_rows(
                     "Potential Duplicate - Repeated Invoice numbers do not net to a "
                     "matching Infinium value"
                 )
-            elif (
-                q_po
-                and len(po_group) > 1
-                and group_lacks_matching_infinium_total(NORM_PO, q_po, po_group)
-            ):
+            elif po_reuse_id:
+                # A normalized PO reused across 2+ still-unresolved QuickBooks
+                # rows whose grouped total does not tie exactly to the grouped
+                # Infinium total for that PO -- see build_po_reuse_errors. These
+                # rows stay in the accrual; this only makes the classification
+                # and its grouped detail traceable instead of leaving several
+                # undifferentiated individual exceptions.
+                po_detail = po_reuse_detail.get(po_reuse_id, {})
                 row["Exception Cause"] = (
-                    "Potential Duplicate - Repeated PO values do not net to a "
-                    "matching Infinium value"
+                    "PO Re-use Error - Repeated PO values do not net to a "
+                    "matching Infinium total"
                 )
+                row["Related Source Row IDs"] = str(po_detail.get("Infinium Row IDs", ""))
+                row["Potential Amount Difference"] = po_detail.get("Difference")
             else:
                 row["Exception Cause"] = candidate_cause.get(
                     qb.at[qidx, QB_ID], "Unresolved matching exception"
@@ -1616,6 +1855,13 @@ def build_paired_rows(
             row["Exception Cause"] = "Potential Match - Pending Manual Confirmation"
             row["Cause Confidence"] = FUZZY_MATCH_CONFIDENCE
             row["Financial Treatment"] = "Excluded pending documented match confirmation"
+        elif section == "10 Ambiguous Duplicate QuickBooks":
+            ambiguous_row_detail = ambiguous_detail.get(str(row.get("Match ID", "")), {})
+            row["Exception Cause"] = "Ambiguous Duplicate - Multiple records share the PO and/or Invoice"
+            row["Cause Confidence"] = str(ambiguous_row_detail.get("Confidence", "Review"))
+            row["Financial Treatment"] = str(ambiguous_row_detail.get("Accrual Treatment", "Review hold"))
+            row["Related Source Row IDs"] = str(ambiguous_row_detail.get("Candidate Infinium Row IDs", ""))
+            row["Potential Duplicate Reason"] = str(ambiguous_row_detail.get("Explanation", ""))
 
         detail: dict[str, Any] = {}
         if row.get("QB Index") is not None and row.get("QB Record Scope") == "Primary":
@@ -1716,6 +1962,7 @@ def build_match_assessments(
     inf: pd.DataFrame,
     candidates: pd.DataFrame,
     amount_variance_analysis: Optional[pd.DataFrame] = None,
+    ambiguous_duplicate_analysis: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     candidate_map = candidates.set_index("QuickBooks Row ID").to_dict("index") if not candidates.empty else {}
@@ -1837,6 +2084,28 @@ def build_match_assessments(
                     "Assessment Explanation": variance["Explanation"],
                 }
             )
+    if ambiguous_duplicate_analysis is not None and not ambiguous_duplicate_analysis.empty:
+        for ambiguous in ambiguous_duplicate_analysis.to_dict("records"):
+            records.append(
+                {
+                    "Match ID": ambiguous["Ambiguous ID"],
+                    "Decision": "Ambiguous Duplicate - Multiple Candidates",
+                    "Match Method": ambiguous["Classification"],
+                    "Confidence": ambiguous["Confidence"],
+                    "QuickBooks Row Count": 1,
+                    "Infinium Row Count": ambiguous["Candidate Count"],
+                    "QuickBooks Row IDs": ambiguous["QuickBooks Row ID"],
+                    "Infinium Row IDs": ambiguous["Candidate Infinium Row IDs"],
+                    "PO Criterion": "Agree" if ambiguous["Normalized PO"] else "Not used / differs",
+                    "Invoice Criterion": "Agree" if ambiguous["Normalized Invoice"] else "Not used / differs",
+                    "Signed Amount Criterion": "Not evaluated - correspondence is ambiguous",
+                    "QuickBooks Amount": ambiguous["QuickBooks Amount"],
+                    "Infinium Amount": None,
+                    "Amount Difference": None,
+                    "Group-Level Match": False,
+                    "Assessment Explanation": ambiguous["Explanation"],
+                }
+            )
     return pd.DataFrame(records)
 
 
@@ -1853,6 +2122,7 @@ def build_method_summary(
     duplicate_review_hold_inf_rows: list[int],
     amount_variance_review_hold_qb_rows: list[int],
     amount_variance_review_hold_inf_rows: list[int],
+    ambiguous_duplicate_qb_rows: list[int],
     fuzzy_match_review_hold_qb_rows: list[int],
     fuzzy_match_review_hold_inf_rows: list[int],
 ) -> pd.DataFrame:
@@ -1909,6 +2179,10 @@ def build_method_summary(
         bucket["Infinium Rows"] = len(amount_variance_review_hold_inf_rows)
         bucket["QB Cents"] = _amount_total(qb, amount_variance_review_hold_qb_rows)
         bucket["Infinium Cents"] = _amount_total(inf, amount_variance_review_hold_inf_rows)
+    if ambiguous_duplicate_qb_rows:
+        bucket = buckets["Ambiguous Duplicate QuickBooks (excluded from JE, pending research)"]
+        bucket["QB Rows"] = len(ambiguous_duplicate_qb_rows)
+        bucket["QB Cents"] = _amount_total(qb, ambiguous_duplicate_qb_rows)
     if fuzzy_match_review_hold_qb_rows or fuzzy_match_review_hold_inf_rows:
         bucket = buckets["Fuzzy Match Review Hold (excluded from JE, pending confirmation)"]
         bucket["QB Rows"] = len(fuzzy_match_review_hold_qb_rows)
@@ -1976,6 +2250,7 @@ def build_exception_analysis(
     amount_variance_analysis: Optional[pd.DataFrame] = None,
     paired_rows: Optional[list[dict[str, Any]]] = None,
     fuzzy_match_review_hold_analysis: Optional[pd.DataFrame] = None,
+    ambiguous_duplicate_analysis: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     candidate_reason = candidates.set_index("QuickBooks Row ID")["Exception Cause"].to_dict() if not candidates.empty else {}
@@ -2051,6 +2326,15 @@ def build_exception_analysis(
                     "Amount": float(group["QuickBooks Amount"].sum()),
                 }
             )
+    if ambiguous_duplicate_analysis is not None and not ambiguous_duplicate_analysis.empty:
+        records.append(
+            {
+                "Analysis Type": "Ambiguous duplicates on review hold",
+                "Dimension": "Ambiguous Duplicate - Multiple Candidates",
+                "Transaction Count": len(ambiguous_duplicate_analysis),
+                "Amount": float(ambiguous_duplicate_analysis["QuickBooks Amount"].sum()),
+            }
+        )
     return pd.DataFrame(records)
 
 
@@ -2165,6 +2449,24 @@ def build_rules_and_config(
                  "Every unresolved, duplicate, and amount-variance row receives a controlled cause, confidence, "
                  "financial treatment, and related-row evidence. Reconciled Data retains the actual duplicate PO, "
                  "invoice, signed amount, group ID, copy-set ID, and canonical row ID for audit inspection."
+             )},
+            {"Priority": 20, "Rule": "Ambiguous duplicate review (see build_ambiguous_duplicate_candidates)",
+             "Automatic": "Classification only",
+             "Requirement": (
+                 "After the amount-variance pass (Priority 18), an unresolved QuickBooks row whose PO and/or "
+                 "invoice is still shared by two or more unresolved Infinium rows has no single traceable "
+                 "correspondence. It is withheld from the accrual and itemized with every candidate Infinium "
+                 "row and amount, rather than assumed to match one of them."
+             )},
+            {"Priority": 21, "Rule": "PO Re-use Error (see build_po_reuse_errors)", "Automatic": "Classification only",
+             "Requirement": (
+                 "A normalized PO reused across two or more rows still remaining in the QuickBooks accrual "
+                 "population is grouped and its total compared, exactly (no tolerance), to the grouped Infinium "
+                 "total for the same PO among the rows still unresolved there. A PO whose grouped totals already "
+                 "tie exactly was already accepted as a real match by Priority 5 and never reaches this "
+                 "classification. Unlike Priority 18 and 20, these rows are NOT withheld -- they remain in the "
+                 "accrual exactly as an ordinary exception would, labeled 'PO Re-use Error' with a grouped "
+                 "PO/QuickBooks-total/Infinium-total/difference/row-count detail for review."
              )},
         ]
     )
@@ -2344,6 +2646,7 @@ def build_controls(
     duplicate_review_hold_inf_rows: list[int],
     amount_variance_review_hold_qb_rows: list[int],
     amount_variance_review_hold_inf_rows: list[int],
+    ambiguous_duplicate_qb_rows: list[int],
     fuzzy_match_review_hold_qb_rows: list[int],
     fuzzy_match_review_hold_inf_rows: list[int],
 ) -> pd.DataFrame:
@@ -2373,6 +2676,7 @@ def build_controls(
     review_hold_i_total = _amount_total(inf, duplicate_review_hold_inf_rows)
     variance_hold_q_total = _amount_total(qb, amount_variance_review_hold_qb_rows)
     variance_hold_i_total = _amount_total(inf, amount_variance_review_hold_inf_rows)
+    ambiguous_q_total = _amount_total(qb, ambiguous_duplicate_qb_rows)
     fuzzy_hold_q_total = _amount_total(qb, fuzzy_match_review_hold_qb_rows)
     fuzzy_hold_i_total = _amount_total(inf, fuzzy_match_review_hold_inf_rows)
     historical_difference = (
@@ -2383,7 +2687,7 @@ def build_controls(
         ("QuickBooks row completeness", len(qb),
          len(matched_q) + len(historical_q) + len(unmatched_qb) + len(duplicate_qb_rows)
          + len(duplicate_review_hold_qb_rows) + len(amount_variance_review_hold_qb_rows)
-         + len(fuzzy_match_review_hold_qb_rows)),
+         + len(ambiguous_duplicate_qb_rows) + len(fuzzy_match_review_hold_qb_rows)),
         ("Infinium row completeness", len(inf),
          len(matched_i) + len(historical_i) + len(unmatched_inf) + len(duplicate_inf_rows)
          + len(duplicate_review_hold_inf_rows) + len(amount_variance_review_hold_inf_rows)
@@ -2392,7 +2696,7 @@ def build_controls(
          cents_to_float(
              matched_q_total + historical_q_total + unresolved_q_total
              + duplicate_q_total + review_hold_q_total + variance_hold_q_total
-             + fuzzy_hold_q_total
+             + ambiguous_q_total + fuzzy_hold_q_total
          )),
         ("Infinium amount roll-forward", cents_to_float(inf_total),
          cents_to_float(
@@ -2406,7 +2710,7 @@ def build_controls(
          cents_to_float(
              qb_total - matched_q_total - historical_q_total
              - duplicate_q_total - review_hold_q_total - variance_hold_q_total
-             - fuzzy_hold_q_total
+             - ambiguous_q_total - fuzzy_hold_q_total
          )),
         ("Excess QuickBooks copies excluded from JE", cents_to_float(duplicate_q_total),
          cents_to_float(duplicate_q_total)),
@@ -2414,6 +2718,8 @@ def build_controls(
          cents_to_float(review_hold_q_total), cents_to_float(review_hold_q_total)),
         ("Reference-matched amount variance QuickBooks items excluded from automatic JE",
          cents_to_float(variance_hold_q_total), cents_to_float(variance_hold_q_total)),
+        ("Ambiguous duplicate QuickBooks items excluded from JE",
+         cents_to_float(ambiguous_q_total), cents_to_float(ambiguous_q_total)),
         ("Fuzzy match review hold QuickBooks items excluded from automatic JE",
          cents_to_float(fuzzy_hold_q_total), cents_to_float(fuzzy_hold_q_total)),
     ]
@@ -2648,6 +2954,28 @@ def build_reconciliation(
         set(unmatched_inf).difference(amount_variance_review_hold_inf)
     )
 
+    # Whatever is still unresolved on the QuickBooks side after the clean,
+    # mutually unique amount-variance pass above may still share a PO
+    # and/or invoice with more than one remaining Infinium row -- an
+    # ambiguous duplicate rather than a single traceable reference. These
+    # are likewise withheld from accrual rather than posted as an ordinary
+    # exception; see build_ambiguous_duplicate_candidates.
+    ambiguous_duplicate_analysis, ambiguous_duplicate_qb = build_ambiguous_duplicate_candidates(
+        qb, inf, unmatched_qb, unmatched_inf
+    )
+    unmatched_qb = sorted(
+        set(unmatched_qb).difference(ambiguous_duplicate_qb)
+    )
+
+    # A normalized PO reused across 2+ rows still remaining in the
+    # QuickBooks accrual population whose grouped total does not tie
+    # exactly to the grouped Infinium total for that PO -- see
+    # build_po_reuse_errors. Unlike every review-hold population above,
+    # these rows are NOT removed from unmatched_qb: they stay in the
+    # accrual exactly as an ordinary exception would, just with their own
+    # traceable classification and grouped detail.
+    po_reuse_errors = build_po_reuse_errors(qb, inf, unmatched_qb, unmatched_inf)
+
     # Finalized (post-matching) duplicate reports are computed here, before
     # build_paired_rows, because the QuickBooks accounting above now makes a
     # genuinely post-matching decision (excess vs. ordinary exception) that
@@ -2672,6 +3000,8 @@ def build_reconciliation(
         duplicate_qb_rows_final, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_analysis,
+        ambiguous_duplicate_analysis,
+        po_reuse_errors,
         fuzzy_hold_groups,
         qb_primary_duplicate_report,
         inf_primary_duplicate_report,
@@ -2680,18 +3010,21 @@ def build_reconciliation(
     assessments = build_match_assessments(
         matches, historical_clearances, unmatched_qb, qb, inf, candidates,
         amount_variance_analysis,
+        ambiguous_duplicate_analysis,
     )
     method_summary = build_method_summary(
         matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf,
         duplicate_qb_rows_final, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
+        ambiguous_duplicate_qb,
         fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
     )
     exception_analysis = build_exception_analysis(
         qb, inf, unmatched_qb, unmatched_inf, candidates,
         amount_variance_analysis, paired_rows,
         fuzzy_match_review_hold_analysis,
+        ambiguous_duplicate_analysis,
     )
     qb_secondary_duplicate_report = (
         finalize_review_dispositions(
@@ -2732,6 +3065,7 @@ def build_reconciliation(
         duplicate_qb_rows_final, inf_screen.duplicate_rows,
         duplicate_review_hold_qb, duplicate_review_hold_inf,
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
+        ambiguous_duplicate_qb,
         fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
     )
     rules, config = build_rules_and_config(
@@ -2784,6 +3118,8 @@ def build_reconciliation(
         posting_blockers.append("unresolved Infinium historical duplicate review holds")
     if not amount_variance_analysis.empty:
         posting_blockers.append("unresolved reference-matched amount variance review holds")
+    if not ambiguous_duplicate_analysis.empty:
+        posting_blockers.append("unresolved ambiguous duplicate candidates")
     if not fuzzy_match_review_hold_analysis.empty:
         posting_blockers.append("unresolved fuzzy PO match review holds")
     if qb[AMOUNT_CENTS].isna().any():
@@ -2880,6 +3216,17 @@ def build_reconciliation(
             float(amount_variance_analysis["Absolute Difference"].sum())
             if not amount_variance_analysis.empty else 0.0
         ),
+        "Ambiguous Duplicate QuickBooks Rows": len(ambiguous_duplicate_qb),
+        "Ambiguous Duplicate QuickBooks Amount": cents_to_float(
+            _amount_total(qb, ambiguous_duplicate_qb)
+        ),
+        "PO Re-use Error Groups": len(po_reuse_errors),
+        "PO Re-use Error QuickBooks Rows": (
+            int(po_reuse_errors["QuickBooks Row Count"].sum()) if not po_reuse_errors.empty else 0
+        ),
+        "PO Re-use Error Net Difference": (
+            float(po_reuse_errors["Difference"].sum()) if not po_reuse_errors.empty else 0.0
+        ),
         "Fuzzy Match Review Hold Rows": len(fuzzy_match_review_hold_analysis),
         "Fuzzy Match Review Hold QuickBooks Amount": cents_to_float(
             _amount_total(qb, fuzzy_match_review_hold_qb)
@@ -2964,6 +3311,9 @@ def build_reconciliation(
         duplicate_review_hold_inf_rows=duplicate_review_hold_inf,
         amount_variance_review_hold_qb_rows=amount_variance_review_hold_qb,
         amount_variance_review_hold_inf_rows=amount_variance_review_hold_inf,
+        ambiguous_duplicate_analysis=ambiguous_duplicate_analysis,
+        ambiguous_duplicate_qb_rows=ambiguous_duplicate_qb,
+        po_reuse_errors=po_reuse_errors,
         fuzzy_match_review_hold_analysis=fuzzy_match_review_hold_analysis,
         fuzzy_match_review_hold_qb_rows=fuzzy_match_review_hold_qb,
         fuzzy_match_review_hold_inf_rows=fuzzy_match_review_hold_inf,
@@ -2982,6 +3332,7 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
     review_hold_inf = set(result.duplicate_review_hold_inf_rows)
     variance_hold_qb = set(result.amount_variance_review_hold_qb_rows)
     variance_hold_inf = set(result.amount_variance_review_hold_inf_rows)
+    ambiguous_qb = set(result.ambiguous_duplicate_qb_rows)
     fuzzy_hold_qb = set(result.fuzzy_match_review_hold_qb_rows)
     fuzzy_hold_inf = set(result.fuzzy_match_review_hold_inf_rows)
     if duplicate_qb.intersection(result.suspected_qb_rows):
@@ -3015,13 +3366,72 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
             "placed in Duplicate Review Hold."
         )
     if (
-        variance_hold_qb.intersection(duplicate_qb | review_hold_qb | set(result.unmatched_qb))
+        variance_hold_qb.intersection(duplicate_qb | review_hold_qb | ambiguous_qb | set(result.unmatched_qb))
         or variance_hold_inf.intersection(duplicate_inf | review_hold_inf | set(result.unmatched_inf))
     ):
         raise ValueError(
             "Amount variance control failure: a variance-held row also appears in another "
             "financial disposition population."
         )
+    if ambiguous_qb.intersection(duplicate_qb | review_hold_qb | set(result.unmatched_qb)):
+        raise ValueError(
+            "Ambiguous duplicate control failure: an ambiguous-duplicate row also appears "
+            "in another financial disposition population."
+        )
+    ambiguous_report = result.ambiguous_duplicate_analysis
+    if len(ambiguous_report) != len(ambiguous_qb):
+        raise ValueError(
+            "Ambiguous duplicate audit control failure: report and held-row counts do not agree."
+        )
+    if not ambiguous_report.empty:
+        if ambiguous_report["QuickBooks Row Index"].duplicated().any():
+            raise ValueError(
+                "Ambiguous duplicate audit control failure: relationships are not one-per-row."
+            )
+        if set(ambiguous_report["QuickBooks Row Index"].astype(int)) != ambiguous_qb:
+            raise ValueError(
+                "Ambiguous duplicate audit control failure: QuickBooks row indexes disagree."
+            )
+        for ambiguous in ambiguous_report.to_dict("records"):
+            if int(ambiguous["Candidate Count"]) < 2:
+                raise ValueError(
+                    "Ambiguous duplicate control failure: fewer than two candidates were held "
+                    "as ambiguous."
+                )
+    po_reuse_report = result.po_reuse_errors
+    if not po_reuse_report.empty:
+        # PO Re-use Error rows are the one population that stays IN the
+        # accrual (unlike every review-hold population above), so the
+        # relevant control is that they were never *also* pulled into an
+        # excluding population, not that they're disjoint from unmatched_qb.
+        po_reuse_qb_indexes = set(po_reuse_error_qb_index_map(po_reuse_report))
+        if not po_reuse_qb_indexes.issubset(set(result.unmatched_qb)):
+            raise ValueError(
+                "PO Re-use Error audit control failure: a flagged row is no longer in the "
+                "unresolved QuickBooks accrual population."
+            )
+        if po_reuse_qb_indexes.intersection(duplicate_qb | review_hold_qb | variance_hold_qb | ambiguous_qb):
+            raise ValueError(
+                "PO Re-use Error audit control failure: a flagged row also appears in another "
+                "financial disposition population."
+            )
+        for po_reuse in po_reuse_report.to_dict("records"):
+            if int(po_reuse["QuickBooks Row Count"]) < 2:
+                raise ValueError(
+                    "PO Re-use Error control failure: fewer than two QuickBooks rows were "
+                    "grouped under a reused PO."
+                )
+            expected_difference = (
+                Decimal(str(po_reuse["QuickBooks Total"])) * 100
+                - Decimal(str(po_reuse["Infinium Total"])) * 100
+            )
+            reported_difference = Decimal(str(po_reuse["Difference"])) * 100
+            if reported_difference != expected_difference:
+                raise ValueError("PO Re-use Error control failure: reported difference is incorrect.")
+            if reported_difference == 0:
+                raise ValueError(
+                    "PO Re-use Error control failure: a zero-difference group was flagged as an error."
+                )
     variance_report = result.amount_variance_analysis
     if len(variance_report) != len(variance_hold_qb) or len(variance_report) != len(variance_hold_inf):
         raise ValueError(
@@ -3062,7 +3472,7 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
                 raise ValueError("Amount variance control failure: reported difference is incorrect.")
     if (
         fuzzy_hold_qb.intersection(
-            duplicate_qb | review_hold_qb | variance_hold_qb | set(result.unmatched_qb)
+            duplicate_qb | review_hold_qb | variance_hold_qb | ambiguous_qb | set(result.unmatched_qb)
         )
         or fuzzy_hold_inf.intersection(
             duplicate_inf | review_hold_inf | variance_hold_inf | set(result.unmatched_inf)
@@ -3106,6 +3516,11 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
             raise ValueError(
                 "Amount variance control failure: a variance-held row was included in an "
                 "accepted match."
+            )
+        if ambiguous_qb.intersection(group.qb_rows):
+            raise ValueError(
+                "Ambiguous duplicate control failure: an ambiguous-duplicate row was included "
+                "in an accepted match."
             )
         if fuzzy_hold_qb.intersection(group.qb_rows) or fuzzy_hold_inf.intersection(group.inf_rows):
             raise ValueError(
@@ -3309,6 +3724,7 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
         "07 Duplicate Review Hold Infinium",
         "08 Reference-Matched Amount Variance Review Hold",
         "09 Fuzzy Match Review Hold",
+        "10 Ambiguous Duplicate QuickBooks",
     }
     duplicate_sections = {"04 Duplicate QuickBooks", "05 Duplicate Infinium"}
     for row in result.paired_rows:

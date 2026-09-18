@@ -37,6 +37,8 @@ from config import (
     GREEN_LIGHT,
     NAVY,
     NAVY_LIGHT,
+    NEUTRAL_GOLD_FILL,
+    NEUTRAL_GOLD_TEXT,
     ORANGE,
     RED_LIGHT,
     SLATE,
@@ -84,6 +86,7 @@ from matching import (
     numeric_quantity_sum,
     numeric_sum,
     parse_fiscal_period,
+    po_reuse_error_qb_index_map,
     valid_cents,
 )
 from utils import excel_safe, format_central_timestamp, format_currency
@@ -793,6 +796,51 @@ def _simplify_amount_variance_display(frame: pd.DataFrame) -> pd.DataFrame:
     return simplified
 
 
+def _simplify_ambiguous_duplicate_display(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce an ambiguous_duplicate_analysis-shaped frame (see
+    build_ambiguous_duplicate_candidates in matching.py) to a small, plain-
+    English view for the "Unresolved Exceptions" sheet -- the full
+    technical schema (Posting Disposition, Manual Decision, etc.) stays
+    intact on result.ambiguous_duplicate_analysis for the Analytics
+    workbook and validate_reconciliation."""
+    columns = [
+        "Ambiguous ID", "QuickBooks Row ID", "Candidate Count", "Candidate Infinium Row IDs",
+        "Candidate Infinium Amounts", "QuickBooks Amount", "Likely Cause", "Reviewer Note",
+    ]
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    simplified = pd.DataFrame({
+        "Ambiguous ID": frame["Ambiguous ID"].values,
+        "QuickBooks Row ID": frame["QuickBooks Row ID"].values,
+        "Candidate Count": frame["Candidate Count"].values,
+        "Candidate Infinium Row IDs": frame["Candidate Infinium Row IDs"].values,
+        "Candidate Infinium Amounts": frame["Candidate Infinium Amounts"].values,
+        "QuickBooks Amount": frame["QuickBooks Amount"].values,
+        "Likely Cause": frame["Explanation"].values,
+    })
+    simplified["Reviewer Note"] = ""
+    return simplified
+
+
+def _simplify_po_reuse_display(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce a po_reuse_errors-shaped frame (see build_po_reuse_errors in
+    matching.py) to the reviewer-facing grouped detail columns -- plain-
+    English headers, and drops the internal row-index columns used only
+    for lookups elsewhere. The full technical schema (Normalized PO,
+    QuickBooks/Infinium Row Indexes, etc.) stays intact on
+    result.po_reuse_errors for validate_reconciliation and any future
+    audit-sheet use."""
+    columns = [
+        "PO Reuse ID", "PO", "QuickBooks Row IDs", "QuickBooks Row Count",
+        "QuickBooks Total", "Infinium Row IDs", "Infinium Row Count", "Infinium Total",
+        "Difference", "Explanation",
+    ]
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    simplified = frame.rename(columns={"Normalized PO": "PO"})
+    return simplified.reindex(columns=columns)
+
+
 def _write_kpi_band(
     ws, label_row: int, value_row: int, kpis: list[tuple], end_col: int, start_col: int = 1,
 ) -> None:
@@ -831,6 +879,7 @@ _STATUS_COLOR_LEGEND: list[tuple] = [
     (RED_LIGHT, None, "Prior-period urgent exception / control fail"),
     (AMBER, None, "Pending review / routine prior-period exception"),
     (ORANGE, None, "Reference matches, amount differs - likely data entry error"),
+    (NEUTRAL_GOLD_FILL, NEUTRAL_GOLD_TEXT, "Ambiguous duplicate - multiple candidates, not accrued"),
     (GREEN_LIGHT, None, "Current period / control pass"),
 ]
 
@@ -868,17 +917,34 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     headers = source_headers + ["Exception Status", "Reference Amount Difference", "Reviewer Note"]
     candidate_map = result.candidates.set_index("QuickBooks Row ID").to_dict("index") if not result.candidates.empty else {}
     qb_id_row_map = _qb_id_reconciled_data_row_map(result)
+    # PO Re-use Error rows are never withheld from the accrual (unlike
+    # every other review-hold classification on this sheet), so they still
+    # come through result.unmatched_qb in the loop below -- this lookup
+    # just overrides their Exception Status label to make the reused-PO
+    # grouping traceable instead of showing a generic "no match" reason.
+    po_reuse_qb_map = po_reuse_error_qb_index_map(result.po_reuse_errors)
+    po_reuse_detail = (
+        result.po_reuse_errors.set_index("PO Reuse ID").to_dict("index")
+        if not result.po_reuse_errors.empty else {}
+    )
 
     qb_subset_dict = result.qb_work.loc[result.unmatched_qb].to_dict("index")
     records = []
     for qidx in result.unmatched_qb:
         row_data = qb_subset_dict[qidx]
         candidate = candidate_map.get(row_data[QB_ID], {})
+        po_reuse_id = po_reuse_qb_map.get(qidx)
+        if po_reuse_id:
+            exception_status = "PO Re-use Error"
+            reference_amount_difference = po_reuse_detail.get(po_reuse_id, {}).get("Difference")
+        else:
+            exception_status = candidate.get("Disposition", "Unmatched QuickBooks")
+            reference_amount_difference = candidate.get("Minimum Amount Difference")
         records.append(
             [row_data.get(col) for col in source_headers]
             + [
-                candidate.get("Disposition", "Unmatched QuickBooks"),
-                candidate.get("Minimum Amount Difference"),
+                exception_status,
+                reference_amount_difference,
                 "",
             ]
         )
@@ -932,6 +998,32 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     variance_count = result.metrics["Reference-Matched Amount Variance Rows"]
     variance_qb_amount = result.metrics["Amount Variance Review Hold QuickBooks Amount"]
     variance_inf_amount = result.metrics["Amount Variance Review Hold Infinium Amount"]
+
+    # Ambiguous duplicates (see build_ambiguous_duplicate_candidates in
+    # matching.py): an unresolved QuickBooks row whose PO and/or invoice is
+    # shared by more than one still-unresolved Infinium row, so no single
+    # correspondence can be determined. Distinct from the amount-variance
+    # section above (which always has exactly one candidate) and from a
+    # confirmed same-side duplicate -- labeled and colored separately so a
+    # reviewer never confuses the three.
+    ambiguous_frame = _simplify_ambiguous_duplicate_display(result.ambiguous_duplicate_analysis)
+    ambiguous_headers = list(ambiguous_frame.columns)
+    ambiguous_end_col = len(ambiguous_headers)
+    ambiguous_count = result.metrics["Ambiguous Duplicate QuickBooks Rows"]
+    ambiguous_qb_amount = result.metrics["Ambiguous Duplicate QuickBooks Amount"]
+
+    # PO Re-use Error (see build_po_reuse_errors in matching.py): a
+    # normalized PO reused across 2+ still-unresolved QuickBooks rows whose
+    # grouped total does not tie exactly to the grouped Infinium total for
+    # that PO. Unlike every section above, these rows are NOT withheld --
+    # they already appear in the exceptions table above, counted in the
+    # accrual total. This is purely the grouped detail view.
+    po_reuse_frame = _simplify_po_reuse_display(result.po_reuse_errors)
+    po_reuse_headers = list(po_reuse_frame.columns)
+    po_reuse_end_col = len(po_reuse_headers)
+    po_reuse_group_count = result.metrics["PO Re-use Error Groups"]
+    po_reuse_qb_row_count = result.metrics["PO Re-use Error QuickBooks Rows"]
+    po_reuse_net_difference = result.metrics["PO Re-use Error Net Difference"]
 
     unmatched_qb_amounts = result.qb_work.loc[result.unmatched_qb, AMOUNT_CENTS].tolist()
     amounts = [cents_or_zero(val) for val in unmatched_qb_amounts]
@@ -1142,7 +1234,9 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     dup_kpi_value_row = dup_title_row + 3
     dup_header_row = dup_title_row + 5
     dup_data_row = dup_header_row + 1
-    section_end_col = max(end_col, dup_end_col, review_end_col, variance_end_col)
+    section_end_col = max(
+        end_col, dup_end_col, review_end_col, variance_end_col, ambiguous_end_col, po_reuse_end_col,
+    )
 
     _write_title_band(
         ws, dup_title_row, 1, section_end_col,
@@ -1383,7 +1477,174 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
                 f"{variance_note_letter}{variance_data_row}:{variance_note_letter}{variance_last_row}"
             )
 
-    je_title_row = variance_last_row + 3
+    # Ambiguous Duplicate: an unresolved QuickBooks row whose PO and/or
+    # invoice is shared by two or more still-unresolved Infinium rows, so
+    # no single correspondence can be established. Neither amount is
+    # accrued -- this is a distinct category from both a confirmed
+    # duplicate and a reference-matched amount variance, and is labeled
+    # accordingly rather than folded into either.
+    ambiguous_title_row = variance_last_row + 3
+    ambiguous_caption_row = ambiguous_title_row + 1
+    ambiguous_kpi_label_row = ambiguous_title_row + 2
+    ambiguous_kpi_value_row = ambiguous_title_row + 3
+    ambiguous_header_row = ambiguous_title_row + 5
+    ambiguous_data_row = ambiguous_header_row + 1
+    ambiguous_section_end_col = section_end_col
+
+    ambiguous_caption = (
+        f"{ambiguous_count:,} row(s) share a PO and/or invoice with more than one still-unresolved "
+        "Infinium row, so the correct correspondence -- if any -- cannot be determined from the "
+        "reference fields alone. Rather than guessing, each is labeled an ambiguous duplicate and "
+        "withheld from the accrual/JE support total above; research the candidate Infinium rows "
+        "listed for each to determine the correct treatment."
+        if ambiguous_count
+        else "No ambiguous QuickBooks duplicates (multiple candidates sharing a PO and/or invoice) were identified."
+    )
+    _write_title_band(
+        ws, ambiguous_title_row, 1, ambiguous_section_end_col,
+        "AMBIGUOUS DUPLICATE | MULTIPLE CANDIDATES - NOT ACCRUED", SLATE,
+    )
+    _write_caption_band(ws, ambiguous_caption_row, 1, ambiguous_section_end_col, ambiguous_caption, SLATE)
+
+    ambiguous_kpis = [
+        ("Items requiring review", ambiguous_count, ACCOUNTING_COUNT_FORMAT),
+        ("QuickBooks amount withheld", ambiguous_qb_amount, ACCOUNTING_CURRENCY_FORMAT),
+        ("JE inclusion", "Excluded - not accrued", 'General'),
+    ]
+    _write_kpi_band(ws, ambiguous_kpi_label_row, ambiguous_kpi_value_row, ambiguous_kpis, ambiguous_end_col)
+
+    _write_dataframe_values(ws, ambiguous_frame, ambiguous_header_row, 1)
+    _format_header(
+        ws, ambiguous_header_row, 1, ambiguous_end_col, SLATE,
+        headers=ambiguous_headers,
+        amount_columns={"QuickBooks Amount"}, quantity_columns={"Candidate Count"},
+    )
+    if len(ambiguous_frame):
+        ambiguous_last_row = ambiguous_data_row + len(ambiguous_frame) - 1
+        _format_body_block(ws, ambiguous_data_row, ambiguous_last_row, 1, ambiguous_end_col, SLATE_LIGHT)
+        _apply_number_formats(
+            ws, ambiguous_headers, ambiguous_data_row, ambiguous_last_row, 1,
+            {"QuickBooks Amount"}, {"Candidate Count"},
+        )
+        # Gold, distinct from the duplicate-red, review-amber, and
+        # variance-orange styles used elsewhere on this sheet: this is its
+        # own category, not a confirmed duplicate or a single traceable
+        # amount variance.
+        for row in range(ambiguous_data_row, ambiguous_last_row + 1):
+            for col in range(1, ambiguous_end_col + 1):
+                ws.cell(row, col).fill = PatternFill("solid", fgColor=NEUTRAL_GOLD_FILL)
+                ws.cell(row, col).font = Font(name=FONT_NAME, size=10, color=NEUTRAL_GOLD_TEXT)
+        # Row ID links straight to where each row was originally listed on
+        # Reconciled Data, same as the sections above.
+        ambiguous_qb_col = ambiguous_headers.index("QuickBooks Row ID") + 1
+        for offset, qb_id in enumerate(ambiguous_frame["QuickBooks Row ID"]):
+            _apply_row_id_hyperlink(
+                ws, ambiguous_data_row + offset, ambiguous_qb_col, qb_id_row_map.get(str(qb_id)),
+            )
+        if "Reviewer Note" in ambiguous_headers:
+            ambiguous_note_col = ambiguous_headers.index("Reviewer Note") + 1
+            for row in range(ambiguous_data_row, ambiguous_last_row + 1):
+                ws.cell(row, ambiguous_note_col).protection = Protection(locked=False)
+    else:
+        ambiguous_last_row = ambiguous_header_row
+
+    _set_widths(ws, 1, ambiguous_end_col, ambiguous_header_row, ambiguous_last_row)
+    if "Likely Cause" in ambiguous_headers:
+        ws.column_dimensions[
+            get_column_letter(ambiguous_headers.index("Likely Cause") + 1)
+        ].width = 52
+    if "Candidate Infinium Row IDs" in ambiguous_headers:
+        ws.column_dimensions[
+            get_column_letter(ambiguous_headers.index("Candidate Infinium Row IDs") + 1)
+        ].width = 30
+    if "Candidate Infinium Amounts" in ambiguous_headers:
+        ws.column_dimensions[
+            get_column_letter(ambiguous_headers.index("Candidate Infinium Amounts") + 1)
+        ].width = 30
+    if "Reviewer Note" in ambiguous_headers:
+        ambiguous_note_letter = get_column_letter(ambiguous_headers.index("Reviewer Note") + 1)
+        ws.column_dimensions[ambiguous_note_letter].width = 36
+        if len(ambiguous_frame):
+            ambiguous_validation = DataValidation(
+                type="textLength", operator="lessThanOrEqual", formula1="1000", allow_blank=True
+            )
+            ambiguous_validation.error = "Reviewer notes are limited to 1,000 characters."
+            ambiguous_validation.errorTitle = "Note too long"
+            ws.add_data_validation(ambiguous_validation)
+            ambiguous_validation.add(
+                f"{ambiguous_note_letter}{ambiguous_data_row}:{ambiguous_note_letter}{ambiguous_last_row}"
+            )
+
+    # PO Re-use Error: unlike every section above, these rows are NOT
+    # withheld from the accrual -- they already appear, and are already
+    # counted, in the QuickBooks exceptions table at the top of this
+    # sheet. This section is purely supplementary grouped detail (PO,
+    # QuickBooks total, Infinium total, difference, row counts) so a
+    # reused PO doesn't read as several unrelated individual exceptions.
+    po_reuse_title_row = ambiguous_last_row + 3
+    po_reuse_caption_row = po_reuse_title_row + 1
+    po_reuse_kpi_label_row = po_reuse_title_row + 2
+    po_reuse_kpi_value_row = po_reuse_title_row + 3
+    po_reuse_header_row = po_reuse_title_row + 5
+    po_reuse_data_row = po_reuse_header_row + 1
+    po_reuse_section_end_col = section_end_col
+
+    po_reuse_caption = (
+        f"{po_reuse_group_count:,} PO(s) appear more than once in the unresolved QuickBooks pool "
+        "with a grouped total that does not tie exactly to the grouped Infinium total for the same "
+        "PO. These rows are already included in the QuickBooks exceptions table and accrual total "
+        "above -- this section only shows the grouped PO detail so the pattern is traceable instead "
+        "of reading as several unrelated individual exceptions."
+        if po_reuse_group_count
+        else "No PO Re-use Errors were identified (every PO repeated in the unresolved QuickBooks "
+        "pool either ties exactly to Infinium -- and was already matched -- or appears only once)."
+    )
+    _write_title_band(
+        ws, po_reuse_title_row, 1, po_reuse_section_end_col,
+        "PO RE-USE ERROR | GROUPED DETAIL - ALREADY INCLUDED IN ACCRUAL ABOVE", SLATE,
+    )
+    _write_caption_band(ws, po_reuse_caption_row, 1, po_reuse_section_end_col, po_reuse_caption, SLATE)
+
+    po_reuse_kpis = [
+        ("PO groups flagged", po_reuse_group_count, ACCOUNTING_COUNT_FORMAT),
+        ("QuickBooks rows involved", po_reuse_qb_row_count, ACCOUNTING_COUNT_FORMAT),
+        ("Net difference", po_reuse_net_difference, ACCOUNTING_CURRENCY_FORMAT),
+    ]
+    _write_kpi_band(ws, po_reuse_kpi_label_row, po_reuse_kpi_value_row, po_reuse_kpis, po_reuse_end_col)
+
+    _write_dataframe_values(ws, po_reuse_frame, po_reuse_header_row, 1)
+    _format_header(
+        ws, po_reuse_header_row, 1, po_reuse_end_col, SLATE,
+        headers=po_reuse_headers,
+        amount_columns={"QuickBooks Total", "Infinium Total", "Difference"},
+        quantity_columns={"QuickBooks Row Count", "Infinium Row Count"},
+    )
+    if len(po_reuse_frame):
+        po_reuse_last_row = po_reuse_data_row + len(po_reuse_frame) - 1
+        _format_body_block(ws, po_reuse_data_row, po_reuse_last_row, 1, po_reuse_end_col, SLATE_LIGHT)
+        _apply_number_formats(
+            ws, po_reuse_headers, po_reuse_data_row, po_reuse_last_row, 1,
+            {"QuickBooks Total", "Infinium Total", "Difference"},
+            {"QuickBooks Row Count", "Infinium Row Count"},
+        )
+    else:
+        po_reuse_last_row = po_reuse_header_row
+
+    _set_widths(ws, 1, po_reuse_end_col, po_reuse_header_row, po_reuse_last_row)
+    if "Explanation" in po_reuse_headers:
+        ws.column_dimensions[
+            get_column_letter(po_reuse_headers.index("Explanation") + 1)
+        ].width = 52
+    if "QuickBooks Row IDs" in po_reuse_headers:
+        ws.column_dimensions[
+            get_column_letter(po_reuse_headers.index("QuickBooks Row IDs") + 1)
+        ].width = 30
+    if "Infinium Row IDs" in po_reuse_headers:
+        ws.column_dimensions[
+            get_column_letter(po_reuse_headers.index("Infinium Row IDs") + 1)
+        ].width = 30
+
+    je_title_row = po_reuse_last_row + 3
     je_caption_row = je_title_row + 1
     je_header_row = je_title_row + 2
     je_data_row = je_header_row + 1

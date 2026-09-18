@@ -424,6 +424,81 @@ def test_reference_matched_amount_variance_is_excluded_from_accrual_and_shown_se
     assert not any(text == "Unmatched QuickBooks" for text in sheet_text)
 
 
+def test_ambiguous_duplicate_is_excluded_from_accrual_and_labeled_separately(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """A QuickBooks row whose PO/invoice matches more than one still-
+    unresolved Infinium row must never be posted as an ordinary exception --
+    it is withheld from accrual and must appear, explicitly labeled
+    "ambiguous duplicate" (not folded into the confirmed-duplicate or
+    amount-variance sections), so a reviewer can research the candidates."""
+    qb_rows = [
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 100.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 90.00, "Period": "1"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 80.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.unmatched_qb == []
+    assert len(result.ambiguous_duplicate_analysis) == 1
+    assert result.amount_variance_analysis.empty
+
+    workbook_bytes = build_primary_workbook(result)
+    ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
+    sheet_text = _worksheet_text(ws)
+
+    assert any("AMBIGUOUS DUPLICATE" in text for text in sheet_text)
+    assert any(text == "QB-1" for text in sheet_text)
+    # Both Infinium candidates are listed for the reviewer to research.
+    assert any("INF-1" in text and "INF-2" in text for text in sheet_text)
+    # It must not also appear as an ordinary exception row, nor be folded
+    # into the reference-matched amount variance section (no variance rows
+    # were generated at all, per the assertion above).
+    assert not any(text == "Unmatched QuickBooks" for text in sheet_text)
+    assert not any(str(text).startswith("VAR-") for text in sheet_text)
+
+
+def test_po_reuse_error_stays_in_accrual_and_shows_grouped_detail(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """A PO reused across 2+ unresolved QuickBooks rows whose grouped total
+    disagrees with Infinium's must remain in the exceptions table and
+    accrual total (unlike a duplicate, amount variance, or ambiguous
+    duplicate, none of which stay), labeled "PO Re-use Error" at the row
+    level, with a supplementary grouped-detail section showing the PO,
+    both totals, the difference, and both row counts."""
+    qb_rows = [
+        {"PO": "PO-REUSE1", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE1", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO-REUSE1", "Invoice": "", "Amount": 140.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert sorted(result.unmatched_qb) == [0, 1]
+    assert len(result.po_reuse_errors) == 1
+
+    workbook_bytes = build_primary_workbook(result)
+    ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
+    sheet_text = _worksheet_text(ws)
+
+    # Both rows stay as ordinary exceptions, labeled PO Re-use Error, and
+    # are still part of the JE-support total (they are never pulled into a
+    # withheld/excluded section like the other review-hold categories).
+    assert sheet_text.count("PO Re-use Error") >= 2
+    assert any("PO RE-USE ERROR" in text for text in sheet_text)
+    assert any("QB-1" in text and "QB-2" in text for text in sheet_text)
+    assert any(isinstance(v, (int, float)) and v == 150.0 for v in [c.value for row in ws.iter_rows() for c in row])
+    assert any(isinstance(v, (int, float)) and v == 140.0 for v in [c.value for row in ws.iter_rows() for c in row])
+
+
 def test_duplicates_and_je_sit_ten_rows_below_the_exceptions_total(
     qb_mapping, inf_mapping, make_metadata,
 ):

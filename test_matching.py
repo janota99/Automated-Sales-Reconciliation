@@ -640,6 +640,132 @@ def test_fiscal_exception_summary_treats_one_and_two_periods_behind_as_routine(
     assert classification_by_period["PD-01"] == "Prior-Period Urgent Exception"
 
 
+def test_ambiguous_duplicate_candidates_are_withheld_from_accrual(qb_mapping, inf_mapping, make_metadata):
+    """A QuickBooks row whose PO/invoice is shared by two or more still-
+    unresolved Infinium rows has no single correspondence that can be
+    established -- it must not be posted as an ordinary exception (or
+    silently guessed at), but withheld and reported as an ambiguous
+    duplicate, distinct from both a confirmed same-side duplicate and a
+    (single-candidate) reference-matched amount variance."""
+    qb_rows = [
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 100.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 90.00, "Period": "1"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 80.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.unmatched_qb == []
+    assert len(result.ambiguous_duplicate_analysis) == 1
+    assert result.metrics["Ambiguous Duplicate QuickBooks Rows"] == 1
+    assert result.metrics["Ambiguous Duplicate QuickBooks Amount"] == pytest.approx(100.00)
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert result.amount_variance_analysis.empty
+    ambiguous = result.ambiguous_duplicate_analysis.iloc[0]
+    assert ambiguous["Candidate Count"] == 2
+    assert ambiguous["Classification"] == "Ambiguous Duplicate - Multiple Candidates"
+
+
+def test_po_reuse_error_flags_repeated_po_with_disagreeing_grouped_totals(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """A PO reused across 2+ still-unresolved QuickBooks rows whose grouped
+    total does not tie to the grouped Infinium total for that PO must be
+    classified as a PO Re-use Error and reported with PO/QuickBooks
+    total/Infinium total/difference/row counts -- but, unlike a duplicate
+    or a review-hold row, it stays in the accrual rather than being
+    withheld."""
+    qb_rows = [
+        {"PO": "PO-REUSE1", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE1", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO-REUSE1", "Invoice": "", "Amount": 140.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert sorted(result.unmatched_qb) == [0, 1]
+    assert result.metrics["Unresolved QuickBooks Rows"] == 2
+    assert result.amount_variance_analysis.empty
+    assert result.ambiguous_duplicate_analysis.empty
+    assert len(result.po_reuse_errors) == 1
+    po_reuse = result.po_reuse_errors.iloc[0]
+    assert po_reuse["QuickBooks Total"] == pytest.approx(150.00)
+    assert po_reuse["Infinium Total"] == pytest.approx(140.00)
+    assert po_reuse["Difference"] == pytest.approx(10.00)
+    assert po_reuse["QuickBooks Row Count"] == 2
+    assert po_reuse["Infinium Row Count"] == 1
+    assert result.metrics["PO Re-use Error Groups"] == 1
+    assert result.metrics["PO Re-use Error QuickBooks Rows"] == 2
+    assert result.metrics["PO Re-use Error Net Difference"] == pytest.approx(10.00)
+
+
+def test_po_reuse_error_does_not_flag_a_repeated_po_whose_grouped_totals_tie_exactly(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """When a repeated PO's QuickBooks total ties exactly to the Infinium
+    total, the existing grouped-aggregate matching pass already resolves it
+    as a real match (Priority 5) -- it must never reach the PO Re-use
+    Error classification, per the requirement to preserve the existing
+    resolution/review treatment when totals agree."""
+    qb_rows = [
+        {"PO": "PO-REUSE2", "Invoice": "INV-C", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE2", "Invoice": "INV-D", "Amount": 50.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO-REUSE2", "Invoice": "", "Amount": 150.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.unmatched_qb == []
+    assert result.po_reuse_errors.empty
+    assert result.metrics["PO Re-use Error Groups"] == 0
+
+
+def test_po_reuse_error_applies_zero_tolerance_at_one_cent(qb_mapping, inf_mapping, make_metadata):
+    """Consistent with this application's established zero-tolerance amount
+    policy (no rounding allowance anywhere else in the engine), a
+    one-cent grouped-total difference on a reused PO must still be flagged
+    -- not silently accepted as immaterial rounding."""
+    qb_rows = [
+        {"PO": "PO-REUSE3", "Invoice": "INV-E", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE3", "Invoice": "INV-F", "Amount": 50.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO-REUSE3", "Invoice": "", "Amount": 149.99, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert len(result.po_reuse_errors) == 1
+    assert result.po_reuse_errors.iloc[0]["Difference"] == pytest.approx(0.01)
+
+
+def test_po_reuse_error_ignores_blank_po_values(qb_mapping, inf_mapping, make_metadata):
+    """Two QuickBooks rows with a blank PO are not "the same PO reused" --
+    grouping must key on a populated normalized PO, never on blank."""
+    qb_rows = [
+        {"PO": "", "Invoice": "INV-G", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INV-H", "Amount": 50.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "", "Invoice": "INV-Z", "Amount": 1.00, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    assert result.po_reuse_errors.empty
+
+
 def test_weak_basis_pair_resolved_via_match_proceeds_normally(qb_mapping, inf_mapping, make_metadata):
     """When a weak-basis (invoice-only) duplicate pair together satisfies a
     legitimate grouped aggregate match, both rows proceed normally: neither
