@@ -35,6 +35,8 @@ from config import (
     DUPLICATE_RED_TEXT,
     FONT_NAME,
     GREEN_LIGHT,
+    METHOD_GREY_DARK,
+    METHOD_GREY_FILL,
     NAVY,
     NAVY_LIGHT,
     NEUTRAL_GOLD_FILL,
@@ -577,14 +579,14 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
     final_data_row = data_row + len(match_results) - 1
 
     _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | RECONCILED", NAVY)
-    _write_title_band(ws, 1, match_col, match_col, "MATCH RESULT", SLATE)
+    _write_title_band(ws, 1, match_col, match_col, "MATCH RESULT", METHOD_GREY_DARK)
     _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM | RECONCILED", TEAL)
     _write_caption_band(
         ws, 2, qb_start, qb_end,
         f"Every primary QuickBooks record appears once. Any accepted QuickBooks prior-period match is displayed on this side and labeled in Record Context. Generated {format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
-    _write_caption_band(ws, 2, match_col, match_col, "Matching Methodology", SLATE)
+    _write_caption_band(ws, 2, match_col, match_col, "Matching Methodology", METHOD_GREY_DARK)
     _write_caption_band(
         ws, 2, inf_start, inf_end,
         "Every primary Infinium record appears once. Accepted prior-period matches are displayed; unused historical rows are excluded.",
@@ -599,10 +601,10 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
     qb_quantity_cols = {result.qb_mapping.get("quantity") or ""}
     inf_amount_cols = {result.inf_mapping["amount"]}
     _format_header(ws, header_row, qb_start, qb_end, NAVY, qb_headers, qb_amount_cols, qb_quantity_cols)
-    _format_header(ws, header_row, match_col, match_col, SLATE)
+    _format_header(ws, header_row, match_col, match_col, METHOD_GREY_DARK)
     _format_header(ws, header_row, inf_start, inf_end, TEAL, inf_headers, inf_amount_cols)
     _format_body_block(ws, data_row, final_data_row, qb_start, qb_end, NAVY_LIGHT)
-    _format_body_block(ws, data_row, final_data_row, match_col, match_col, SLATE_LIGHT)
+    _format_body_block(ws, data_row, final_data_row, match_col, match_col, METHOD_GREY_FILL)
     _format_body_block(ws, data_row, final_data_row, inf_start, inf_end, TEAL_LIGHT)
 
     duplicate_qb_rows = _duplicate_source_indexes(result, "QuickBooks")

@@ -31,6 +31,13 @@ NEUTRAL_GOLD_FILL = "FFEB9C"
 NEUTRAL_GOLD_TEXT = "9C6500"
 METHOD_GREY_FILL = "D9D9D9"
 METHOD_GREY_TEXT = "000000"
+# A true neutral grey (no blue or teal undertone) for a column that exists
+# purely to divide two colored sides -- e.g. Reconciled Data's "Match
+# Result" column, sitting between the QuickBooks (navy) and Infinium
+# (teal) blocks. SLATE reads as a third shade of blue next to those two,
+# not as a clear divider; this is deliberately desaturated so it never
+# competes with either side's identity color.
+METHOD_GREY_DARK = "595959"
 RED_LIGHT = "FDECEC"
 GREEN_LIGHT = "E8F3EC"
 WHITE = "FFFFFF"
