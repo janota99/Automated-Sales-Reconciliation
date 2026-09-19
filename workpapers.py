@@ -66,6 +66,7 @@ from excel_styles import (
     _apply_legacy_status_fill,
     _apply_number_formats,
     _autofit_workbook_columns,
+    _pin_column_width,
     _format_body_block,
     _format_header,
     _prepare_sheet,
@@ -96,9 +97,11 @@ from matching import (
     cents_to_float,
     numeric_quantity_sum,
     numeric_sum,
+    describe_match_references,
     parse_fiscal_period,
     po_reuse_error_qb_index_map,
     valid_cents,
+    validate_match_references,
 )
 from utils import excel_safe, format_central_timestamp, format_currency
 
@@ -580,40 +583,49 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
     qb_headers = list(qb_display.columns)
     inf_headers = list(inf_display.columns)
     qb_start = 1
-    match_col = len(qb_headers) + 1
-    inf_start = match_col + 1
+    # Match panel: Match Ref. sits immediately before Match Result; the
+    # Referenced Match Ref. pointer (an exception naming a match that already
+    # consumed a record) follows it.
+    ref_col = len(qb_headers) + 1
+    match_col = ref_col + 1
+    referenced_col = match_col + 1
+    inf_start = referenced_col + 1
     qb_end = len(qb_headers)
     inf_end = inf_start + len(inf_headers) - 1
     header_row, data_row = RECONCILED_DATA_HEADER_ROW, RECONCILED_DATA_DATA_ROW
     final_data_row = data_row + len(match_results) - 1
 
     _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | RECONCILED", NAVY)
-    _write_title_band(ws, 1, match_col, match_col, "MATCH RESULT", METHOD_GREY_DARK)
+    _write_title_band(ws, 1, ref_col, referenced_col, "MATCH RESULT", METHOD_GREY_DARK)
     _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM | RECONCILED", TEAL)
     _write_caption_band(
         ws, 2, qb_start, qb_end,
         f"Every primary QuickBooks record appears once. Any accepted QuickBooks prior-period match is displayed on this side and labeled in Record Context. Generated {format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
-    _write_caption_band(ws, 2, match_col, match_col, "Matching Methodology", METHOD_GREY_DARK)
+    _write_caption_band(ws, 2, ref_col, referenced_col, "Matching Methodology", METHOD_GREY_DARK)
     _write_caption_band(
         ws, 2, inf_start, inf_end,
         "Every primary Infinium record appears once. Accepted prior-period matches are displayed; unused historical rows are excluded.",
         TEAL,
     )
     _write_dataframe_values(ws, qb_display, header_row, qb_start)
+    ws.cell(header_row, ref_col, "Match Ref.")
     ws.cell(header_row, match_col, "Match Result")
-    for offset, value in enumerate(match_results, 1):
+    ws.cell(header_row, referenced_col, "Referenced Match Ref.")
+    for offset, (value, paired) in enumerate(zip(match_results, _resolve_paired_records_bulk(result)), 1):
+        ws.cell(header_row + offset, ref_col, paired.get("Match Ref.") or None)
         ws.cell(header_row + offset, match_col, value)
+        ws.cell(header_row + offset, referenced_col, paired.get("Referenced Match Ref.") or None)
     _write_dataframe_values(ws, inf_display, header_row, inf_start)
     qb_amount_cols = {result.qb_mapping["amount"]}
     qb_quantity_cols = {result.qb_mapping.get("quantity") or ""}
     inf_amount_cols = {result.inf_mapping["amount"]}
     _format_header(ws, header_row, qb_start, qb_end, NAVY, qb_headers, qb_amount_cols, qb_quantity_cols)
-    _format_header(ws, header_row, match_col, match_col, METHOD_GREY_DARK)
+    _format_header(ws, header_row, ref_col, referenced_col, METHOD_GREY_DARK)
     _format_header(ws, header_row, inf_start, inf_end, TEAL, inf_headers, inf_amount_cols)
     _format_body_block(ws, data_row, final_data_row, qb_start, qb_end, NAVY_LIGHT)
-    _format_body_block(ws, data_row, final_data_row, match_col, match_col, METHOD_GREY_FILL)
+    _format_body_block(ws, data_row, final_data_row, ref_col, referenced_col, METHOD_GREY_FILL)
     _format_body_block(ws, data_row, final_data_row, inf_start, inf_end, TEAL_LIGHT)
 
     duplicate_qb_rows = _duplicate_source_indexes(result, "QuickBooks")
@@ -623,10 +635,10 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
         row = data_row + offset
         status = str(record["Section"])
         if status == "02 Unmatched QuickBooks":
-            for col in range(qb_start, match_col + 1):
+            for col in range(qb_start, referenced_col + 1):
                 ws.cell(row, col).fill = PatternFill("solid", fgColor=AMBER)
         elif status == "03 Unmatched Infinium":
-            for col in range(match_col, inf_end + 1):
+            for col in range(ref_col, inf_end + 1):
                 ws.cell(row, col).fill = PatternFill("solid", fgColor=ORANGE)
         qidx = record["QB Index"]
         iidx = record["Infinium Index"]
@@ -651,6 +663,8 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
                 name=FONT_NAME, size=10, bold=True, color=TEAL
             )
         ws.cell(row, match_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        for code_col in (ref_col, referenced_col):
+            ws.cell(row, code_col).alignment = Alignment(horizontal="center", vertical="center")
 
     total_row = final_data_row + 1
     _write_total_row(ws, total_row, qb_start, qb_end,
@@ -669,6 +683,10 @@ def build_reconciled_data_sheet(wb: Workbook, result: ReconciliationResult) -> N
     _set_widths(ws, qb_start, qb_end, header_row, total_row)
     _set_widths(ws, inf_start, inf_end, header_row, total_row)
     ws.column_dimensions[get_column_letter(match_col)].width = 43
+    # Narrow but wide enough for the full heading (which wraps) and a
+    # reference: the workbook-wide autofit must not stretch them.
+    _pin_column_width(ws, get_column_letter(ref_col), 12)
+    _pin_column_width(ws, get_column_letter(referenced_col), 16)
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
     ws.auto_filter.ref = f"A{header_row}:{get_column_letter(inf_end)}{final_data_row}"
     ws.print_title_rows = "1:3"
@@ -925,7 +943,21 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     # no accrual impact and are already listed in Reconciled Data, so they
     # are intentionally not repeated here.
     source_headers = list(result.qb_raw.columns)
-    headers = source_headers + ["Exception Status", "Reference Amount Difference", "Reviewer Note"]
+    headers = source_headers + [
+        "Referenced Match Ref.", "Exception Status", "Reference Amount Difference", "Reviewer Note",
+    ]
+    referenced_offset = len(source_headers) + 1
+    status_offset = referenced_offset + 1
+    difference_offset = status_offset + 1
+    note_offset = difference_offset + 1
+    # An exception can point at an accepted match two ways -- a consumed
+    # PO/invoice candidate, or a duplicate group with a matched member --
+    # both already resolved onto its paired row.
+    referenced_by_qb_index = {
+        int(row["QB Index"]): row.get("Referenced Match Ref.", "")
+        for row in result.paired_rows
+        if row.get("Section") == "02 Unmatched QuickBooks" and row.get("QB Index") is not None
+    }
     candidate_map = result.candidates.set_index("QuickBooks Row ID").to_dict("index") if not result.candidates.empty else {}
     qb_id_row_map = _qb_id_reconciled_data_row_map(result)
     # PO Re-use Error rows are never withheld from the accrual (unlike
@@ -954,6 +986,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         records.append(
             [row_data.get(col) for col in source_headers]
             + [
+                referenced_by_qb_index.get(int(qidx)) or None,
                 exception_status,
                 reference_amount_difference,
                 "",
@@ -1183,9 +1216,10 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         for offset, qidx in enumerate(result.unmatched_qb):
             row = data_row + offset
             ws.cell(row, source_headers.index(result.qb_mapping["amount"]) + 1).number_format = ACCOUNTING_CURRENCY_FORMAT
-            ws.cell(row, len(source_headers) + 1).fill = PatternFill("solid", fgColor=AMBER)
-            ws.cell(row, len(source_headers) + 1).alignment = Alignment(wrap_text=True, vertical="center")
-            ws.cell(row, len(source_headers) + 2).number_format = ACCOUNTING_CURRENCY_FORMAT
+            ws.cell(row, status_offset).fill = PatternFill("solid", fgColor=AMBER)
+            ws.cell(row, status_offset).alignment = Alignment(wrap_text=True, vertical="center")
+            ws.cell(row, referenced_offset).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row, difference_offset).number_format = ACCOUNTING_CURRENCY_FORMAT
             if int(qidx) in duplicate_qb_rows:
                 _apply_duplicate_style(ws, row, 1, end_col)
     total_row = data_row + len(frame)
@@ -1215,13 +1249,14 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws, headers, data_row, total_row, 1,
         {result.qb_mapping["amount"]}, {qb_quantity_header or ""},
     )
-    ws.column_dimensions[get_column_letter(len(source_headers) + 1)].width = 48
-    ws.column_dimensions[get_column_letter(len(source_headers) + 2)].width = 24
-    ws.column_dimensions[get_column_letter(len(source_headers) + 3)].width = 36
+    ws.column_dimensions[get_column_letter(referenced_offset)].width = 16
+    ws.column_dimensions[get_column_letter(status_offset)].width = 48
+    ws.column_dimensions[get_column_letter(difference_offset)].width = 24
+    ws.column_dimensions[get_column_letter(note_offset)].width = 36
     _set_widths(ws, 1, len(source_headers), header_row, total_row)
     ws.freeze_panes = f"A{data_row}"
     if len(frame):
-        note_col = get_column_letter(len(source_headers) + 3)
+        note_col = get_column_letter(note_offset)
         validation = DataValidation(
             type="textLength", operator="lessThanOrEqual", formula1="1000", allow_blank=True
         )
@@ -1834,24 +1869,28 @@ def _legacy_matched_label(match_result: str) -> str:
     return f"{'Group' if is_group else 'Unique'} Match: {keys}"
 
 
-def _legacy_already_matched_reference(qb_frame, qidx, candidate: dict, inf_references: dict) -> str:
-    """Which reference an unresolved QuickBooks row shares with an
-    Infinium row that was already matched elsewhere -- "PO" or "Invoice"."""
-    q_po = qb_frame.at[qidx, NORM_PO]
-    q_invoice = qb_frame.at[qidx, NORM_INV]
-    matched_ids = [
-        piece.strip() for piece in str(candidate.get("Already-Matched Candidate IDs") or "").split(";")
-        if piece.strip() and not piece.strip().startswith("...")
-    ]
-    references = [inf_references[i] for i in matched_ids if i in inf_references]
-    if q_po and any(po == q_po for po, _ in references):
-        return "PO"
-    if q_invoice and any(invoice == q_invoice for _, invoice in references):
-        return "Invoice"
-    return "PO" if q_po else "Invoice"
+def _legacy_reference_label(record: dict) -> Optional[str]:
+    """Legacy wording for an exception that points at an accepted match --
+    built from the canonical reference stored on the paired row, never
+    re-derived here, so it always names a match that exists."""
+    references = _split_cell_references(record.get("Referenced Match Ref."))
+    if not references:
+        return None
+    basis = record.get("Reference Basis")
+    if basis == "Group":
+        return f"Review: Candidate Belongs to {describe_match_references(references, group=True)}"
+    if basis in ("PO", "Invoice"):
+        return f"Review: {basis} Already Used by {describe_match_references(references)}"
+    if basis == "Record":
+        return f"Infinium Record Already Assigned to {describe_match_references(references)}"
+    return f"Potential Duplicate of {describe_match_references(references)}"
 
 
-def _legacy_match_method_label(record: dict, result: ReconciliationResult, candidate_map: dict, inf_references: dict) -> str:
+def _split_cell_references(text: Any) -> list[str]:
+    return [piece.strip() for piece in str(text or "").split(";") if piece.strip()]
+
+
+def _legacy_match_method_label(record: dict) -> str:
     """The Legacy Reconciliation "Match Result" text: just how the match
     was made (or why there isn't one). Confidence tiers stay on the primary
     workpaper and analytics package -- the accountant's legacy view is a
@@ -1862,13 +1901,10 @@ def _legacy_match_method_label(record: dict, result: ReconciliationResult, candi
         if section == "09 Fuzzy Match Review Hold":
             return "Possible Match: Similar PO + Amount"
         return _legacy_matched_label(match_result)
+    pointer = _legacy_reference_label(record)
+    if pointer:
+        return pointer
     if section == "02 Unmatched QuickBooks":
-        if "already matched" in match_result:
-            qb_id = result.qb_work.at[record["QB Index"], QB_ID]
-            reference = _legacy_already_matched_reference(
-                result.qb_work, record["QB Index"], candidate_map.get(qb_id, {}), inf_references,
-            )
-            return f"Review: {reference} Already Used by Another Match"
         return "No Matching Infinium Records"
     if section == "03 Unmatched Infinium":
         return "No Matching QuickBooks Records"
@@ -2001,8 +2037,12 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     qb_headers = list(result.qb_raw.columns)
     inf_headers = list(result.inf_raw.columns)
     qb_start = 1
-    method_col = len(qb_headers) + 1
-    inf_start = method_col + 1
+    # Match Ref. sits immediately before Match Result; Referenced Match Ref.
+    # (an exception naming the accepted match it points at) follows it.
+    ref_col = len(qb_headers) + 1
+    method_col = ref_col + 1
+    referenced_col = method_col + 1
+    inf_start = referenced_col + 1
     qb_end = len(qb_headers)
     inf_end = inf_start + len(inf_headers) - 1
     # Row 3 holds the color legend, directly under the introductory note.
@@ -2011,14 +2051,6 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     default_year = int(result.metadata.get("fiscal_year") or result.run_timestamp.year)
     selected_period = result.metadata.get("fiscal_period")
     inf_period_col = result.inf_mapping.get("period")
-    candidate_map = (
-        result.candidates.set_index("QuickBooks Row ID").to_dict("index")
-        if not result.candidates.empty else {}
-    )
-    inf_references = {
-        row[INF_ID]: (row[NORM_PO], row[NORM_INV])
-        for row in result.inf_work[[INF_ID, NORM_PO, NORM_INV]].to_dict("records")
-    }
 
     def inf_row_period(record: dict) -> Any:
         iidx = record.get("Infinium Index")
@@ -2050,7 +2082,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     has_excluded_duplicates = any(record.get("Section") in _LEGACY_DUPLICATE_SECTIONS for record in all_rows)
 
     _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | SORTED BY PO", NAVY)
-    _write_title_band(ws, 1, method_col, method_col, "MATCH RESULT", SLATE)
+    _write_title_band(ws, 1, ref_col, referenced_col, "MATCH RESULT", SLATE)
     _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM", TEAL)
     _write_caption_band(
         ws, 2, qb_start, qb_end,
@@ -2061,7 +2093,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
         NAVY,
     )
     _write_caption_band(
-        ws, 2, method_col, method_col,
+        ws, 2, ref_col, referenced_col,
         "How each row resolved: the rule that matched it, or why it did not match.",
         SLATE,
     )
@@ -2086,16 +2118,20 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
             ws.cell(row, qb_start + col_offset, excel_safe(value))
         for col_offset, value in enumerate(inf_values):
             ws.cell(row, inf_start + col_offset, excel_safe(value))
-        ws.cell(row, method_col, _legacy_match_method_label(record, result, candidate_map, inf_references))
+        ws.cell(row, ref_col, record.get("Match Ref.") or None)
+        ws.cell(row, method_col, _legacy_match_method_label(record))
+        ws.cell(row, referenced_col, record.get("Referenced Match Ref.") or None)
 
+    ws.cell(header_row, ref_col, "Match Ref.")
     ws.cell(header_row, method_col, "Match Result")
+    ws.cell(header_row, referenced_col, "Referenced Match Ref.")
     _write_legacy_legend(ws, legend_row, qb_start)
     _write_dataframe_values(ws, pd.DataFrame(columns=qb_headers), header_row, qb_start)
     _write_dataframe_values(
         ws, pd.DataFrame(columns=_legacy_infinium_display_headers(inf_headers)), header_row, inf_start,
     )
     _format_header(ws, header_row, qb_start, qb_end, NAVY)
-    _format_header(ws, header_row, method_col, method_col, SLATE)
+    _format_header(ws, header_row, ref_col, referenced_col, SLATE)
     _format_header(ws, header_row, inf_start, inf_end, TEAL)
 
     blank_side_merges: list[tuple[int, int, int]] = []
@@ -2124,12 +2160,19 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
             blank_side_merges.append((row, qb_start, qb_end))
         if not has_inf:
             blank_side_merges.append((row, inf_start, inf_end))
-        _apply_legacy_status_cell(ws, row, method_col, LEGACY_METHOD_FILL, _legacy_row_needs_attention(section))
+        needs_attention = _legacy_row_needs_attention(section)
+        _apply_legacy_status_cell(ws, row, ref_col, LEGACY_METHOD_FILL, False)
+        _apply_legacy_status_cell(ws, row, method_col, LEGACY_METHOD_FILL, needs_attention)
+        _apply_legacy_status_cell(ws, row, referenced_col, LEGACY_METHOD_FILL, False)
         ws.cell(row, method_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        ws.cell(row, method_col).border = _thin_border()
+        for code_col in (ref_col, referenced_col):
+            ws.cell(row, code_col).alignment = Alignment(horizontal="center", vertical="center")
+        for panel_col in (ref_col, method_col, referenced_col):
+            ws.cell(row, panel_col).border = _thin_border()
     if not all_rows:
         _apply_default_alignment(ws, data_row, qb_start, inf_end)
-        _apply_legacy_status_cell(ws, data_row, method_col, LEGACY_METHOD_FILL, False)
+        for panel_col in (ref_col, method_col, referenced_col):
+            _apply_legacy_status_cell(ws, data_row, panel_col, LEGACY_METHOD_FILL, False)
 
     total_row = final_data_row + 1
     qb_display = pd.DataFrame(
@@ -2144,8 +2187,9 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
                      _source_totals(qb_display, result.qb_mapping), qb_headers, "QUICKBOOKS TOTAL")
     _write_total_row(ws, total_row, inf_start, inf_end,
                      _source_totals(inf_display, result.inf_mapping), inf_headers, "INFINIUM TOTAL (SHOWN)")
-    ws.cell(total_row, method_col).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-    ws.cell(total_row, method_col).border = _total_border()
+    for panel_col in (ref_col, method_col, referenced_col):
+        ws.cell(total_row, panel_col).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+        ws.cell(total_row, panel_col).border = _total_border()
     _apply_number_formats(ws, qb_headers, data_row, total_row, qb_start,
                           {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
     _apply_number_formats(ws, inf_headers, data_row, total_row, inf_start,
@@ -2157,6 +2201,9 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _legacy_ensure_headers_fit(ws, qb_headers, qb_start)
     _legacy_ensure_headers_fit(ws, _legacy_infinium_display_headers(inf_headers), inf_start)
     ws.column_dimensions[get_column_letter(method_col)].width = 46
+    # Narrow, but wide enough for a reference and the full (wrapping) heading.
+    ws.column_dimensions[get_column_letter(ref_col)].width = 12
+    ws.column_dimensions[get_column_letter(referenced_col)].width = 16
     _legacy_standardize_dates(ws, qb_headers, qb_start, data_row, final_data_row)
     _legacy_standardize_dates(ws, _legacy_infinium_display_headers(inf_headers), inf_start, data_row, final_data_row)
     # Each blank side becomes one merged cell, so an empty block reads as a
@@ -2186,7 +2233,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
     """
     ws = wb.create_sheet("Exceptions")
     qb_headers = list(result.qb_raw.columns)
-    trailer_headers = ["Fiscal Period", "Exception Type", "Explanation"]
+    trailer_headers = ["Fiscal Period", "Exception Type", "Referenced Match Ref.", "Explanation"]
     n_qb = len(qb_headers)
     n_trailer = len(trailer_headers)
 
@@ -2285,6 +2332,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
                 + [
                     row_period(record),
                     _legacy_section_label(str(record.get("Section", ""))),
+                    record.get("Referenced Match Ref.") or None,
                     f"{record.get('Match Result', '')} -- {record.get('Explanation', '')}",
                 ]
                 for record in records
@@ -2303,6 +2351,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
             # status cell worth bolding, and only for a genuine open item.
             _apply_legacy_status_cell(ws, row, trailer_start + 1, status_fill, bold_exception_type)
             ws.cell(row, trailer_end).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            ws.cell(row, trailer_start + 2).alignment = Alignment(horizontal="center", vertical="center")
         _apply_number_formats(ws, qb_headers, data_row, block_final_row, block_qb_start,
                               {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
         _legacy_standardize_dates(ws, qb_headers, block_qb_start, data_row, block_final_row)
@@ -2311,6 +2360,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
         _legacy_ensure_headers_fit(ws, qb_headers, block_qb_start)
         ws.column_dimensions[get_column_letter(trailer_start)].width = 14
         ws.column_dimensions[get_column_letter(trailer_start + 1)].width = 34
+        ws.column_dimensions[get_column_letter(trailer_start + 2)].width = 16
         ws.column_dimensions[get_column_letter(trailer_end)].width = 60
         return block_final_row
 
@@ -2339,6 +2389,7 @@ def build_legacy_workbook(result: ReconciliationResult) -> bytes:
     the audit-trail depth of the primary workpaper. The primary workpaper
     and analytics package are unaffected by this export.
     """
+    validate_match_references(result)
     wb = Workbook()
     wb.properties.creator = "Sales Reconciliation Application"
     wb.properties.title = f"Sales Reconciliation (Legacy Format) {result.run_id}"
@@ -2577,6 +2628,7 @@ def _apply_workbook_run_metadata(wb: Workbook, result: ReconciliationResult) -> 
 
 
 def build_primary_workbook(result: ReconciliationResult) -> bytes:
+    validate_match_references(result)
     wb = Workbook()
     wb.properties.creator = "Sales Reconciliation Application"
     wb.properties.title = f"Sales Reconciliation {result.run_id}"
@@ -2610,7 +2662,9 @@ def detailed_ledger_dataframe(result: ReconciliationResult) -> pd.DataFrame:
             "Run ID": result.run_id,
             "Section": record["Section"],
             "Match ID": record["Match ID"],
+            "Match Ref.": record.get("Match Ref.", ""),
             "Match Result": record["Match Result"],
+            "Referenced Match Ref.": record.get("Referenced Match Ref.", ""),
             "Confidence": record["Confidence"],
             "Group Sequence": record["Group Sequence"],
             "Assessment Explanation": record["Explanation"],
@@ -2636,7 +2690,7 @@ def detailed_ledger_dataframe(result: ReconciliationResult) -> pd.DataFrame:
 
 
 DATA_SEARCH_COLUMNS = [
-    "Status", "Match Type", "Duplicate Group ID",
+    "Status", "Match Ref.", "Match Type", "Referenced Match Ref.", "Duplicate Group ID",
     "QuickBooks Row ID", "QuickBooks PO", "QuickBooks Invoice", "QuickBooks Amount",
     "Infinium Row ID", "Infinium PO", "Infinium Invoice", "Infinium Amount",
     "Detail",
@@ -2727,7 +2781,9 @@ def build_data_search_dataframe(result: ReconciliationResult) -> pd.DataFrame:
 
         records.append({
             "Status": _data_search_status(record),
+            "Match Ref.": record.get("Match Ref.", ""),
             "Match Type": match_type,
+            "Referenced Match Ref.": record.get("Referenced Match Ref.", ""),
             "Duplicate Group ID": duplicate_group_id,
             "QuickBooks Row ID": qb_row_id,
             "QuickBooks PO": qb_values.get(qb_po_header) if qb_po_header else None,
@@ -2753,14 +2809,16 @@ def build_data_search_indexes(result: ReconciliationResult) -> tuple[pd.DataFram
     joined = build_data_search_dataframe(result)
     qb_index = joined.loc[joined["QuickBooks Row ID"].notna(), [
         "QuickBooks Row ID", "QuickBooks PO", "QuickBooks Invoice", "QuickBooks Amount",
-        "Status", "Match Type", "Duplicate Group ID", "Infinium Row ID", "Detail",
+        "Status", "Match Ref.", "Match Type", "Referenced Match Ref.", "Duplicate Group ID",
+        "Infinium Row ID", "Detail",
     ]].rename(columns={
         "QuickBooks Row ID": "Row ID", "QuickBooks PO": "PO", "QuickBooks Invoice": "Invoice",
         "QuickBooks Amount": "Amount", "Infinium Row ID": "Matched Infinium Row ID",
     }).reset_index(drop=True)
     inf_index = joined.loc[joined["Infinium Row ID"].notna(), [
         "Infinium Row ID", "Infinium PO", "Infinium Invoice", "Infinium Amount",
-        "Status", "Match Type", "Duplicate Group ID", "QuickBooks Row ID", "Detail",
+        "Status", "Match Ref.", "Match Type", "Referenced Match Ref.", "Duplicate Group ID",
+        "QuickBooks Row ID", "Detail",
     ]].rename(columns={
         "Infinium Row ID": "Row ID", "Infinium PO": "PO", "Infinium Invoice": "Invoice",
         "Infinium Amount": "Amount", "QuickBooks Row ID": "Matched QuickBooks Row ID",
@@ -3031,6 +3089,7 @@ def build_analytics_summary_sheet(wb: Workbook, result: ReconciliationResult) ->
 
 
 def build_analytics_workbook(result: ReconciliationResult) -> bytes:
+    validate_match_references(result)
     wb = Workbook()
     wb.properties.creator = "Sales Reconciliation Application"
     wb.properties.title = f"Sales Reconciliation Analytics {result.run_id}"

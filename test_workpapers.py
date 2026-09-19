@@ -241,9 +241,10 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     exception_type_cols = [cell.column for cell in header_row_cells if cell.value == "Exception Type"]
     assert len(exception_type_cols) == 2  # one per block
     left_col, right_col = sorted(exception_type_cols)
-    # The right block starts n_qb + 3 (trailer) + 1 (separator) columns
-    # after the left block's own "Exception Type" column.
-    assert right_col - left_col == n_qb + 3 + 1
+    # The right block starts n_qb + 4 (trailer: Fiscal Period, Exception Type,
+    # Referenced Match Ref., Explanation) + 1 (separator) columns after the
+    # left block's own "Exception Type" column.
+    assert right_col - left_col == n_qb + 4 + 1
 
     right_qb_start_col = right_col - 1 - n_qb  # "Exception Type" is trailer offset +1
     general_pos = [
@@ -305,9 +306,10 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     for cell in ws[4]:
         headers.setdefault(cell.value, cell.column)
     method_col = headers["Match Result"]
+    assert headers["Match Ref."] == method_col - 1  # immediately before Match Result
     amount_col = headers["Amount"]
     po_col = headers["PO"]
-    inf_start = method_col + 1
+    inf_start = headers["Referenced Match Ref."] + 1
 
     rows = list(ws.iter_rows(min_row=5))
     by_label = {}
@@ -343,7 +345,8 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     merged = {str(r) for r in ws.merged_cells.ranges}
     unmatched_row = unmatched[0].row
     assert f"{get_column_letter(inf_start)}{unmatched_row}:{get_column_letter(inf_end)}{unmatched_row}" in merged
-    assert f"A{unmatched_row}:{get_column_letter(method_col - 1)}{unmatched_row}" not in merged
+    qb_end_col = headers["Match Ref."] - 1  # last QuickBooks column
+    assert f"A{unmatched_row}:{get_column_letter(qb_end_col)}{unmatched_row}" not in merged
     matched_row = matched[0].row
     assert not any(
         r.min_row == matched_row and r.max_row == matched_row and r.min_col != r.max_col
@@ -370,7 +373,7 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     # the same near-white gray, while the Infinium side keeps the status tint.
     inf_only = by_label["No Matching QuickBooks Records"][0]
     assert _fill_matches(inf_only[po_col - 1], LEGACY_NO_PAIR_FILL)
-    assert f"A{inf_only[0].row}:{get_column_letter(method_col - 1)}{inf_only[0].row}" in merged
+    assert f"A{inf_only[0].row}:{get_column_letter(qb_end_col)}{inf_only[0].row}" in merged
     assert _fill_matches(inf_only[inf_start - 1], LEGACY_REVIEW_FILL) or _fill_matches(
         inf_only[inf_start - 1], LEGACY_EXCLUDED_FILL
     )
@@ -406,8 +409,9 @@ def test_legacy_already_matched_duplicate_reads_as_a_review_action(qb_mapping, i
     )
     ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
     labels = {cell.value for row in ws.iter_rows(min_row=5) for cell in row if isinstance(cell.value, str)}
-    assert "Review: PO Already Used by Another Match" in labels
-    assert not any("Value Already Matched" in label for label in labels)
+    # The label names the exact accepted match the row's PO was already used by.
+    assert "Review: PO Already Used by Match M-001" in labels
+    assert not any("Another Match" in label or "Value Already Matched" in label for label in labels)
 
 
 def test_legacy_short_valued_columns_are_wide_enough_for_their_headings(make_metadata, qb_mapping):
@@ -425,8 +429,13 @@ def test_legacy_short_valued_columns_are_wide_enough_for_their_headings(make_met
     )
     ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
     for cell in ws[4]:
+        if cell.value in ("Match Ref.", "Referenced Match Ref."):
+            continue  # narrow by design; the long heading wraps (checked below)
         if cell.value:
             assert ws.column_dimensions[get_column_letter(cell.column)].width >= len(str(cell.value)) + 5, cell.value
+    widths = {c.value: ws.column_dimensions[get_column_letter(c.column)].width for c in ws[4] if c.value}
+    assert 10 <= widths["Match Ref."] <= 14
+    assert 14 <= widths["Referenced Match Ref."] <= 18
     customer_no = next(c for c in ws[4] if c.value == "Customer No")
     assert ws.column_dimensions[get_column_letter(customer_no.column)].width >= 16
 
@@ -544,7 +553,7 @@ def test_legacy_reconciliation_normalizes_infinium_column_names(qb_mapping, make
     header_values = [cell.value for cell in ws[4]]
     for raw in ("OHAPD", "OHOBDE", "OHCO", "CUNO", "OHOBNO", "OHTOTA", "OHDESC", "OHPONO"):
         assert raw not in header_values
-    inf_headers = header_values[header_values.index("Match Result") + 1:]
+    inf_headers = header_values[header_values.index("Referenced Match Ref.") + 1:]
     assert inf_headers[:8] == [
         "Period", "Date", "Type", "Customer No", "Invoice No", "Amount", "Description", "PO No.",
     ]
@@ -647,7 +656,9 @@ def test_data_search_sheet_is_first_and_live_searchable(qb_mapping, inf_mapping,
     # errors from malformed table/range references).
     assert qb_formula.count("(") == qb_formula.count(")")
 
-    inf_col_count = 9  # Row ID, PO, Invoice, Amount, Status, Match Type, Duplicate Group ID, Matched * Row ID, Detail
+    # Row ID, PO, Invoice, Amount, Status, Match Ref., Match Type, Referenced Match Ref.,
+    # Duplicate Group ID, Matched * Row ID, Detail
+    inf_col_count = 11
     inf_formula = ws.cell(9, inf_col_count + 2).value
     assert isinstance(inf_formula, str) and inf_formula.startswith("=")
     assert "Data Search INF Source" in inf_formula
@@ -1127,3 +1138,194 @@ def test_no_review_hold_items_renders_empty_section_cleanly(qb_mapping, inf_mapp
     ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
     unresolved_text = _worksheet_text(ws)
     assert any("No QuickBooks weak-basis duplicate candidates remain unresolved" in t for t in unresolved_text)
+
+
+# ---------------------------------------------------------------------------
+# Match references in the generated workbooks
+# ---------------------------------------------------------------------------
+
+def _reference_result(qb_mapping, inf_mapping, make_metadata):
+    """Two one-to-one matches (PO9 listed before PO1 in the file), a grouped
+    match, an exception whose PO a match already used, and a duplicate of a
+    matched row -- so every reference kind appears at least once."""
+    qb_rows = [
+        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-G", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-G", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO1", "Invoice": "INV1B", "Amount": 5.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Period": "1"},
+        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Period": "1"},
+        {"PO": "PO-G", "Invoice": "", "Amount": 150.00, "Period": "1"},
+    ]
+    return build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+
+
+def _sheet_headers(ws, row):
+    return [cell.value for cell in ws[row]]
+
+
+def test_reconciled_data_places_match_ref_immediately_before_match_result(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Reconciled Data"]
+    headers = _sheet_headers(ws, 3)
+    ref_index = headers.index("Match Ref.")
+    assert headers[ref_index + 1] == "Match Result"          # Match Ref. immediately before
+    assert headers[ref_index + 2] == "Referenced Match Ref."
+    ref_col = ref_index + 1
+    for position, record in enumerate(result.paired_rows):
+        row_number = 4 + position
+        shown = ws.cell(row_number, ref_col).value
+        pointer = ws.cell(row_number, ref_col + 2).value
+        if record["Section"] == "01 Matched":
+            assert shown == record["Match Ref."] and shown
+            assert pointer is None
+        else:
+            assert shown is None                              # never an accepted-match reference
+            assert (pointer or "") == record["Referenced Match Ref."]
+    assert any(ws.cell(4 + i, ref_col + 2).value for i in range(len(result.paired_rows)))
+    # Narrow but complete: the workbook autofit must not stretch the reference columns.
+    assert ws.column_dimensions[get_column_letter(ref_col)].width <= 14
+    assert ws.column_dimensions[get_column_letter(ref_col + 2)].width <= 18
+
+
+def test_legacy_reconciliation_references_stay_with_their_relationship_after_sorting(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    headers = _sheet_headers(ws, 4)
+    ref_col = headers.index("Match Ref.")
+    assert headers[ref_col + 1] == "Match Result"
+    invoice_col = headers.index("Invoice")
+    # Expected: each QuickBooks invoice's reference, straight from the register.
+    qb_ref_by_id = {}
+    for entry in result.match_register.to_dict("records"):
+        for qb_id in entry["QuickBooks Row IDs"].split("; "):
+            qb_ref_by_id[qb_id] = entry["Match Ref."]
+    expected = {}
+    for index, qb_id in result.qb_work[QB_ID].items():
+        if qb_id in qb_ref_by_id:
+            expected.setdefault(result.qb_work.at[index, "Invoice"], set()).add(qb_ref_by_id[qb_id])
+    seen = {}
+    for row in ws.iter_rows(min_row=5):
+        invoice, ref = row[invoice_col].value, row[ref_col].value
+        if ref and invoice:
+            seen.setdefault(invoice, set()).add(ref)
+    assert seen == expected
+    # The sheet is sorted by PO, not by reference -- so the order differs from
+    # M-001, M-002, ... yet every reference is still attached to the right row.
+    ref_order = [row[ref_col].value for row in ws.iter_rows(min_row=5) if row[ref_col].value]
+    assert ref_order != sorted(ref_order)
+    # Exceptions cite the exact match they point at.
+    labels = {c.value for row in ws.iter_rows(min_row=5) for c in row if isinstance(c.value, str)}
+    assert any(label.startswith("Potential Duplicate of Match M-") for label in labels)
+    assert any(label.startswith("Review: PO Already Used by Match M-") for label in labels)
+
+
+def test_unresolved_exceptions_places_referenced_match_ref_immediately_before_status(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    header_row = next(row for row in ws.iter_rows() if any(c.value == "Exception Status" for c in row))
+    headers = [c.value for c in header_row]
+    status_col = headers.index("Exception Status") + 1
+    assert headers[status_col - 2] == "Referenced Match Ref."
+    pointer_col = status_col - 1
+    rows = []
+    for number in range(header_row[0].row + 1, header_row[0].row + 1 + len(result.unmatched_qb)):
+        rows.append((ws.cell(number, status_col).value, ws.cell(number, pointer_col).value))
+    assert len(rows) == 2
+    for status, pointer in rows:
+        # Every exception here points at a real match, named the same way in both cells.
+        assert pointer in {"M-001", "M-002", "G-001"}
+        assert pointer in status
+
+
+def test_every_reference_shown_in_any_workbook_exists_in_the_match_register(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    import re
+
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    register = set(result.match_register["Match Ref."])
+    assert register == {"M-001", "M-002", "G-001"}
+    pattern = re.compile(r"\b[MG]-\d{3,}\b")
+    cited = set()
+    for builder in (build_primary_workbook, build_legacy_workbook, build_analytics_workbook):
+        wb = load_workbook(io.BytesIO(builder(result)))
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    if isinstance(cell.value, str) and not cell.value.startswith("="):
+                        cited.update(pattern.findall(cell.value))
+    # Nothing is cited that is not a real accepted match; the old six-digit
+    # run-local ids (M-000012) would also match this pattern and fail here.
+    assert cited == register
+
+
+def test_analytics_match_level_sheets_carry_references_but_summaries_do_not(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_analytics_workbook(result)))
+
+    def headers(name):
+        return next(
+            [c.value for c in row] for row in wb[name].iter_rows(min_row=1, max_row=6)
+            if sum(1 for c in row if c.value) > 3 and row[0].row >= 3
+        )
+
+    ledger = headers("Detailed Match Ledger")
+    assert ledger.index("Match Ref.") + 1 == ledger.index("Match Result")
+    assert "Referenced Match Ref." in ledger
+    assessment = headers("Match Assessment")
+    assert assessment.index("Match Ref.") + 1 == assessment.index("Match Method")
+    assert "Referenced Match Ref." in assessment
+    assert "Referenced Match Ref." in headers("QuickBooks Duplicates")
+    # High-level summaries have no match-level records to trace.
+    for name in ("Match Method Summary", "Exception Analysis", "Executive Summary"):
+        assert not any(
+            isinstance(c.value, str) and "Match Ref." in c.value
+            for row in wb[name].iter_rows() for c in row
+        ), name
+    primary = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    for name in ("Product Aggregate Summary", "Raw Data"):
+        assert not any(
+            isinstance(c.value, str) and "Match Ref." in c.value
+            for row in primary[name].iter_rows() for c in row
+        ), name
+
+
+def test_data_search_panels_show_references_beside_the_match_type(qb_mapping, inf_mapping, make_metadata):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    for source in ("Data Search QB Source", "Data Search INF Source"):
+        headers = _sheet_headers(wb[source], 1)
+        assert headers.index("Match Ref.") + 1 == headers.index("Match Type")
+        assert "Referenced Match Ref." in headers
+        refs = {row[headers.index("Match Ref.")].value for row in wb[source].iter_rows(min_row=2)}
+        assert {"M-001", "M-002", "G-001"} <= {r for r in refs if r}
+
+
+def test_reference_feature_changes_no_reconciliation_total(qb_mapping, inf_mapping, make_metadata):
+    """Hand-checked totals for the reference scenario -- the traceability
+    fields are additive; every amount, count, and journal-entry input is as
+    before."""
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    assert result.metrics["Control Status"] == "PASS"
+    assert len(result.matches) == 3                                # PO1, PO9, and the PO-G group
+    assert result.metrics["Unresolved QuickBooks Rows"] == 2       # PO1/INV1B and the PO9 duplicate copy
+    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(5.00 + 90.00)
+    assert result.metrics["QuickBooks Source Total"] == pytest.approx(345.00)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    assert any("SUM(QuickBooksExceptions[Amount])" in t for t in _worksheet_text(ws))

@@ -126,9 +126,14 @@ def display_primary_preview(result: ReconciliationResult) -> pd.DataFrame:
     qb_display, inf_display, methods = paired_display_frames(result)
     qb_display = qb_display.add_prefix("QB | ")
     inf_display = inf_display.add_prefix("INF | ")
-    return pd.concat(
-        [qb_display, pd.DataFrame({"Match Result": methods}), inf_display], axis=1
-    )
+    # paired_display_frames walks result.paired_rows in order, so the frames
+    # and these two reference columns line up row for row.
+    match_panel = pd.DataFrame({
+        "Match Ref.": [row.get("Match Ref.", "") for row in result.paired_rows],
+        "Match Result": methods,
+        "Referenced Match Ref.": [row.get("Referenced Match Ref.", "") for row in result.paired_rows],
+    })
+    return pd.concat([qb_display, match_panel, inf_display], axis=1)
 
 
 def render_limited_dataframe(

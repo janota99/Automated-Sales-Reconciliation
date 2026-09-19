@@ -295,6 +295,17 @@ def _standardize_column_widths(
             ws.column_dimensions[get_column_letter(col)].width = fixed_widths[header]
 
 
+def _pin_column_width(ws, letter: str, width: float) -> None:
+    """Set a column's width and mark it deliberate, so the workbook-wide
+    content-driven autofit leaves it alone (a narrow reference column whose
+    long heading is meant to wrap, for instance, must not be stretched to
+    fit that heading on one line)."""
+    ws.column_dimensions[letter].width = width
+    pinned = getattr(ws, "_pinned_column_letters", set())
+    pinned.add(letter)
+    ws._pinned_column_letters = pinned
+
+
 def _autofit_workbook_columns(
     wb: Workbook,
     minimum: float = 10,
@@ -327,8 +338,11 @@ def _autofit_workbook_columns(
         if ws.max_row > sample_rows:
             sampled_row_numbers.append(ws.max_row)
 
+        pinned_letters = getattr(ws, "_pinned_column_letters", set())
         for column_index in range(1, ws.max_column + 1):
             letter = get_column_letter(column_index)
+            if letter in pinned_letters:
+                continue
             maximum_length = 0
             has_unmerged_value = False
             for row_index in sampled_row_numbers:
