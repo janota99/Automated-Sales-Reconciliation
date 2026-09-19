@@ -331,7 +331,7 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
 
     # Unmatched QuickBooks row: gold review tint, bold status text, and a
     # gray (not gold) blank Infinium side because nothing is paired there.
-    unmatched = by_label["No Matching Infinium records"][0]
+    unmatched = by_label["No Matching Infinium Records"][0]
     assert _fill_matches(unmatched[po_col - 1], LEGACY_REVIEW_FILL)
     assert unmatched[method_col - 1].font.bold is True
     assert _fill_matches(unmatched[method_col - 1], LEGACY_METHOD_FILL)
@@ -356,17 +356,110 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
 
     # Compact legend directly under the introductory note.
     legend = [cell.value for cell in ws[3] if cell.value]
-    assert legend == ["Reconciled", "Review", "No paired record"]
+    assert legend == ["Reconciled", "Review required", "No paired record"]
+    # Three adjacent chips, each filled with the exact tint it explains.
+    for chip, tint in zip(ws[3][:3], (LEGACY_MATCHED_FILL, LEGACY_REVIEW_FILL, LEGACY_NO_PAIR_FILL)):
+        assert _fill_matches(chip, tint)
+    assert ws.row_dimensions[3].height == 18
 
     # Infinium-only row (no QuickBooks record): its blank QuickBooks side is
     # the same near-white gray, while the Infinium side keeps the status tint.
-    inf_only = by_label["No Matching QuickBooks records"][0]
+    inf_only = by_label["No Matching QuickBooks Records"][0]
     assert _fill_matches(inf_only[po_col - 1], LEGACY_NO_PAIR_FILL)
     assert f"A{inf_only[0].row}:{get_column_letter(method_col - 1)}{inf_only[0].row}" in merged
     assert _fill_matches(inf_only[inf_start - 1], LEGACY_REVIEW_FILL) or _fill_matches(
         inf_only[inf_start - 1], LEGACY_EXCLUDED_FILL
     )
     assert ws.print_title_rows == "$1:$4"
+
+
+def test_legacy_dates_are_real_dates_shown_as_mm_dd_yyyy(qb_mapping, make_metadata):
+    """QuickBooks delivers some dates as real dates and others as text, and
+    Infinium's are text like "1/09/2026" -- all must end up as real dates
+    displayed MM/DD/YYYY, on both legacy sheets."""
+    from datetime import datetime
+
+    qb_mapping = dict(qb_mapping)
+    qb_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1",
+         "Date": datetime(2026, 3, 3)},
+        {"PO": "PO2", "Invoice": "INV2", "Amount": 20.00, "Qty": 1, "Period": "1",
+         "Date": "08/17/2026"},
+        {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Qty": 1, "Period": "1",
+         "Date": "2026-04-10"},
+    ]
+    inf_rows = [{"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Period": "1", "Date": "1/09/2026"}]
+    inf_mapping = {"po": "PO", "invoice": "Invoice", "amount": "Amount", "period": "Period"}
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    wb = load_workbook(io.BytesIO(build_legacy_workbook(result)))
+    ws = wb["Legacy Reconciliation"]
+    date_cols = [c.column for c in ws[4] if c.value == "Date"]
+    assert len(date_cols) == 2  # QuickBooks and Infinium
+    checked = 0
+    for row in ws.iter_rows(min_row=5):
+        for col in date_cols:
+            cell = row[col - 1]
+            if cell.value is None or str(cell.value).endswith("TOTAL"):
+                continue
+            assert isinstance(cell.value, datetime), f"{cell.coordinate} is {cell.value!r}"
+            assert cell.number_format == "mm/dd/yyyy"
+            checked += 1
+    assert checked >= 4
+    exceptions_ws = wb["Exceptions"]
+    exception_date_cells = [
+        cell for row in exceptions_ws.iter_rows() for cell in row
+        if isinstance(cell.value, datetime)
+    ]
+    assert exception_date_cells
+    assert all(cell.number_format == "mm/dd/yyyy" for cell in exception_date_cells)
+
+
+def test_legacy_intro_note_reports_percent_reconciled_and_us_style_timestamp(qb_mapping, inf_mapping, make_metadata):
+    import re
+
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    note = ws.cell(2, 1).value
+    assert re.match(
+        r"^\d[\d,]* of \d[\d,]* QuickBooks records reconciled \(\d+\.\d%\)\. "
+        r"Gold rows require review; red rows are excluded duplicates\. See Exceptions for details\. "
+        r"Generated \d{2}/\d{2}/\d{4} \d{1,2}:\d{2} (AM|PM) [A-Z]{3,4}\.$",
+        note,
+    ), note
+
+
+def test_legacy_workbook_suppresses_number_stored_as_text_warnings(qb_mapping, inf_mapping, make_metadata):
+    """Invoice/PO/customer numbers are identifiers, correctly stored as
+    text -- the legacy workbook must tell Excel not to flag them with green
+    triangles, via each sheet's <ignoredErrors> (placed where the schema
+    requires it) -- and the primary workpaper is unaffected."""
+    import zipfile
+
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    archive = zipfile.ZipFile(io.BytesIO(build_legacy_workbook(result)))
+    sheet_parts = [n for n in archive.namelist() if n.startswith("xl/worksheets/sheet")]
+    assert len(sheet_parts) == 3
+    for name in sheet_parts:
+        xml = archive.read(name).decode("utf-8")
+        assert xml.count('numberStoredAsText="1"') == 1, name
+        # Schema order: <ignoredErrors> follows pageSetup/headerFooter and
+        # precedes the trailing drawing/tableParts, or Excel repairs the file.
+        assert xml.index("<ignoredErrors>") > xml.index("</sheetData>")
+        assert xml.index("<ignoredErrors>") < xml.index("</worksheet>")
+        for later in ("<drawing", "<legacyDrawing", "<tableParts", "<extLst"):
+            if later in xml:
+                assert xml.index("<ignoredErrors>") < xml.index(later)
+    # The archive is still a valid workbook openpyxl can read back.
+    assert load_workbook(io.BytesIO(build_legacy_workbook(result))).sheetnames == EXPECTED_LEGACY_SHEETS
+
+    primary = zipfile.ZipFile(io.BytesIO(build_primary_workbook(result)))
+    assert not any(
+        "ignoredErrors" in primary.read(n).decode("utf-8")
+        for n in primary.namelist() if n.startswith("xl/worksheets/sheet")
+    )
 
 
 def test_legacy_reconciliation_normalizes_infinium_column_names(qb_mapping, make_metadata):

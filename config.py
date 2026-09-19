@@ -53,6 +53,9 @@ LEGACY_NO_PAIR_FILL = "F8FAF9"
 # The Match Method data column: RGB(234, 234, 234).
 LEGACY_METHOD_FILL = "EAEAEA"
 LEGACY_BODY_TEXT = "000000"
+
+# Every real date cell in every workbook is displayed this way.
+DATE_NUMBER_FORMAT = "mm/dd/yyyy"
 RED_LIGHT = "FDECEC"
 GREEN_LIGHT = "E8F3EC"
 WHITE = "FFFFFF"

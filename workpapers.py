@@ -12,7 +12,9 @@ module and the browser.
 from __future__ import annotations
 
 import io
-from datetime import datetime
+import re
+import zipfile
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -20,7 +22,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
 from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Font, PatternFill, Protection
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableColumn, TableStyleInfo
@@ -31,6 +33,7 @@ from config import (
     ACCOUNTING_QUANTITY_FORMAT,
     AMBER,
     CENTRAL_TIMEZONE,
+    DATE_NUMBER_FORMAT,
     DUPLICATE_RED_FILL,
     DUPLICATE_RED_TEXT,
     FONT_NAME,
@@ -1865,10 +1868,10 @@ def _legacy_match_method_label(record: dict, result: ReconciliationResult, candi
             reference = _legacy_already_matched_reference(
                 result.qb_work, record["QB Index"], candidate_map.get(qb_id, {}), inf_references,
             )
-            return f"Potential Duplicate: {reference} value already matched"
-        return "No Matching Infinium records"
+            return f"Potential Duplicate: {reference} Value Already Matched"
+        return "No Matching Infinium Records"
     if section == "03 Unmatched Infinium":
-        return "No Matching QuickBooks records"
+        return "No Matching QuickBooks Records"
     if section in _LEGACY_DUPLICATE_SECTIONS:
         return "Duplicate: Excess Copy Excluded"
     if section in {"06 Duplicate Review Hold QuickBooks", "07 Duplicate Review Hold Infinium"}:
@@ -1881,7 +1884,7 @@ def _legacy_match_method_label(record: dict, result: ReconciliationResult, candi
     if section == "08 Reference-Matched Amount Variance Review Hold":
         return "Amount Differs: Same PO/Invoice"
     if section == "10 Ambiguous Duplicate QuickBooks":
-        return "Potential Duplicate: Multiple Infinium candidates"
+        return "Potential Duplicate: Multiple Infinium Candidates"
     return match_result
 
 
@@ -1895,24 +1898,76 @@ def _legacy_row_needs_attention(section: str) -> bool:
 
 
 def _write_legacy_legend(ws, row: int, start_col: int) -> None:
-    """A compact color key just under the introductory note: a small
-    swatch, then its meaning, three times over. Labels are left to spill
-    into the empty cells to their right rather than being merged."""
-    entries = [
+    """A compact color key just under the introductory note: three adjacent
+    chips, each filled with the exact row tint it explains and carrying its
+    own label, so the key and the rows can never disagree. (A colored "■"
+    glyph would be invisible for the paler tints.) Text shrinks to fit
+    whatever width its column happens to have."""
+    chip_border_side = Side(style="thin", color="BFBFBF")
+    chips = [
         (LEGACY_MATCHED_FILL, "Reconciled"),
-        (LEGACY_REVIEW_FILL, "Review"),
+        (LEGACY_REVIEW_FILL, "Review required"),
         (LEGACY_NO_PAIR_FILL, "No paired record"),
     ]
-    col = start_col
-    for fill_color, label in entries:
-        swatch = ws.cell(row, col)
-        swatch.fill = PatternFill("solid", fgColor=fill_color)
-        swatch.border = _thin_border()
-        text = ws.cell(row, col + 1, label)
-        text.font = Font(name=FONT_NAME, size=9, color=LEGACY_BODY_TEXT)
-        text.alignment = Alignment(horizontal="left", vertical="center")
-        col += 3
+    for offset, (fill_color, label) in enumerate(chips):
+        cell = ws.cell(row, start_col + offset, label)
+        cell.fill = PatternFill("solid", fgColor=fill_color)
+        cell.font = Font(name=FONT_NAME, size=9, color=LEGACY_BODY_TEXT)
+        cell.alignment = Alignment(horizontal="center", vertical="center", shrink_to_fit=True)
+        cell.border = Border(
+            left=chip_border_side, right=chip_border_side, top=chip_border_side, bottom=chip_border_side,
+        )
     ws.row_dimensions[row].height = 18
+
+
+def _legacy_generated_stamp(run_timestamp: datetime) -> str:
+    """"09/19/2026 3:21 PM CDT" -- MM/DD/YYYY and a 12-hour clock, in
+    Central time, matching how every date on the legacy sheets displays."""
+    local = run_timestamp.astimezone(CENTRAL_TIMEZONE)
+    hour = local.strftime("%I").lstrip("0") or "12"
+    return f"{local:%m/%d/%Y} {hour}:{local:%M} {local:%p} {local:%Z}"
+
+
+_LEGACY_DATE_INPUT_FORMATS = ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%Y-%m-%d %H:%M:%S", "%m-%d-%Y")
+
+
+def _legacy_parse_date(value: Any) -> Optional[datetime]:
+    """A source date as a real date: an existing datetime/date passes
+    through, and text like "1/09/2026" or "2026-03-03" is parsed month-first
+    (the export's own convention). Anything else is not treated as a date."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    for pattern in _LEGACY_DATE_INPUT_FORMATS:
+        try:
+            return datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+    return None
+
+
+def _legacy_standardize_dates(
+    ws, headers: list[str], start_col: int, first_row: int, last_row: int,
+) -> None:
+    """Every date-column cell on a legacy sheet becomes a real date shown as
+    MM/DD/YYYY. QuickBooks delivers some dates as real dates and others as
+    text, which otherwise render as "2026-03-03" beside "08/17/2026"; a
+    text date is converted, and all date cells are centered alike."""
+    for offset, header in enumerate(headers):
+        if "DATE" not in str(header).upper():
+            continue
+        for row in range(first_row, last_row + 1):
+            cell = ws.cell(row, start_col + offset)
+            parsed = _legacy_parse_date(cell.value)
+            if parsed is None:
+                continue
+            cell.value = parsed
+            cell.number_format = DATE_NUMBER_FORMAT
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
 def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult) -> None:
@@ -1983,9 +2038,10 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM", TEAL)
     _write_caption_band(
         ws, 2, qb_start, qb_end,
-        f"Every QuickBooks row, sorted by normalized PO. {matched_count:,} of {len(qb_rows):,} matched -- see "
-        f"the Exceptions sheet for QuickBooks items shown gold (review) or red (excluded duplicate) here. "
-        f"Generated {format_central_timestamp(result.run_timestamp)}.",
+        f"{matched_count:,} of {len(qb_rows):,} QuickBooks records reconciled "
+        f"({(matched_count / len(qb_rows) * 100) if qb_rows else 0:.1f}%). Gold rows require review; red rows are "
+        f"excluded duplicates. See Exceptions for details. Generated "
+        f"{_legacy_generated_stamp(result.run_timestamp)}.",
         NAVY,
     )
     _write_caption_band(
@@ -2083,6 +2139,8 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _standardize_legacy_widths(ws, qb_headers, qb_start, result.qb_mapping)
     _standardize_legacy_widths(ws, inf_headers, inf_start, result.inf_mapping)
     ws.column_dimensions[get_column_letter(method_col)].width = 46
+    _legacy_standardize_dates(ws, qb_headers, qb_start, data_row, final_data_row)
+    _legacy_standardize_dates(ws, _legacy_infinium_display_headers(inf_headers), inf_start, data_row, final_data_row)
     # Each blank side becomes one merged cell, so an empty block reads as a
     # single quiet panel instead of a row of empty gridlined cells. Merged
     # last, after every cell has been styled and formatted.
@@ -2166,7 +2224,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
         f"{len(general_rows):,} QuickBooks exception(s) at left (unmatched and review-hold items, shaded "
         f"gold) and {len(duplicate_rows):,} excluded QuickBooks duplicate copy(ies) at right (shaded red). "
         f"Infinium-only exceptions carry no accrual impact and are not repeated here. Generated "
-        f"{format_central_timestamp(result.run_timestamp)}.",
+        f"{_legacy_generated_stamp(result.run_timestamp)}.",
         NAVY,
     )
 
@@ -2229,6 +2287,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
             ws.cell(row, trailer_end).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         _apply_number_formats(ws, qb_headers, data_row, block_final_row, block_qb_start,
                               {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
+        _legacy_standardize_dates(ws, qb_headers, block_qb_start, data_row, block_final_row)
         _set_widths(ws, block_qb_start, block_qb_start + n_qb - 1, header_row, block_final_row, maximum=40)
         _standardize_legacy_widths(ws, qb_headers, block_qb_start, result.qb_mapping)
         ws.column_dimensions[get_column_letter(trailer_start)].width = 14
@@ -2279,6 +2338,7 @@ def build_legacy_workbook(result: ReconciliationResult) -> bytes:
     return _save_workbook_bytes(
         wb, apply_accountant_row_heights=True,
         skip_autofit_titles=frozenset({"Legacy Reconciliation", "Exceptions"}),
+        suppress_text_number_warnings=True,
     )
 
 
@@ -2346,16 +2406,20 @@ def _autofit_workbook_rows(wb: Workbook) -> None:
                 ws.row_dimensions[row_idx].height = _controlled_row_two_height(ws.title)
                 continue
 
-            # Row 1 is a single-line title band. Its merged text is measured
-            # against only the first column's width here, which on the legacy
-            # sheets (narrow leading columns) reads as 3-5 wrapped lines and
-            # balloons the band to 45-75pt. Pin it to the band's designed 27.
-            if row_idx == 1 and ws.title in _FIXED_TITLE_ROW_SHEETS:
-                ws.row_dimensions[row_idx].height = _TITLE_ROW_HEIGHT
+            fixed_height = _FIXED_ROW_HEIGHTS.get(ws.title, {}).get(row_idx)
+            if fixed_height is not None:
+                ws.row_dimensions[row_idx].height = fixed_height
                 continue
 
             for cell in row:
-                text = str(cell.value) if cell.value is not None else ""
+                # A date renders as MM/DD/YYYY (10 characters), not as the
+                # 19-character "YYYY-MM-DD HH:MM:SS" str() of the datetime --
+                # measuring the latter wraps every date cell and inflates
+                # the whole row.
+                if isinstance(cell.value, (datetime, date)):
+                    text = "00/00/0000"
+                else:
+                    text = str(cell.value) if cell.value is not None else ""
                 if not text:
                     continue
 
@@ -2392,8 +2456,14 @@ def _autofit_workbook_rows(wb: Workbook) -> None:
                 ws.row_dimensions[row_idx].height = None
                 
 
-_FIXED_TITLE_ROW_SHEETS = frozenset({"Legacy Reconciliation", "Exceptions"})
-_TITLE_ROW_HEIGHT = 27
+# Rows whose height is a deliberate design value rather than something to be
+# measured from their text. Row 1 is a single-line title band; measured
+# against only its first (narrow) column it reads as 3-5 wrapped lines and
+# balloons to 45-75pt. Legacy Reconciliation row 3 is the one-line legend.
+_FIXED_ROW_HEIGHTS = {
+    "Legacy Reconciliation": {1: 27, 3: 18},
+    "Exceptions": {1: 27},
+}
 
 
 def _controlled_row_two_height(sheet_title: str) -> int:
@@ -2416,6 +2486,7 @@ def _save_workbook_bytes(
     *,
     apply_accountant_row_heights: bool = False,
     skip_autofit_titles: frozenset = frozenset(),
+    suppress_text_number_warnings: bool = False,
 ) -> bytes:
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
@@ -2428,7 +2499,39 @@ def _save_workbook_bytes(
         _apply_accountant_output_row_heights(wb)
     buffer = io.BytesIO()
     wb.save(buffer)
-    return buffer.getvalue()
+    saved = buffer.getvalue()
+    return _add_ignored_errors(saved) if suppress_text_number_warnings else saved
+
+
+# Worksheet-XML children that must come after <ignoredErrors> in the schema.
+_AFTER_IGNORED_ERRORS = (
+    "smartTags", "drawing", "legacyDrawing", "legacyDrawingHF", "picture",
+    "oleObjects", "controls", "webPublishItems", "tableParts", "extLst",
+)
+_IGNORED_ERRORS_XML = (
+    '<ignoredErrors><ignoredError sqref="A1:XFD1048576" numberStoredAsText="1"/></ignoredErrors>'
+)
+
+
+def _add_ignored_errors(xlsx_bytes: bytes) -> bytes:
+    """Suppress Excel's green "number stored as text" triangles on every
+    worksheet. Invoice, PO, and customer numbers are identifiers, so storing
+    them as text is correct -- but openpyxl has no API for the worksheet's
+    <ignoredErrors> element, so it is inserted into each sheet's XML at its
+    schema-mandated position after the workbook is saved."""
+    source = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+    output = io.BytesIO()
+    boundary = re.compile(r"<(?:%s)[\s>/]" % "|".join(_AFTER_IGNORED_ERRORS))
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", item.filename):
+                xml = data.decode("utf-8")
+                match = boundary.search(xml)
+                position = match.start() if match else xml.rindex("</worksheet>")
+                data = (xml[:position] + _IGNORED_ERRORS_XML + xml[position:]).encode("utf-8")
+            target.writestr(item, data)
+    return output.getvalue()
 
 
 def _apply_workbook_run_metadata(wb: Workbook, result: ReconciliationResult) -> None:

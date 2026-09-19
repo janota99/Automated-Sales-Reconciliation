@@ -22,6 +22,7 @@ from config import (
     ACCOUNTING_CURRENCY_FORMAT,
     ACCOUNTING_QUANTITY_FORMAT,
     BORDER,
+    DATE_NUMBER_FORMAT,
     DUPLICATE_RED_FILL,
     DUPLICATE_RED_TEXT,
     FONT_NAME,
@@ -117,7 +118,7 @@ def _infer_column_style(
     if header in quantity_columns or any(term in header_upper for term in ("QUANTITY", "QTY")):
         return ALIGN_RIGHT_CENTER, ACCOUNTING_QUANTITY_FORMAT, True
     if "DATE" in header_upper or "TIMESTAMP" in header_upper:
-        return ALIGN_CENTER_CENTER, "yyyy-mm-dd", False
+        return ALIGN_CENTER_CENTER, DATE_NUMBER_FORMAT, False
     return None, None, False
 
 
