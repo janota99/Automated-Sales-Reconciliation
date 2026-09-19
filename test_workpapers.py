@@ -336,6 +336,18 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     assert unmatched[method_col - 1].font.bold is True
     assert _fill_matches(unmatched[method_col - 1], LEGACY_METHOD_FILL)
     assert _fill_matches(unmatched[inf_start - 1], LEGACY_NO_PAIR_FILL)
+    # The blank side is a single merged cell (no empty gridlined cells), and
+    # only the blank side -- populated blocks stay one cell per field.
+    inf_end = len(ws[4])
+    merged = {str(r) for r in ws.merged_cells.ranges}
+    unmatched_row = unmatched[0].row
+    assert f"{get_column_letter(inf_start)}{unmatched_row}:{get_column_letter(inf_end)}{unmatched_row}" in merged
+    assert f"A{unmatched_row}:{get_column_letter(method_col - 1)}{unmatched_row}" not in merged
+    matched_row = matched[0].row
+    assert not any(
+        r.min_row == matched_row and r.max_row == matched_row and r.min_col != r.max_col
+        and r.min_row > 4 for r in ws.merged_cells.ranges
+    )
 
     # Excluded duplicate copy: pale red, informational (not bolded).
     duplicate = by_label["Duplicate: Excess Copy Excluded"][0]
@@ -350,6 +362,7 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     # the same near-white gray, while the Infinium side keeps the status tint.
     inf_only = by_label["No Matching QuickBooks records"][0]
     assert _fill_matches(inf_only[po_col - 1], LEGACY_NO_PAIR_FILL)
+    assert f"A{inf_only[0].row}:{get_column_letter(method_col - 1)}{inf_only[0].row}" in merged
     assert _fill_matches(inf_only[inf_start - 1], LEGACY_REVIEW_FILL) or _fill_matches(
         inf_only[inf_start - 1], LEGACY_EXCLUDED_FILL
     )

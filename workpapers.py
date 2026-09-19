@@ -2026,6 +2026,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _format_header(ws, header_row, method_col, method_col, SLATE)
     _format_header(ws, header_row, inf_start, inf_end, TEAL)
 
+    blank_side_merges: list[tuple[int, int, int]] = []
     for offset, record in enumerate(all_rows):
         row = data_row + offset
         section = record.get("Section", "")
@@ -2047,6 +2048,10 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
         has_inf = record.get("Infinium Index") is not None
         _apply_legacy_status_fill(ws, row, qb_start, qb_end, status_fill if has_qb else LEGACY_NO_PAIR_FILL)
         _apply_legacy_status_fill(ws, row, inf_start, inf_end, status_fill if has_inf else LEGACY_NO_PAIR_FILL)
+        if not has_qb:
+            blank_side_merges.append((row, qb_start, qb_end))
+        if not has_inf:
+            blank_side_merges.append((row, inf_start, inf_end))
         _apply_legacy_status_cell(ws, row, method_col, LEGACY_METHOD_FILL, _legacy_row_needs_attention(section))
         ws.cell(row, method_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws.cell(row, method_col).border = _thin_border()
@@ -2078,6 +2083,14 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _standardize_legacy_widths(ws, qb_headers, qb_start, result.qb_mapping)
     _standardize_legacy_widths(ws, inf_headers, inf_start, result.inf_mapping)
     ws.column_dimensions[get_column_letter(method_col)].width = 46
+    # Each blank side becomes one merged cell, so an empty block reads as a
+    # single quiet panel instead of a row of empty gridlined cells. Merged
+    # last, after every cell has been styled and formatted.
+    for merge_row, merge_start, merge_end in blank_side_merges:
+        if merge_end > merge_start:
+            ws.merge_cells(
+                start_row=merge_row, start_column=merge_start, end_row=merge_row, end_column=merge_end,
+            )
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
     if all_rows:
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(inf_end)}{final_data_row}"
