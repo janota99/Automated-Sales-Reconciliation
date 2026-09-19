@@ -168,14 +168,15 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
 
     recon_ws = wb["Legacy Reconciliation"]
     recon_text = _worksheet_text(recon_ws)
-    assert any("Match Method" in text for text in recon_text)
+    assert any("Match Result" in text for text in recon_text)
+    assert not any("Match Method" in text or "MATCH METHOD" in text for text in recon_text)
     # The one clean 1:1 match (PO100/INV100/$100) must appear, in a pale
     # green tint, with its method labeled by how it matched -- no
     # confidence tier attached.
     assert any(text == "Unique Match: PO + Invoice + Amount" for text in recon_text)
     # Row 3 is the color legend; row 4 is the header row (unchanged headers).
     header_cells = {cell.value: cell.column for cell in next(recon_ws.iter_rows(min_row=4, max_row=4))}
-    method_col = header_cells["Match Method"]
+    method_col = header_cells["Match Result"]
     data_row_cells = list(recon_ws.iter_rows(min_row=5, max_row=5))[0]
     non_method_cells = [c for c in data_row_cells if c.column != method_col]
     assert any(_fill_matches(cell, LEGACY_MATCHED_FILL) for cell in non_method_cells)
@@ -184,7 +185,7 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
         if cell.value is not None:
             assert cell.font.bold is not True
             assert cell.font.color.rgb.endswith("000000")
-    # The Match Method data cell is RGB(234,234,234); a clean match isn't bolded.
+    # The Match Result data cell is RGB(234,234,234); a clean match isn't bolded.
     method_cell = next(c for c in data_row_cells if c.column == method_col)
     assert _fill_matches(method_cell, LEGACY_METHOD_FILL)
     assert method_cell.font.bold is not True
@@ -303,7 +304,7 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     headers: dict = {}
     for cell in ws[4]:
         headers.setdefault(cell.value, cell.column)
-    method_col = headers["Match Method"]
+    method_col = headers["Match Result"]
     amount_col = headers["Amount"]
     po_col = headers["PO"]
     inf_start = method_col + 1
@@ -356,9 +357,12 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
 
     # Compact legend directly under the introductory note.
     legend = [cell.value for cell in ws[3] if cell.value]
-    assert legend == ["Reconciled", "Review required", "No paired record"]
-    # Three adjacent chips, each filled with the exact tint it explains.
-    for chip, tint in zip(ws[3][:3], (LEGACY_MATCHED_FILL, LEGACY_REVIEW_FILL, LEGACY_NO_PAIR_FILL)):
+    assert legend == ["Reconciled", "Review required", "Excluded duplicate", "No paired record"]
+    # Four adjacent chips, each filled with the exact tint it explains.
+    for chip, tint in zip(
+        ws[3][:4],
+        (LEGACY_MATCHED_FILL, LEGACY_REVIEW_FILL, LEGACY_EXCLUDED_FILL, LEGACY_NO_PAIR_FILL),
+    ):
         assert _fill_matches(chip, tint)
     assert ws.row_dimensions[3].height == 18
 
@@ -371,6 +375,60 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
         inf_only[inf_start - 1], LEGACY_EXCLUDED_FILL
     )
     assert ws.print_title_rows == "$1:$4"
+
+
+def test_legacy_review_labels_and_red_row_reference(qb_mapping, inf_mapping, make_metadata):
+    """The red-row sentence in the intro note appears only when a red
+    (excluded duplicate) row exists; the legend always lists the chip."""
+    with_red = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(with_red)))["Legacy Reconciliation"]
+    assert "red rows are excluded duplicates" in ws.cell(2, 1).value
+
+    without_red = _build_result_without_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(without_red)))["Legacy Reconciliation"]
+    note = ws.cell(2, 1).value
+    assert "red" not in note.lower()
+    assert "Gold rows require review. See Exceptions for details." in note
+    assert "Excluded duplicate" in [cell.value for cell in ws[3]]
+
+
+def test_legacy_already_matched_duplicate_reads_as_a_review_action(qb_mapping, inf_mapping, make_metadata):
+    """An unresolved QuickBooks row whose PO/invoice belongs to an Infinium
+    row already matched elsewhere is labeled as a review action."""
+    qb_rows = [
+        {"PO": "PO-USED", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-USED", "Invoice": "INV-B", "Amount": 55.00, "Qty": 1, "Period": "1"},
+    ]
+    inf_rows = [{"PO": "PO-USED", "Invoice": "INV-A", "Amount": 100.00, "Period": "1"}]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    labels = {cell.value for row in ws.iter_rows(min_row=5) for cell in row if isinstance(cell.value, str)}
+    assert "Review: PO Already Used by Another Match" in labels
+    assert not any("Value Already Matched" in label for label in labels)
+
+
+def test_legacy_short_valued_columns_are_wide_enough_for_their_headings(make_metadata, qb_mapping):
+    """Infinium's five-digit "Customer No" column is sized to its data, which
+    clips its heading (and the autofilter button) to "Customer N"."""
+    qb_rows = [{"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1"}]
+    inf_rows = [{
+        "OHAPD": "1", "OHOBDE": "1/09/2026", "OHCO": "WP", "CUNO": 50001, "OHOBNO": "INV100",
+        "OHTOTA": 100.00, "OHDESC": "PO 100", "OHPONO": "PO100",
+    }]
+    inf_mapping = {"po": "OHPONO", "invoice": "OHOBNO", "amount": "OHTOTA", "period": "OHAPD"}
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    for cell in ws[4]:
+        if cell.value:
+            assert ws.column_dimensions[get_column_letter(cell.column)].width >= len(str(cell.value)) + 5, cell.value
+    customer_no = next(c for c in ws[4] if c.value == "Customer No")
+    assert ws.column_dimensions[get_column_letter(customer_no.column)].width >= 16
 
 
 def test_legacy_dates_are_real_dates_shown_as_mm_dd_yyyy(qb_mapping, make_metadata):
@@ -435,7 +493,8 @@ def test_legacy_workbook_suppresses_number_stored_as_text_warnings(qb_mapping, i
     """Invoice/PO/customer numbers are identifiers, correctly stored as
     text -- the legacy workbook must tell Excel not to flag them with green
     triangles, via each sheet's <ignoredErrors> (placed where the schema
-    requires it) -- and the primary workpaper is unaffected."""
+    requires it). The primary workpaper does the same; it has a table part,
+    so the element must land before <tableParts>."""
     import zipfile
 
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
@@ -456,10 +515,18 @@ def test_legacy_workbook_suppresses_number_stored_as_text_warnings(qb_mapping, i
     assert load_workbook(io.BytesIO(build_legacy_workbook(result))).sheetnames == EXPECTED_LEGACY_SHEETS
 
     primary = zipfile.ZipFile(io.BytesIO(build_primary_workbook(result)))
-    assert not any(
-        "ignoredErrors" in primary.read(n).decode("utf-8")
-        for n in primary.namelist() if n.startswith("xl/worksheets/sheet")
-    )
+    primary_parts = [n for n in primary.namelist() if n.startswith("xl/worksheets/sheet")]
+    assert len(primary_parts) == len(EXPECTED_PRIMARY_SHEETS)
+    saw_table_sheet = False
+    for name in primary_parts:
+        xml = primary.read(name).decode("utf-8")
+        assert xml.count('numberStoredAsText="1"') == 1, name
+        assert xml.index("<ignoredErrors>") > xml.index("</sheetData>")
+        if "<tableParts" in xml:
+            saw_table_sheet = True
+            assert xml.index("<ignoredErrors>") < xml.index("<tableParts")
+    assert saw_table_sheet
+    assert load_workbook(io.BytesIO(build_primary_workbook(result))).sheetnames == EXPECTED_PRIMARY_SHEETS
 
 
 def test_legacy_reconciliation_normalizes_infinium_column_names(qb_mapping, make_metadata):
@@ -477,7 +544,7 @@ def test_legacy_reconciliation_normalizes_infinium_column_names(qb_mapping, make
     header_values = [cell.value for cell in ws[4]]
     for raw in ("OHAPD", "OHOBDE", "OHCO", "CUNO", "OHOBNO", "OHTOTA", "OHDESC", "OHPONO"):
         assert raw not in header_values
-    inf_headers = header_values[header_values.index("Match Method") + 1:]
+    inf_headers = header_values[header_values.index("Match Result") + 1:]
     assert inf_headers[:8] == [
         "Period", "Date", "Type", "Customer No", "Invoice No", "Amount", "Description", "PO No.",
     ]

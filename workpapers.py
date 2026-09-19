@@ -1852,7 +1852,7 @@ def _legacy_already_matched_reference(qb_frame, qidx, candidate: dict, inf_refer
 
 
 def _legacy_match_method_label(record: dict, result: ReconciliationResult, candidate_map: dict, inf_references: dict) -> str:
-    """The Legacy Reconciliation "Match Method" text: just how the match
+    """The Legacy Reconciliation "Match Result" text: just how the match
     was made (or why there isn't one). Confidence tiers stay on the primary
     workpaper and analytics package -- the accountant's legacy view is a
     read-on-sight summary, and the row's fill already carries the status."""
@@ -1868,7 +1868,7 @@ def _legacy_match_method_label(record: dict, result: ReconciliationResult, candi
             reference = _legacy_already_matched_reference(
                 result.qb_work, record["QB Index"], candidate_map.get(qb_id, {}), inf_references,
             )
-            return f"Potential Duplicate: {reference} Value Already Matched"
+            return f"Review: {reference} Already Used by Another Match"
         return "No Matching Infinium Records"
     if section == "03 Unmatched Infinium":
         return "No Matching QuickBooks Records"
@@ -1907,6 +1907,7 @@ def _write_legacy_legend(ws, row: int, start_col: int) -> None:
     chips = [
         (LEGACY_MATCHED_FILL, "Reconciled"),
         (LEGACY_REVIEW_FILL, "Review required"),
+        (LEGACY_EXCLUDED_FILL, "Excluded duplicate"),
         (LEGACY_NO_PAIR_FILL, "No paired record"),
     ]
     for offset, (fill_color, label) in enumerate(chips):
@@ -1948,6 +1949,19 @@ def _legacy_parse_date(value: Any) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+def _legacy_ensure_headers_fit(ws, headers: list[str], start_col: int) -> None:
+    """Widen any column too narrow for its own bold heading plus the
+    autofilter button Excel draws inside it -- otherwise a short-valued
+    column such as an Infinium "Customer No" (five-digit values) is sized
+    to its data and its heading is clipped to "Customer N"."""
+    for offset, header in enumerate(headers):
+        letter = get_column_letter(start_col + offset)
+        needed = len(str(header)) + 5
+        current = ws.column_dimensions[letter].width or 0
+        if current < needed:
+            ws.column_dimensions[letter].width = needed
 
 
 def _legacy_standardize_dates(
@@ -2032,21 +2046,23 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     all_rows = qb_rows + inf_only_rows
     final_data_row = data_row + max(len(all_rows), 1) - 1
     matched_count = sum(1 for record in all_rows if record.get("Section") in _LEGACY_MATCHED_SECTIONS)
+    # The red-row sentence in the note is only meaningful if a red row exists.
+    has_excluded_duplicates = any(record.get("Section") in _LEGACY_DUPLICATE_SECTIONS for record in all_rows)
 
     _write_title_band(ws, 1, qb_start, qb_end, "QUICKBOOKS | SORTED BY PO", NAVY)
-    _write_title_band(ws, 1, method_col, method_col, "MATCH METHOD", SLATE)
+    _write_title_band(ws, 1, method_col, method_col, "MATCH RESULT", SLATE)
     _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM", TEAL)
     _write_caption_band(
         ws, 2, qb_start, qb_end,
         f"{matched_count:,} of {len(qb_rows):,} QuickBooks records reconciled "
-        f"({(matched_count / len(qb_rows) * 100) if qb_rows else 0:.1f}%). Gold rows require review; red rows are "
-        f"excluded duplicates. See Exceptions for details. Generated "
-        f"{_legacy_generated_stamp(result.run_timestamp)}.",
+        f"({(matched_count / len(qb_rows) * 100) if qb_rows else 0:.1f}%). "
+        f"{'Gold rows require review; red rows are excluded duplicates.' if has_excluded_duplicates else 'Gold rows require review.'} "
+        f"See Exceptions for details. Generated {_legacy_generated_stamp(result.run_timestamp)}.",
         NAVY,
     )
     _write_caption_band(
         ws, 2, method_col, method_col,
-        "How each match was made -- or, for an unpaired row, why there is no match.",
+        "How each row resolved: the rule that matched it, or why it did not match.",
         SLATE,
     )
     _write_caption_band(
@@ -2072,7 +2088,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
             ws.cell(row, inf_start + col_offset, excel_safe(value))
         ws.cell(row, method_col, _legacy_match_method_label(record, result, candidate_map, inf_references))
 
-    ws.cell(header_row, method_col, "Match Method")
+    ws.cell(header_row, method_col, "Match Result")
     _write_legacy_legend(ws, legend_row, qb_start)
     _write_dataframe_values(ws, pd.DataFrame(columns=qb_headers), header_row, qb_start)
     _write_dataframe_values(
@@ -2138,6 +2154,8 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _set_widths(ws, inf_start, inf_end, header_row, total_row, maximum=40)
     _standardize_legacy_widths(ws, qb_headers, qb_start, result.qb_mapping)
     _standardize_legacy_widths(ws, inf_headers, inf_start, result.inf_mapping)
+    _legacy_ensure_headers_fit(ws, qb_headers, qb_start)
+    _legacy_ensure_headers_fit(ws, _legacy_infinium_display_headers(inf_headers), inf_start)
     ws.column_dimensions[get_column_letter(method_col)].width = 46
     _legacy_standardize_dates(ws, qb_headers, qb_start, data_row, final_data_row)
     _legacy_standardize_dates(ws, _legacy_infinium_display_headers(inf_headers), inf_start, data_row, final_data_row)
@@ -2290,6 +2308,7 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
         _legacy_standardize_dates(ws, qb_headers, block_qb_start, data_row, block_final_row)
         _set_widths(ws, block_qb_start, block_qb_start + n_qb - 1, header_row, block_final_row, maximum=40)
         _standardize_legacy_widths(ws, qb_headers, block_qb_start, result.qb_mapping)
+        _legacy_ensure_headers_fit(ws, qb_headers, block_qb_start)
         ws.column_dimensions[get_column_letter(trailer_start)].width = 14
         ws.column_dimensions[get_column_letter(trailer_start + 1)].width = 34
         ws.column_dimensions[get_column_letter(trailer_end)].width = 60
@@ -2527,7 +2546,7 @@ def _add_ignored_errors(xlsx_bytes: bytes) -> bytes:
             data = source.read(item.filename)
             if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", item.filename):
                 xml = data.decode("utf-8")
-                match = boundary.search(xml)
+                match = boundary.search(xml, xml.index("</sheetData>"))
                 position = match.start() if match else xml.rindex("</worksheet>")
                 data = (xml[:position] + _IGNORED_ERRORS_XML + xml[position:]).encode("utf-8")
             target.writestr(item, data)
@@ -2570,7 +2589,7 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     _link_reconciled_data_to_unresolved_exceptions(wb, result)
     build_product_sheet(wb, result)
     _apply_workbook_run_metadata(wb, result)
-    return _save_workbook_bytes(wb, apply_accountant_row_heights=True)
+    return _save_workbook_bytes(wb, apply_accountant_row_heights=True, suppress_text_number_warnings=True)
 
 
 def detailed_ledger_dataframe(result: ReconciliationResult) -> pd.DataFrame:
