@@ -21,6 +21,7 @@ from openpyxl.utils import get_column_letter
 
 from matching import QB_ID, build_reconciliation
 from workpapers import (
+    _legacy_matched_label,
     build_analytics_workbook,
     build_data_search_dataframe,
     build_legacy_workbook,
@@ -146,7 +147,7 @@ _LEGACY_MATCHED_SECTIONS_FOR_TEST = {
 
 
 def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping, make_metadata):
-    from config import DUPLICATE_RED_FILL, GOOD_GREEN_FILL, METHOD_GREY_FILL, NEUTRAL_GOLD_FILL
+    from config import LEGACY_EXCLUDED_FILL, LEGACY_MATCHED_FILL, LEGACY_METHOD_FILL, LEGACY_REVIEW_FILL
 
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
     # Sanity check the fixture actually has an Infinium-only exception (the
@@ -168,21 +169,28 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     recon_ws = wb["Legacy Reconciliation"]
     recon_text = _worksheet_text(recon_ws)
     assert any("Match Method" in text for text in recon_text)
-    # The one clean 1:1 match (PO100/INV100/$100) must appear, colored Good green.
-    assert any("PO + Invoice + Amount" in text for text in recon_text)
-    header_cells = {cell.value: cell.column for cell in next(recon_ws.iter_rows(min_row=3, max_row=3))}
+    # The one clean 1:1 match (PO100/INV100/$100) must appear, in a pale
+    # green tint, with its method labeled by how it matched -- no
+    # confidence tier attached.
+    assert any(text == "Unique Match: PO + Invoice + Amount" for text in recon_text)
+    # Row 3 is the color legend; row 4 is the header row (unchanged headers).
+    header_cells = {cell.value: cell.column for cell in next(recon_ws.iter_rows(min_row=4, max_row=4))}
     method_col = header_cells["Match Method"]
-    data_row_cells = list(recon_ws.iter_rows(min_row=4, max_row=4))[0]
-    # QB and Infinium sides are Good green; the Match Method column between
-    # them is its own grey/dark-bold-black divider, not green.
+    data_row_cells = list(recon_ws.iter_rows(min_row=5, max_row=5))[0]
     non_method_cells = [c for c in data_row_cells if c.column != method_col]
-    assert any(_fill_matches(cell, GOOD_GREEN_FILL) for cell in non_method_cells)
+    assert any(_fill_matches(cell, LEGACY_MATCHED_FILL) for cell in non_method_cells)
+    # Body text is regular-weight black -- never bold, never colored.
+    for cell in non_method_cells:
+        if cell.value is not None:
+            assert cell.font.bold is not True
+            assert cell.font.color.rgb.endswith("000000")
+    # The Match Method data cell is RGB(234,234,234); a clean match isn't bolded.
     method_cell = next(c for c in data_row_cells if c.column == method_col)
-    assert _fill_matches(method_cell, METHOD_GREY_FILL)
-    assert method_cell.font.color.rgb.endswith("000000")
-    assert method_cell.font.bold is True
-    # Row 2 (the caption band) is fixed at height 30 on this sheet.
+    assert _fill_matches(method_cell, LEGACY_METHOD_FILL)
+    assert method_cell.font.bold is not True
+    # Row 2 (the caption band) stays fixed at height 30; row 1 is pinned to 27.
     assert recon_ws.row_dimensions[2].height == 30
+    assert recon_ws.row_dimensions[1].height == 27
 
     # Every QB row (matched or not) is on Legacy Reconciliation, plus the
     # qualifying Infinium-only rows (any-period duplicate, current-period
@@ -197,11 +205,11 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     all_qb_rows = [r for r in result.paired_rows if r.get("QB Index") is not None]
     expected_recon_row_count = len(all_qb_rows) + len(qualifying_inf_only)
     total_row_number = next(
-        row[0].row for row in recon_ws.iter_rows(min_row=4)
+        row[0].row for row in recon_ws.iter_rows(min_row=5)
         if any(str(cell.value or "").endswith("TOTAL") for cell in row)
     )
     recon_data_rows = sum(
-        1 for row in recon_ws.iter_rows(min_row=4, max_row=total_row_number - 1)
+        1 for row in recon_ws.iter_rows(min_row=5, max_row=total_row_number - 1)
         if any(cell.value is not None for cell in row)
     )
     assert recon_data_rows == expected_recon_row_count
@@ -217,8 +225,9 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
         for cell in row
         if isinstance(cell.fill.fgColor.rgb, str)
     }
-    assert any(color.endswith(NEUTRAL_GOLD_FILL) for color in fill_colors)
-    assert any(color.endswith(DUPLICATE_RED_FILL) for color in fill_colors)
+    assert any(color.endswith(LEGACY_REVIEW_FILL) for color in fill_colors)
+    assert any(color.endswith(LEGACY_EXCLUDED_FILL) for color in fill_colors)
+    assert exceptions_ws.row_dimensions[1].height == 27
 
     # Two independent blocks: general QuickBooks exceptions on the left,
     # excluded QuickBooks duplicate copies on the right, separated by a
@@ -259,6 +268,136 @@ def test_legacy_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping,
     assert len(duplicate_pos) == len(expected_duplicate)
 
     assert "Product Aggregate Summary" in wb.sheetnames
+
+
+@pytest.mark.parametrize("engine_result, expected", [
+    ("PO + Invoice + Amount", "Unique Match: PO + Invoice + Amount"),
+    ("PO + Amount", "Unique Match: PO + Amount"),
+    ("Invoice + Amount", "Unique Match: Invoice + Amount"),
+    ("PO + Invoice + Aggregate Amount (Grouped) [group-level; no line allocation]", "Group Match: PO + Invoice + Amount"),
+    ("PO + Aggregate Amount (Grouped) [group-level; no line allocation]", "Group Match: PO + Amount"),
+    ("Invoice + Aggregate Amount (Grouped) [group-level; no line allocation]", "Group Match: Invoice + Amount"),
+    # A confirmed vendor alias is a PO-field + amount match.
+    ("Confirmed Vendor Alias + Amount", "Unique Match: PO + Amount"),
+    # A prior-period clearance keeps only the underlying rule, not its prefix.
+    ("QuickBooks primary ↔ Infinium prior-period match | Invoice + Amount", "Unique Match: Invoice + Amount"),
+])
+def test_legacy_match_method_labels_state_only_how_the_match_was_made(engine_result, expected):
+    label = _legacy_matched_label(engine_result)
+    assert label == expected
+    for confidence in ("Strong", "Moderate", "Weak", "Review", "Confirmed"):
+        assert confidence not in label
+
+
+def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping, make_metadata):
+    from config import (
+        LEGACY_EXCLUDED_FILL, LEGACY_MATCHED_FILL, LEGACY_METHOD_FILL,
+        LEGACY_NO_PAIR_FILL, LEGACY_REVIEW_FILL,
+    )
+
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+
+    # QuickBooks and Infinium share header names in this fixture; setdefault
+    # keeps the first (QuickBooks-side) column for each.
+    headers: dict = {}
+    for cell in ws[4]:
+        headers.setdefault(cell.value, cell.column)
+    method_col = headers["Match Method"]
+    amount_col = headers["Amount"]
+    po_col = headers["PO"]
+    inf_start = method_col + 1
+
+    rows = list(ws.iter_rows(min_row=5))
+    by_label = {}
+    for row in rows:
+        label = row[method_col - 1].value
+        if label and not str(label).endswith("TOTAL"):
+            by_label.setdefault(label, []).append(row)
+
+    # Only "how it matched" / why not -- never a confidence tier.
+    for label in by_label:
+        assert not any(tag in label for tag in ("(Strong)", "(Moderate)", "(Weak)", "(Review)", "(Needs Review)"))
+
+    # Matched: pale green, regular black text, method cell not bold.
+    matched = by_label["Unique Match: PO + Invoice + Amount"][0]
+    assert _fill_matches(matched[po_col - 1], LEGACY_MATCHED_FILL)
+    assert _fill_matches(matched[inf_start - 1], LEGACY_MATCHED_FILL)
+    assert _fill_matches(matched[method_col - 1], LEGACY_METHOD_FILL)
+    assert matched[method_col - 1].font.bold is not True
+    # Descriptive data stays Segoe UI regular; amounts are regular Consolas.
+    assert matched[po_col - 1].font.name == "Segoe UI" and matched[po_col - 1].font.bold is not True
+    assert matched[amount_col - 1].font.name == "Consolas" and matched[amount_col - 1].font.bold is not True
+
+    # Unmatched QuickBooks row: gold review tint, bold status text, and a
+    # gray (not gold) blank Infinium side because nothing is paired there.
+    unmatched = by_label["No Matching Infinium records"][0]
+    assert _fill_matches(unmatched[po_col - 1], LEGACY_REVIEW_FILL)
+    assert unmatched[method_col - 1].font.bold is True
+    assert _fill_matches(unmatched[method_col - 1], LEGACY_METHOD_FILL)
+    assert _fill_matches(unmatched[inf_start - 1], LEGACY_NO_PAIR_FILL)
+
+    # Excluded duplicate copy: pale red, informational (not bolded).
+    duplicate = by_label["Duplicate: Excess Copy Excluded"][0]
+    assert _fill_matches(duplicate[po_col - 1], LEGACY_EXCLUDED_FILL)
+    assert duplicate[method_col - 1].font.bold is not True
+
+    # Compact legend directly under the introductory note.
+    legend = [cell.value for cell in ws[3] if cell.value]
+    assert legend == ["Reconciled", "Review", "No paired record"]
+
+    # Infinium-only row (no QuickBooks record): its blank QuickBooks side is
+    # the same near-white gray, while the Infinium side keeps the status tint.
+    inf_only = by_label["No Matching QuickBooks records"][0]
+    assert _fill_matches(inf_only[po_col - 1], LEGACY_NO_PAIR_FILL)
+    assert _fill_matches(inf_only[inf_start - 1], LEGACY_REVIEW_FILL) or _fill_matches(
+        inf_only[inf_start - 1], LEGACY_EXCLUDED_FILL
+    )
+    assert ws.print_title_rows == "$1:$4"
+
+
+def test_legacy_reconciliation_normalizes_infinium_column_names(qb_mapping, make_metadata):
+    qb_rows = [{"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1"}]
+    inf_rows = [{
+        "OHAPD": "1", "OHOBDE": "1/09/2026", "OHCO": "WP", "CUNO": 50001, "OHOBNO": "INV100",
+        "OHTOTA": 100.00, "OHDESC": "PO 100", "OHPONO": "PO100",
+    }]
+    inf_mapping = {"po": "OHPONO", "invoice": "OHOBNO", "amount": "OHTOTA", "period": "OHAPD"}
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    header_values = [cell.value for cell in ws[4]]
+    for raw in ("OHAPD", "OHOBDE", "OHCO", "CUNO", "OHOBNO", "OHTOTA", "OHDESC", "OHPONO"):
+        assert raw not in header_values
+    inf_headers = header_values[header_values.index("Match Method") + 1:]
+    assert inf_headers[:8] == [
+        "Period", "Date", "Type", "Customer No", "Invoice No", "Amount", "Description", "PO No.",
+    ]
+    # The underlying values still come through under the friendly names.
+    data_values = [cell.value for cell in ws[5]]
+    assert 50001 in data_values and "INV100" in data_values
+
+
+def test_legacy_exceptions_bolds_exception_type_only_for_open_items(qb_mapping, inf_mapping, make_metadata):
+    from config import LEGACY_EXCLUDED_FILL, LEGACY_REVIEW_FILL
+
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Exceptions"]
+    header_cells = next(row for row in ws.iter_rows() if any(c.value == "Exception Type" for c in row))
+    header_row = header_cells[0].row
+    left_col, right_col = sorted(c.column for c in header_cells if c.value == "Exception Type")
+
+    open_item = ws.cell(header_row + 1, left_col)
+    assert open_item.value is not None
+    assert open_item.font.bold is True and _fill_matches(open_item, LEGACY_REVIEW_FILL)
+    duplicate_copy = ws.cell(header_row + 1, right_col)
+    assert duplicate_copy.value is not None
+    assert duplicate_copy.font.bold is not True and _fill_matches(duplicate_copy, LEGACY_EXCLUDED_FILL)
+    # Other body cells in an exception row are regular-weight black.
+    body_cell = ws.cell(header_row + 1, 1)
+    assert body_cell.font.bold is not True and body_cell.font.color.rgb.endswith("000000")
 
 
 def test_legacy_workbook_builds_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):

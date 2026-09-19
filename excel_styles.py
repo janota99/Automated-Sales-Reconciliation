@@ -26,12 +26,7 @@ from config import (
     DUPLICATE_RED_TEXT,
     FONT_NAME,
     FONT_NAME_NUMERIC,
-    GOOD_GREEN_FILL,
-    GOOD_GREEN_TEXT,
-    METHOD_GREY_FILL,
-    METHOD_GREY_TEXT,
-    NEUTRAL_GOLD_FILL,
-    NEUTRAL_GOLD_TEXT,
+    LEGACY_BODY_TEXT,
     SLATE,
     SLATE_LIGHT,
     TEXT,
@@ -50,17 +45,13 @@ ALIGN_WRAP_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True
 
 FONT_BODY = Font(name=FONT_NAME, size=10, color=TEXT)
 FONT_DUPLICATE = Font(name=FONT_NAME, size=10, bold=True, color=DUPLICATE_RED_TEXT)
-FONT_GOOD = Font(name=FONT_NAME, size=10, bold=True, color=GOOD_GREEN_TEXT)
-FONT_NEUTRAL = Font(name=FONT_NAME, size=10, bold=True, color=NEUTRAL_GOLD_TEXT)
-FONT_METHOD = Font(name=FONT_NAME, size=10, bold=True, color=METHOD_GREY_TEXT)
+FONT_LEGACY_BODY = Font(name=FONT_NAME, size=10, color=LEGACY_BODY_TEXT)
+FONT_LEGACY_BODY_BOLD = Font(name=FONT_NAME, size=10, bold=True, color=LEGACY_BODY_TEXT)
 FONT_TOTAL = Font(name=FONT_NAME, size=10, bold=True, color=TEXT)
 FONT_HEADER = Font(name=FONT_NAME, size=10, bold=True, color=WHITE)
 FONT_TITLE = Font(name=FONT_NAME, size=12, bold=True, color=WHITE)
 
 FILL_DUPLICATE = PatternFill("solid", fgColor=DUPLICATE_RED_FILL)
-FILL_GOOD = PatternFill("solid", fgColor=GOOD_GREEN_FILL)
-FILL_NEUTRAL = PatternFill("solid", fgColor=NEUTRAL_GOLD_FILL)
-FILL_METHOD = PatternFill("solid", fgColor=METHOD_GREY_FILL)
 FILL_TOTAL = PatternFill("solid", fgColor=TOTAL_FILL)
 FILL_NONE = PatternFill(fill_type=None)
 FILL_CAPTION_BAND = PatternFill("solid", fgColor=SLATE_LIGHT)
@@ -88,10 +79,6 @@ def _total_border() -> Border:
     return BORDER_TOTAL
 
 
-_MONOSPACE_EXACT_HEADERS = {
-    "PO", "PO NUMBER", "PO#", "PO #", "P.O.", "P.O. NUMBER", "P.O NUMBER",
-}
-
 ALIGN_WRAP_RIGHT = Alignment(horizontal="right", vertical="center", wrap_text=True)
 ALIGN_WRAP_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
@@ -105,11 +92,15 @@ def _infer_column_style(
     amount_columns/quantity_columns, which name the real mapped field so
     this still works when a header doesn't textually resemble its meaning
     (e.g. Infinium's amount field is literally "OHTOTA"). Returns
-    (alignment, number_format, is_numeric_dense); is_numeric_dense also
-    covers text-typed high-density number columns (invoice/PO numbers)
-    that get no numeric format of their own but still read better in a
-    monospaced/tabular font. Shared by _apply_number_formats (the data
-    cells) and _format_header (so the header lines up with its data).
+    (alignment, number_format, is_numeric_dense); is_numeric_dense marks a
+    measured, calculated value (amount, quantity, count, rate) for the
+    monospaced/tabular font, so a column of figures lines up for scanning.
+    An identifier -- PO, invoice, period, customer number, or any other
+    reference number that is never summed or compared numerically -- is
+    deliberately excluded even when it reads as "all digits": the
+    distinction that matters is measurement vs. identifier, not text vs.
+    number. Shared by _apply_number_formats (the data cells) and
+    _format_header (so the header lines up with its data).
     """
     header_upper = str(header).upper()
     if any(term in header_upper for term in ("VALID", "GROUP-LEVEL", "AUTOMATIC")):
@@ -127,19 +118,22 @@ def _infer_column_style(
         return ALIGN_RIGHT_CENTER, ACCOUNTING_QUANTITY_FORMAT, True
     if "DATE" in header_upper or "TIMESTAMP" in header_upper:
         return ALIGN_CENTER_CENTER, "yyyy-mm-dd", False
-    if "INVOICE" in header_upper or header_upper in _MONOSPACE_EXACT_HEADERS:
-        return None, None, True
     return None, None, False
 
 
 def _numeric_font(cell) -> Font:
     """The cell's current font, swapped to the monospaced numeric face --
-    every digit the same width, so a column of invoice numbers or amounts
-    lines up for scanning -- while keeping its size/bold/color/underline."""
+    every digit the same width, so a column of measured figures lines up
+    for scanning -- while keeping its bold/italic/color/underline. Sized
+    one point smaller than the surrounding Segoe UI: Consolas's heavier,
+    more uniform stroke weight reads noticeably darker and larger than
+    Segoe UI at the same point size, so dropping a point keeps the
+    numbers visually level with the descriptive text around them."""
     current = cell.font
+    current_size = current.size or 10
     return Font(
         name=FONT_NAME_NUMERIC,
-        size=current.size,
+        size=max(current_size - 1, 1),
         bold=current.bold,
         italic=current.italic,
         color=current.color,
@@ -216,7 +210,7 @@ def _apply_duplicate_style(ws, row: int, start_col: int, end_col: int) -> None:
 def _apply_default_alignment(ws, row: int, start_col: int, end_col: int) -> None:
     """Left-align and border a row the same way _format_body_block's plain
     cells look, without touching fill or font -- call this alongside a
-    color-status style (_apply_good_style, etc.) so every cell in a row
+    color-status style (_apply_legacy_status_fill, etc.) so every cell in a row
     gets a consistent alignment/border regardless of which style painted
     its color, then let _apply_number_formats override specific columns
     (amounts, dates, quantities) to right/center afterward."""
@@ -226,29 +220,24 @@ def _apply_default_alignment(ws, row: int, start_col: int, end_col: int) -> None
         cell.border = BORDER_THIN
 
 
-def _apply_good_style(ws, row: int, start_col: int, end_col: int) -> None:
-    """Apply Excel's traditional green good-value style to a matched row."""
+def _apply_legacy_status_fill(ws, row: int, start_col: int, end_col: int, fill_color: str) -> None:
+    """Accountant's Legacy Format row styling: a pale full-row tint with
+    plain regular-weight black text. Color alone carries the status --
+    bold is reserved for headers, totals, and the one status cell that
+    needs attention (see _apply_legacy_status_cell)."""
+    fill = PatternFill("solid", fgColor=fill_color)
     for col in range(start_col, end_col + 1):
         cell = ws.cell(row, col)
-        cell.fill = FILL_GOOD
-        cell.font = FONT_GOOD
+        cell.fill = fill
+        cell.font = FONT_LEGACY_BODY
 
 
-def _apply_neutral_style(ws, row: int, start_col: int, end_col: int) -> None:
-    """Apply Excel's traditional gold neutral-value style to an exception row."""
-    for col in range(start_col, end_col + 1):
-        cell = ws.cell(row, col)
-        cell.fill = FILL_NEUTRAL
-        cell.font = FONT_NEUTRAL
-
-
-def _apply_method_style(ws, row: int, start_col: int, end_col: int) -> None:
-    """Apply the grey/dark-bold-black divider style that visually separates
-    the QuickBooks side from the Infinium side on a side-by-side sheet."""
-    for col in range(start_col, end_col + 1):
-        cell = ws.cell(row, col)
-        cell.fill = FILL_METHOD
-        cell.font = FONT_METHOD
+def _apply_legacy_status_cell(ws, row: int, col: int, fill_color: str, bold: bool) -> None:
+    """A single status cell (Match Method / Exception Type) -- bold only
+    when the row genuinely needs attention."""
+    cell = ws.cell(row, col)
+    cell.fill = PatternFill("solid", fgColor=fill_color)
+    cell.font = FONT_LEGACY_BODY_BOLD if bold else FONT_LEGACY_BODY
 
 
 def _apply_number_formats(

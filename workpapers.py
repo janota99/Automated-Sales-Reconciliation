@@ -35,6 +35,12 @@ from config import (
     DUPLICATE_RED_TEXT,
     FONT_NAME,
     GREEN_LIGHT,
+    LEGACY_BODY_TEXT,
+    LEGACY_EXCLUDED_FILL,
+    LEGACY_MATCHED_FILL,
+    LEGACY_METHOD_FILL,
+    LEGACY_NO_PAIR_FILL,
+    LEGACY_REVIEW_FILL,
     METHOD_GREY_DARK,
     METHOD_GREY_FILL,
     NAVY,
@@ -53,9 +59,8 @@ from config import (
 from excel_styles import (
     _apply_default_alignment,
     _apply_duplicate_style,
-    _apply_good_style,
-    _apply_method_style,
-    _apply_neutral_style,
+    _apply_legacy_status_cell,
+    _apply_legacy_status_fill,
     _apply_number_formats,
     _autofit_workbook_columns,
     _format_body_block,
@@ -74,6 +79,7 @@ from duplicates import (
     DUPLICATE_BASIS_INVOICE_ONLY,
     DUPLICATE_BASIS_PO_ONLY,
     DUPLICATE_BASIS_STRICT,
+    NORM_INV,
     NORM_PO,
 )
 from matching import (
@@ -1790,6 +1796,125 @@ def _standardize_legacy_widths(ws, headers: list[str], start_col: int, mapping: 
             ws.column_dimensions[get_column_letter(start_col + offset)].width = 13
 
 
+# Infinium's raw column codes are cryptic to anyone who doesn't know the
+# extract; the legacy sheet shows the real field names instead. Display-only:
+# values, widths, and number formats still key off the original headers.
+_LEGACY_INFINIUM_HEADER_NAMES = {
+    "OHAPD": "Period",
+    "OHOBDE": "Date",
+    "OHCO": "Type",
+    "CUNO": "Customer No",
+    "OHOBNO": "Invoice No",
+    "OHTOTA": "Amount",
+    "OHDESC": "Description",
+    "OHPONO": "PO No.",
+}
+
+
+def _legacy_infinium_display_headers(headers: list[str]) -> list[str]:
+    return [_LEGACY_INFINIUM_HEADER_NAMES.get(str(header).strip().upper(), header) for header in headers]
+
+
+def _legacy_matched_label(match_result: str) -> str:
+    """"Unique Match: PO + Amount", "Group Match: Invoice + Amount", etc. --
+    only how the match was made, never the confidence tier. A vendor-alias
+    match is a PO-field + amount match, and a historical (prior-period)
+    clearance uses the same underlying rule after its "... | " prefix."""
+    text = str(match_result).split("|")[-1].strip()
+    is_group = "Grouped" in text or "group-level" in str(match_result)
+    if "PO + Invoice" in text:
+        keys = "PO + Invoice + Amount"
+    elif text.startswith("Invoice +"):
+        keys = "Invoice + Amount"
+    else:
+        keys = "PO + Amount"
+    return f"{'Group' if is_group else 'Unique'} Match: {keys}"
+
+
+def _legacy_already_matched_reference(qb_frame, qidx, candidate: dict, inf_references: dict) -> str:
+    """Which reference an unresolved QuickBooks row shares with an
+    Infinium row that was already matched elsewhere -- "PO" or "Invoice"."""
+    q_po = qb_frame.at[qidx, NORM_PO]
+    q_invoice = qb_frame.at[qidx, NORM_INV]
+    matched_ids = [
+        piece.strip() for piece in str(candidate.get("Already-Matched Candidate IDs") or "").split(";")
+        if piece.strip() and not piece.strip().startswith("...")
+    ]
+    references = [inf_references[i] for i in matched_ids if i in inf_references]
+    if q_po and any(po == q_po for po, _ in references):
+        return "PO"
+    if q_invoice and any(invoice == q_invoice for _, invoice in references):
+        return "Invoice"
+    return "PO" if q_po else "Invoice"
+
+
+def _legacy_match_method_label(record: dict, result: ReconciliationResult, candidate_map: dict, inf_references: dict) -> str:
+    """The Legacy Reconciliation "Match Method" text: just how the match
+    was made (or why there isn't one). Confidence tiers stay on the primary
+    workpaper and analytics package -- the accountant's legacy view is a
+    read-on-sight summary, and the row's fill already carries the status."""
+    section = str(record.get("Section", ""))
+    match_result = str(record.get("Match Result", ""))
+    if section in _LEGACY_MATCHED_SECTIONS:
+        if section == "09 Fuzzy Match Review Hold":
+            return "Possible Match: Similar PO + Amount"
+        return _legacy_matched_label(match_result)
+    if section == "02 Unmatched QuickBooks":
+        if "already matched" in match_result:
+            qb_id = result.qb_work.at[record["QB Index"], QB_ID]
+            reference = _legacy_already_matched_reference(
+                result.qb_work, record["QB Index"], candidate_map.get(qb_id, {}), inf_references,
+            )
+            return f"Potential Duplicate: {reference} value already matched"
+        return "No Matching Infinium records"
+    if section == "03 Unmatched Infinium":
+        return "No Matching QuickBooks records"
+    if section in _LEGACY_DUPLICATE_SECTIONS:
+        return "Duplicate: Excess Copy Excluded"
+    if section in {"06 Duplicate Review Hold QuickBooks", "07 Duplicate Review Hold Infinium"}:
+        basis = record.get("Duplicate Basis")
+        if basis == DUPLICATE_BASIS_PO_ONLY:
+            return "Potential Duplicate: PO + Amount"
+        if basis == DUPLICATE_BASIS_INVOICE_ONLY:
+            return "Potential Duplicate: Invoice + Amount"
+        return "Potential Duplicate: PO + Invoice + Amount"
+    if section == "08 Reference-Matched Amount Variance Review Hold":
+        return "Amount Differs: Same PO/Invoice"
+    if section == "10 Ambiguous Duplicate QuickBooks":
+        return "Potential Duplicate: Multiple Infinium candidates"
+    return match_result
+
+
+def _legacy_row_needs_attention(section: str) -> bool:
+    """A review row (gold) or a fuzzy possible match is the only kind of row
+    whose status text is bolded; a clean match and an already-decided
+    excluded duplicate are informational."""
+    return (
+        section not in _LEGACY_MATCHED_SECTIONS and section not in _LEGACY_DUPLICATE_SECTIONS
+    ) or section == "09 Fuzzy Match Review Hold"
+
+
+def _write_legacy_legend(ws, row: int, start_col: int) -> None:
+    """A compact color key just under the introductory note: a small
+    swatch, then its meaning, three times over. Labels are left to spill
+    into the empty cells to their right rather than being merged."""
+    entries = [
+        (LEGACY_MATCHED_FILL, "Reconciled"),
+        (LEGACY_REVIEW_FILL, "Review"),
+        (LEGACY_NO_PAIR_FILL, "No paired record"),
+    ]
+    col = start_col
+    for fill_color, label in entries:
+        swatch = ws.cell(row, col)
+        swatch.fill = PatternFill("solid", fgColor=fill_color)
+        swatch.border = _thin_border()
+        text = ws.cell(row, col + 1, label)
+        text.font = Font(name=FONT_NAME, size=9, color=LEGACY_BODY_TEXT)
+        text.alignment = Alignment(horizontal="left", vertical="center")
+        col += 3
+    ws.row_dimensions[row].height = 18
+
+
 def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     """A simplified, side-by-side QuickBooks/Infinium sheet styled after the
     accountant's original hand-built workbook: every QuickBooks row (sorted
@@ -1811,11 +1936,20 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     inf_start = method_col + 1
     qb_end = len(qb_headers)
     inf_end = inf_start + len(inf_headers) - 1
-    header_row, data_row = 3, 4
+    # Row 3 holds the color legend, directly under the introductory note.
+    legend_row, header_row, data_row = 3, 4, 5
 
     default_year = int(result.metadata.get("fiscal_year") or result.run_timestamp.year)
     selected_period = result.metadata.get("fiscal_period")
     inf_period_col = result.inf_mapping.get("period")
+    candidate_map = (
+        result.candidates.set_index("QuickBooks Row ID").to_dict("index")
+        if not result.candidates.empty else {}
+    )
+    inf_references = {
+        row[INF_ID]: (row[NORM_PO], row[NORM_INV])
+        for row in result.inf_work[[INF_ID, NORM_PO, NORM_INV]].to_dict("records")
+    }
 
     def inf_row_period(record: dict) -> Any:
         iidx = record.get("Infinium Index")
@@ -1850,14 +1984,13 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _write_caption_band(
         ws, 2, qb_start, qb_end,
         f"Every QuickBooks row, sorted by normalized PO. {matched_count:,} of {len(qb_rows):,} matched -- see "
-        f"the Exceptions sheet for QuickBooks items shown gold/red here. Generated "
-        f"{format_central_timestamp(result.run_timestamp)}.",
+        f"the Exceptions sheet for QuickBooks items shown gold (review) or red (excluded duplicate) here. "
+        f"Generated {format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
     _write_caption_band(
         ws, 2, method_col, method_col,
-        "States the exact rule that resolved the match, including whether it was a fuzzy "
-        "text-similarity match rather than an exact one.",
+        "How each match was made -- or, for an unpaired row, why there is no match.",
         SLATE,
     )
     _write_caption_band(
@@ -1881,11 +2014,14 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
             ws.cell(row, qb_start + col_offset, excel_safe(value))
         for col_offset, value in enumerate(inf_values):
             ws.cell(row, inf_start + col_offset, excel_safe(value))
-        ws.cell(row, method_col, f"{record.get('Match Result', '')} ({record.get('Confidence', '')})")
+        ws.cell(row, method_col, _legacy_match_method_label(record, result, candidate_map, inf_references))
 
     ws.cell(header_row, method_col, "Match Method")
+    _write_legacy_legend(ws, legend_row, qb_start)
     _write_dataframe_values(ws, pd.DataFrame(columns=qb_headers), header_row, qb_start)
-    _write_dataframe_values(ws, pd.DataFrame(columns=inf_headers), header_row, inf_start)
+    _write_dataframe_values(
+        ws, pd.DataFrame(columns=_legacy_infinium_display_headers(inf_headers)), header_row, inf_start,
+    )
     _format_header(ws, header_row, qb_start, qb_end, NAVY)
     _format_header(ws, header_row, method_col, method_col, SLATE)
     _format_header(ws, header_row, inf_start, inf_end, TEAL)
@@ -1898,20 +2034,25 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
         # applied next only ever touches fill/font, never alignment.
         _apply_default_alignment(ws, row, qb_start, inf_end)
         if section in _LEGACY_MATCHED_SECTIONS:
-            _apply_good_style(ws, row, qb_start, qb_end)
-            _apply_good_style(ws, row, inf_start, inf_end)
+            status_fill = LEGACY_MATCHED_FILL
         elif section in _LEGACY_DUPLICATE_SECTIONS:
-            _apply_duplicate_style(ws, row, qb_start, qb_end)
-            _apply_duplicate_style(ws, row, inf_start, inf_end)
+            status_fill = LEGACY_EXCLUDED_FILL
         else:
-            _apply_neutral_style(ws, row, qb_start, qb_end)
-            _apply_neutral_style(ws, row, inf_start, inf_end)
-        _apply_method_style(ws, row, method_col, method_col)
+            status_fill = LEGACY_REVIEW_FILL
+        # A side with no record in its own dataset (no paired Infinium row,
+        # or an Infinium-only row with no QuickBooks row) stays blank in a
+        # near-white gray, so it reads as "nothing here" rather than as a
+        # second, empty status band.
+        has_qb = record.get("QB Index") is not None
+        has_inf = record.get("Infinium Index") is not None
+        _apply_legacy_status_fill(ws, row, qb_start, qb_end, status_fill if has_qb else LEGACY_NO_PAIR_FILL)
+        _apply_legacy_status_fill(ws, row, inf_start, inf_end, status_fill if has_inf else LEGACY_NO_PAIR_FILL)
+        _apply_legacy_status_cell(ws, row, method_col, LEGACY_METHOD_FILL, _legacy_row_needs_attention(section))
         ws.cell(row, method_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws.cell(row, method_col).border = _thin_border()
     if not all_rows:
         _apply_default_alignment(ws, data_row, qb_start, inf_end)
-        _apply_method_style(ws, data_row, method_col, method_col)
+        _apply_legacy_status_cell(ws, data_row, method_col, LEGACY_METHOD_FILL, False)
 
     total_row = final_data_row + 1
     qb_display = pd.DataFrame(
@@ -1940,7 +2081,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
     if all_rows:
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(inf_end)}{final_data_row}"
-    ws.print_title_rows = "1:3"
+    ws.print_title_rows = f"1:{header_row}"
     _prepare_sheet(ws)
 
 
@@ -2045,7 +2186,8 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
     data_row = header_row + 1
 
     def write_block(
-        records: list[dict], block_qb_start: int, trailer_start: int, trailer_end: int, style_fn,
+        records: list[dict], block_qb_start: int, trailer_start: int, trailer_end: int,
+        status_fill: str, bold_exception_type: bool,
     ) -> int:
         block_headers = qb_headers + trailer_headers
         block = pd.DataFrame(
@@ -2067,7 +2209,10 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
         for offset in range(len(records)):
             row = data_row + offset
             _apply_default_alignment(ws, row, block_qb_start, trailer_end)
-            style_fn(ws, row, block_qb_start, trailer_end)
+            _apply_legacy_status_fill(ws, row, block_qb_start, trailer_end, status_fill)
+            # The Exception Type cell (trailer's second column) is the one
+            # status cell worth bolding, and only for a genuine open item.
+            _apply_legacy_status_cell(ws, row, trailer_start + 1, status_fill, bold_exception_type)
             ws.cell(row, trailer_end).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         _apply_number_formats(ws, qb_headers, data_row, block_final_row, block_qb_start,
                               {result.qb_mapping["amount"]}, {result.qb_mapping.get("quantity") or ""})
@@ -2079,10 +2224,10 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
         return block_final_row
 
     general_final_row = write_block(
-        general_rows, qb_start, left_trailer_start, left_trailer_end, _apply_neutral_style,
+        general_rows, qb_start, left_trailer_start, left_trailer_end, LEGACY_REVIEW_FILL, True,
     )
     duplicate_final_row = write_block(
-        duplicate_rows, dup_qb_start, dup_trailer_start, dup_trailer_end, _apply_duplicate_style,
+        duplicate_rows, dup_qb_start, dup_trailer_start, dup_trailer_end, LEGACY_EXCLUDED_FILL, False,
     )
     final_data_row = max(general_final_row, duplicate_final_row)
 
@@ -2188,6 +2333,14 @@ def _autofit_workbook_rows(wb: Workbook) -> None:
                 ws.row_dimensions[row_idx].height = _controlled_row_two_height(ws.title)
                 continue
 
+            # Row 1 is a single-line title band. Its merged text is measured
+            # against only the first column's width here, which on the legacy
+            # sheets (narrow leading columns) reads as 3-5 wrapped lines and
+            # balloons the band to 45-75pt. Pin it to the band's designed 27.
+            if row_idx == 1 and ws.title in _FIXED_TITLE_ROW_SHEETS:
+                ws.row_dimensions[row_idx].height = _TITLE_ROW_HEIGHT
+                continue
+
             for cell in row:
                 text = str(cell.value) if cell.value is not None else ""
                 if not text:
@@ -2225,6 +2378,10 @@ def _autofit_workbook_rows(wb: Workbook) -> None:
                 # Let Excel manage the single-line rows natively
                 ws.row_dimensions[row_idx].height = None
                 
+
+_FIXED_TITLE_ROW_SHEETS = frozenset({"Legacy Reconciliation", "Exceptions"})
+_TITLE_ROW_HEIGHT = 27
+
 
 def _controlled_row_two_height(sheet_title: str) -> int:
     """Fixed row-2 caption-band height per sheet, overriding autofit."""

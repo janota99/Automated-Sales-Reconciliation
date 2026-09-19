@@ -38,6 +38,21 @@ METHOD_GREY_TEXT = "000000"
 # not as a clear divider; this is deliberately desaturated so it never
 # competes with either side's identity color.
 METHOD_GREY_DARK = "595959"
+
+# Accountant's Legacy Format workbook only. A full-row fill repeated across
+# hundreds of rows has to stay quiet, so these are much lighter tints than
+# the primary workpaper's status colors, paired with plain black regular
+# text instead of a colored bold font.
+LEGACY_MATCHED_FILL = "E7F3E8"
+LEGACY_REVIEW_FILL = "FFF2CC"
+LEGACY_EXCLUDED_FILL = "FCE4E4"
+# The empty side of a row with no paired record in that dataset -- the blank
+# Infinium block of an unmatched QuickBooks row, or the blank QuickBooks block
+# of an Infinium-only row. Almost white, so "nothing here" recedes.
+LEGACY_NO_PAIR_FILL = "F8FAF9"
+# The Match Method data column: RGB(234, 234, 234).
+LEGACY_METHOD_FILL = "EAEAEA"
+LEGACY_BODY_TEXT = "000000"
 RED_LIGHT = "FDECEC"
 GREEN_LIGHT = "E8F3EC"
 WHITE = "FFFFFF"
