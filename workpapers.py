@@ -2134,7 +2134,7 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     _format_header(ws, header_row, ref_col, referenced_col, SLATE)
     _format_header(ws, header_row, inf_start, inf_end, TEAL)
 
-    blank_side_merges: list[tuple[int, int, int]] = []
+    blank_side_panels: list[tuple[int, int, int]] = []
     for offset, record in enumerate(all_rows):
         row = data_row + offset
         section = record.get("Section", "")
@@ -2157,9 +2157,9 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
         _apply_legacy_status_fill(ws, row, qb_start, qb_end, status_fill if has_qb else LEGACY_NO_PAIR_FILL)
         _apply_legacy_status_fill(ws, row, inf_start, inf_end, status_fill if has_inf else LEGACY_NO_PAIR_FILL)
         if not has_qb:
-            blank_side_merges.append((row, qb_start, qb_end))
+            blank_side_panels.append((row, qb_start, qb_end))
         if not has_inf:
-            blank_side_merges.append((row, inf_start, inf_end))
+            blank_side_panels.append((row, inf_start, inf_end))
         needs_attention = _legacy_row_needs_attention(section)
         _apply_legacy_status_cell(ws, row, ref_col, LEGACY_METHOD_FILL, False)
         _apply_legacy_status_cell(ws, row, method_col, LEGACY_METHOD_FILL, needs_attention)
@@ -2206,13 +2206,20 @@ def build_legacy_reconciliation_sheet(wb: Workbook, result: ReconciliationResult
     ws.column_dimensions[get_column_letter(referenced_col)].width = 16
     _legacy_standardize_dates(ws, qb_headers, qb_start, data_row, final_data_row)
     _legacy_standardize_dates(ws, _legacy_infinium_display_headers(inf_headers), inf_start, data_row, final_data_row)
-    # Each blank side becomes one merged cell, so an empty block reads as a
-    # single quiet panel instead of a row of empty gridlined cells. Merged
-    # last, after every cell has been styled and formatted.
-    for merge_row, merge_start, merge_end in blank_side_merges:
-        if merge_end > merge_start:
-            ws.merge_cells(
-                start_row=merge_row, start_column=merge_start, end_row=merge_row, end_column=merge_end,
+    # Each blank side reads as one quiet panel instead of a row of empty
+    # gridlined cells -- by dropping the borders BETWEEN its cells and keeping
+    # only the block's outline, not by merging them: Excel refuses to sort a
+    # range containing merged cells of different sizes ("all the merged cells
+    # need to be the same size"), and this sheet has to stay sortable and
+    # filterable. Formats travel with their rows through a sort.
+    edge = _thin_border().top
+    for panel_row, panel_start, panel_end in blank_side_panels:
+        for panel_col in range(panel_start, panel_end + 1):
+            ws.cell(panel_row, panel_col).border = Border(
+                top=edge,
+                bottom=edge,
+                left=edge if panel_col == panel_start else Side(),
+                right=edge if panel_col == panel_end else Side(),
             )
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
     if all_rows:
@@ -3099,6 +3106,14 @@ def build_analytics_workbook(result: ReconciliationResult) -> bytes:
         wb, "Match Method Summary", "MATCH METHOD SUMMARY",
         "Distribution of matched and unresolved rows. Percentages use QuickBooks row count as the denominator.",
         result.method_summary, NAVY, chart_column="QuickBooks Rows",
+    )
+    _add_standard_data_sheet(
+        wb, "Match Register", "MATCH REGISTER",
+        "One row per accepted match relationship -- M-### for a one-to-one match, G-### for a grouped "
+        "match accepted as a whole -- with the exact QuickBooks and Infinium records it contains and its "
+        "amounts. Every Match Ref. and Referenced Match Ref. shown anywhere in the generated workbooks "
+        "is listed here.",
+        result.match_register, SLATE,
     )
     _add_standard_data_sheet(
         wb, "Detailed Match Ledger", "DETAILED MATCH Ledger",

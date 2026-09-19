@@ -1488,7 +1488,8 @@ MATCH_TYPE_GROUPED = "Grouped"
 MATCH_REGISTER_COLUMNS = [
     "Match Ref.", "Match Type", "Record Scope", "Match Basis",
     "QuickBooks Row Count", "Infinium Row Count",
-    "QuickBooks Row IDs", "Infinium Row IDs", "Relationship Key",
+    "QuickBooks Amount", "Infinium Amount", "Amount Difference",
+    "QuickBooks Row IDs", "Infinium Row IDs", "Clearance ID",
 ]
 _MATCH_REF_PATTERN = re.compile(r"^([MG])-(\d{3,})$")
 _ALREADY_MATCHED_DISPOSITION = "Potential duplicate - referenced Infinium candidate is already matched"
@@ -1556,7 +1557,9 @@ def assign_match_references(
             "basis": group.method,
             "qb_ids": [str(qb.at[idx, QB_ID]) for idx in ordered_q],
             "inf_ids": [str(inf.at[idx, INF_ID]) for idx in ordered_i],
-            "key": group.match_id,
+            "qb_amount": cents_to_float(_amount_total(qb, ordered_q)),
+            "inf_amount": cents_to_float(_amount_total(inf, ordered_i)),
+            "key": "",
         })
 
     if not historical_clearances.empty:
@@ -1575,6 +1578,8 @@ def assign_match_references(
                 "basis": str(first["Match Method"]),
                 "qb_ids": primary_ids if primary_is_qb else secondary_ids,
                 "inf_ids": secondary_ids if primary_is_qb else primary_ids,
+                "qb_amount": round(float(ordered["Primary Amount" if primary_is_qb else "Secondary Amount"].sum()), 2),
+                "inf_amount": round(float(ordered["Secondary Amount" if primary_is_qb else "Primary Amount"].sum()), 2),
                 "key": clearance_id,
             })
 
@@ -1612,9 +1617,12 @@ def assign_match_references(
             "Match Basis": relationship["basis"],
             "QuickBooks Row Count": len(relationship["qb_ids"]),
             "Infinium Row Count": len(relationship["inf_ids"]),
+            "QuickBooks Amount": relationship["qb_amount"],
+            "Infinium Amount": relationship["inf_amount"],
+            "Amount Difference": round(relationship["qb_amount"] - relationship["inf_amount"], 2),
             "QuickBooks Row IDs": "; ".join(relationship["qb_ids"]),
             "Infinium Row IDs": "; ".join(relationship["inf_ids"]),
-            "Relationship Key": relationship["key"],
+            "Clearance ID": relationship["key"],
         })
 
     register = pd.DataFrame(register_records, columns=MATCH_REGISTER_COLUMNS)
@@ -1856,16 +1864,17 @@ def validate_match_references(result: "ReconciliationResult") -> None:
     seen_keys: dict[str, Any] = {}
     for record in records:
         reference = record["Match Ref."]
+        members = f"QuickBooks {record['QuickBooks Row IDs']} / Infinium {record['Infinium Row IDs']}"
         if reference in seen_keys:
             raise ValueError(
                 f"{prefix_error}: reference {reference} is assigned to more than one relationship "
-                f"({seen_keys[reference]!r} and {record['Relationship Key']!r})."
+                f"({seen_keys[reference]} and {members})."
             )
-        seen_keys[reference] = record["Relationship Key"]
+        seen_keys[reference] = members
         relationships[reference] = {
             "qb": set(_split_reference_ids(record["QuickBooks Row IDs"])),
             "inf": set(_split_reference_ids(record["Infinium Row IDs"])),
-            "key": record["Relationship Key"],
+            "key": record["Clearance ID"],
         }
 
     # 8. Format and type: M-### is one-to-one, G-### is grouped, padding is uniform.
@@ -1880,12 +1889,12 @@ def validate_match_references(result: "ReconciliationResult") -> None:
         grouped = int(record["QuickBooks Row Count"]) > 1 or int(record["Infinium Row Count"]) > 1
         if grouped and prefix != "G":
             raise ValueError(
-                f"{prefix_error}: grouped relationship {reference} ({record['Relationship Key']}) "
+                f"{prefix_error}: grouped relationship {reference} ({record['QuickBooks Row IDs']} / {record['Infinium Row IDs']}) "
                 "was given a one-to-one M-### reference."
             )
         if not grouped and prefix != "M":
             raise ValueError(
-                f"{prefix_error}: one-to-one relationship {reference} ({record['Relationship Key']}) "
+                f"{prefix_error}: one-to-one relationship {reference} ({record['QuickBooks Row IDs']} / {record['Infinium Row IDs']}) "
                 "was given a grouped G-### reference."
             )
         if (record["Match Type"] == MATCH_TYPE_GROUPED) != grouped:

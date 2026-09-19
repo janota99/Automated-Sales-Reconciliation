@@ -47,6 +47,7 @@ EXPECTED_LEGACY_SHEETS = [
 EXPECTED_ANALYTICS_SHEETS = [
     "Executive Summary",
     "Match Method Summary",
+    "Match Register",
     "Detailed Match Ledger",
     "Normalization Detail",
     "Match Assessment",
@@ -291,6 +292,19 @@ def test_legacy_match_method_labels_state_only_how_the_match_was_made(engine_res
         assert confidence not in label
 
 
+def _assert_outline_only_panel(ws, row, first_col, last_col):
+    """A blank side: every cell carries the panel fill, the outer edges are
+    drawn, and no border separates its interior cells."""
+    from config import LEGACY_NO_PAIR_FILL
+
+    for col in range(first_col, last_col + 1):
+        cell = ws.cell(row, col)
+        assert _fill_matches(cell, LEGACY_NO_PAIR_FILL)
+        assert cell.border.top.style and cell.border.bottom.style
+        assert bool(cell.border.left.style) == (col == first_col)
+        assert bool(cell.border.right.style) == (col == last_col)
+
+
 def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping, make_metadata):
     from config import (
         LEGACY_EXCLUDED_FILL, LEGACY_MATCHED_FILL, LEGACY_METHOD_FILL,
@@ -339,19 +353,14 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     assert unmatched[method_col - 1].font.bold is True
     assert _fill_matches(unmatched[method_col - 1], LEGACY_METHOD_FILL)
     assert _fill_matches(unmatched[inf_start - 1], LEGACY_NO_PAIR_FILL)
-    # The blank side is a single merged cell (no empty gridlined cells), and
-    # only the blank side -- populated blocks stay one cell per field.
+    # The blank side reads as one quiet panel -- filled, outlined only at its
+    # edges, NOT merged (merged cells of different sizes stop Excel sorting).
     inf_end = len(ws[4])
-    merged = {str(r) for r in ws.merged_cells.ranges}
-    unmatched_row = unmatched[0].row
-    assert f"{get_column_letter(inf_start)}{unmatched_row}:{get_column_letter(inf_end)}{unmatched_row}" in merged
     qb_end_col = headers["Match Ref."] - 1  # last QuickBooks column
-    assert f"A{unmatched_row}:{get_column_letter(qb_end_col)}{unmatched_row}" not in merged
+    unmatched_row = unmatched[0].row
+    _assert_outline_only_panel(ws, unmatched_row, inf_start, inf_end)
     matched_row = matched[0].row
-    assert not any(
-        r.min_row == matched_row and r.max_row == matched_row and r.min_col != r.max_col
-        and r.min_row > 4 for r in ws.merged_cells.ranges
-    )
+    assert matched[po_col - 1].border.right.style is not None       # populated cells keep their gridlines
 
     # Excluded duplicate copy: pale red, informational (not bolded).
     duplicate = by_label["Duplicate: Excess Copy Excluded"][0]
@@ -373,7 +382,7 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     # the same near-white gray, while the Infinium side keeps the status tint.
     inf_only = by_label["No Matching QuickBooks Records"][0]
     assert _fill_matches(inf_only[po_col - 1], LEGACY_NO_PAIR_FILL)
-    assert f"A{inf_only[0].row}:{get_column_letter(qb_end_col)}{inf_only[0].row}" in merged
+    _assert_outline_only_panel(ws, inf_only[0].row, 1, qb_end_col)
     assert _fill_matches(inf_only[inf_start - 1], LEGACY_REVIEW_FILL) or _fill_matches(
         inf_only[inf_start - 1], LEGACY_EXCLUDED_FILL
     )
@@ -1329,3 +1338,43 @@ def test_reference_feature_changes_no_reconciliation_total(qb_mapping, inf_mappi
     assert result.metrics["QuickBooks Source Total"] == pytest.approx(345.00)
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
     assert any("SUM(QuickBooksExceptions[Amount])" in t for t in _worksheet_text(ws))
+
+
+def test_legacy_reconciliation_can_be_sorted_and_filtered(qb_mapping, inf_mapping, make_metadata):
+    """Excel refuses to sort a range holding merged cells of different sizes.
+    Every merge on the sheet must sit above the autofilter's header row."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    assert ws.auto_filter.ref
+    first_data_row = 5
+    assert ws.auto_filter.ref.startswith("A4:")
+    assert all(r.max_row < first_data_row - 1 for r in ws.merged_cells.ranges)
+    assert not any(
+        cell.value is not None and type(cell).__name__ == "MergedCell"
+        for row in ws.iter_rows(min_row=first_data_row) for cell in row
+    )
+
+
+def test_analytics_match_register_lists_every_relationship_with_tying_amounts(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_analytics_workbook(result)))
+    assert wb.sheetnames.index("Match Register") == wb.sheetnames.index("Match Method Summary") + 1
+    ws = wb["Match Register"]
+    header_row = next(row for row in ws.iter_rows(max_row=8) if any(c.value == "Match Ref." for c in row))
+    headers = [c.value for c in header_row]
+    assert "Relationship Key" not in headers                       # no internal run-local ids
+    records = [
+        dict(zip(headers, [c.value for c in row]))
+        for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value
+    ]
+    assert [r["Match Ref."] for r in records] == list(result.match_register["Match Ref."])
+    assert {r["Match Ref."] for r in records} == {"M-001", "M-002", "G-001"}
+    group = next(r for r in records if r["Match Ref."] == "G-001")
+    assert group["Match Type"] == "Grouped"
+    assert group["QuickBooks Row Count"] == 2 and group["Infinium Row Count"] == 1
+    assert group["QuickBooks Amount"] == pytest.approx(150.00)
+    assert group["Infinium Amount"] == pytest.approx(150.00)
+    assert group["Amount Difference"] == pytest.approx(0.0)
+    assert all(r["Match Type"] in ("One-to-One", "Grouped") for r in records)
