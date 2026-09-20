@@ -476,7 +476,7 @@ def render_result(result: ReconciliationResult) -> None:
             st.dataframe(result.assessments, use_container_width=True, hide_index=True, height=320)
     with downloads_tab:
         st.markdown("#### Accounting workpaper")
-        st.caption("Four sheets: Raw Data, Reconciled Data, Unresolved Exceptions, and Product Aggregate Summary.")
+        st.caption("Four sheets: Raw Data, Reconciliation Detail, Unresolved Exceptions, and Product Aggregate Summary.")
         if "primary_workbook" not in st.session_state:
             if st.button(
                 "Prepare Sales Reconciliation",

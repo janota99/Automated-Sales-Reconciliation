@@ -613,8 +613,8 @@ def test_fiscal_exception_summary_treats_one_and_two_periods_behind_as_routine(
 ):
     """A prior-period-close trickle is normal: an unresolved QuickBooks
     exception dated 1 or 2 fiscal periods behind the selected reporting
-    period is a routine "Prior-Period Exception", not the alarming
-    "Prior-Period Urgent Exception" label -- that label is reserved for a
+    period is a routine "Prior Period" exception, not the alarming
+    "Urgent Prior Period" label -- that label is reserved for a
     gap wider than PRIOR_PERIOD_URGENT_THRESHOLD periods, which signals a
     genuinely stale item worth investigating now."""
     qb_rows = [
@@ -633,11 +633,11 @@ def test_fiscal_exception_summary_treats_one_and_two_periods_behind_as_routine(
     )
     summary = build_fiscal_exception_summary(result)
     classification_by_period = dict(zip(summary["Fiscal Period"], summary["Period Classification"]))
-    assert classification_by_period["PD-05"] == "Current Reporting Period"
-    assert classification_by_period["PD-04"] == "Prior-Period Exception"
-    assert classification_by_period["PD-03"] == "Prior-Period Exception"
-    assert classification_by_period["PD-02"] == "Prior-Period Urgent Exception"
-    assert classification_by_period["PD-01"] == "Prior-Period Urgent Exception"
+    assert classification_by_period["PD-05"] == "Current Period"
+    assert classification_by_period["PD-04"] == "Prior Period"
+    assert classification_by_period["PD-03"] == "Prior Period"
+    assert classification_by_period["PD-02"] == "Urgent Prior Period"
+    assert classification_by_period["PD-01"] == "Urgent Prior Period"
 
 
 def test_ambiguous_duplicate_candidates_are_withheld_from_accrual(qb_mapping, inf_mapping, make_metadata):

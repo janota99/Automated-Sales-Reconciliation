@@ -33,7 +33,7 @@ EXPECTED_PRIMARY_SHEETS = [
     "Data Search QB Source",
     "Data Search INF Source",
     "Raw Data",
-    "Reconciled Data",
+    "Reconciliation Detail",
     "Unresolved Exceptions",
     "Product Aggregate Summary",
 ]
@@ -445,7 +445,7 @@ def test_legacy_short_valued_columns_are_wide_enough_for_their_headings(make_met
     widths = {c.value: ws.column_dimensions[get_column_letter(c.column)].width for c in ws[4] if c.value}
     assert 10 <= widths["Match Ref."] <= 14
     assert 14 <= widths["Referenced Match Ref."] <= 18
-    customer_no = next(c for c in ws[4] if c.value == "Customer No")
+    customer_no = next(c for c in ws[4] if c.value == "Customer No.")
     assert ws.column_dimensions[get_column_letter(customer_no.column)].width >= 16
 
 
@@ -564,7 +564,7 @@ def test_legacy_reconciliation_normalizes_infinium_column_names(qb_mapping, make
         assert raw not in header_values
     inf_headers = header_values[header_values.index("Referenced Match Ref.") + 1:]
     assert inf_headers[:8] == [
-        "Period", "Date", "Type", "Customer No", "Invoice No", "Amount", "Description", "PO No.",
+        "Period", "Date", "Type", "Customer No.", "Invoice No.", "Amount", "Description", "PO No.",
     ]
     # The underlying values still come through under the friendly names.
     data_values = [cell.value for cell in ws[5]]
@@ -714,14 +714,21 @@ def test_unresolved_sheet_has_a_status_color_legend(qb_mapping, inf_mapping, mak
                     return cell.row
         raise AssertionError(f"{needle!r} not found in sheet")
 
-    legend_row = first_row_containing("Confirmed duplicate")
+    legend_row = first_row_containing("Current Period")
     fiscal_row = first_row_containing("QUICKBOOKS EXCEPTIONS BY FISCAL PERIOD")
-    kpi_row = first_row_containing("Proposed JE support total")
+    kpi_row = first_row_containing("Net Proposed JE Support")
 
     assert kpi_row < legend_row < fiscal_row
-    legend_texts = [str(cell.value) for cell in ws[legend_row] if cell.value]
+    # The key wraps onto a second row rather than dropping entries.
+    legend_texts = [
+        str(cell.value) for row in ws.iter_rows(min_row=legend_row, max_row=fiscal_row - 1)
+        for cell in row if cell.value
+    ]
+    assert len(legend_texts) == 6
+    # Period classes are named exactly as the fiscal-period summary names them.
+    for name in ("Current Period", "Prior Period / pending review", "Urgent Prior Period"):
+        assert name in legend_texts
     assert any("duplicate" in text.lower() for text in legend_texts)
-    assert any("urgent" in text.lower() for text in legend_texts)
 
 
 def test_reference_matched_amount_variance_is_excluded_from_accrual_and_shown_separately(
@@ -915,12 +922,12 @@ def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
 ):
     """Row ID cells in the duplicates and duplicate-review-hold sections
     must link straight to where that same row was originally listed on
-    Reconciled Data -- and it must be the CORRECT row, not just any link,
+    Reconciliation Detail -- and it must be the CORRECT row, not just any link,
     since a wrong target would be worse than no link at all."""
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
     wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
     unresolved_ws = wb["Unresolved Exceptions"]
-    reconciled_ws = wb["Reconciled Data"]
+    reconciled_ws = wb["Reconciliation Detail"]
 
     def reconciled_po_at(row: int) -> Any:
         return reconciled_ws.cell(row, 1).value  # QB block starts at column A
@@ -937,7 +944,7 @@ def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
     assert linked_cells, "expected at least one Row ID hyperlink on Unresolved Exceptions"
 
     match_col = next(
-        cell.column for cell in reconciled_ws[3] if cell.value == "Match Result"
+        cell.column for cell in reconciled_ws[4] if cell.value == "Match Result"
     )
 
     checked = 0
@@ -945,10 +952,10 @@ def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
     for cell in linked_cells:
         qb_id = str(cell.value)
         target = cell.hyperlink.target
-        assert target.startswith("#'Reconciled Data'!A")
+        assert target.startswith("#'Reconciliation Detail'!A")
         target_row = int(target.rsplit("A", 1)[1])
         assert reconciled_po_at(target_row) == qb_po_for(qb_id), (
-            f"Row ID {qb_id} links to Reconciled Data row {target_row}, which doesn't match"
+            f"Row ID {qb_id} links to Reconciliation Detail row {target_row}, which doesn't match"
         )
         # Underline signals "clickable" without erasing a meaningful color
         # (e.g. a duplicate-excluded row's Row ID stays red, just underlined),
@@ -957,7 +964,7 @@ def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
         assert cell.font.bold is True
         checked += 1
 
-        # Round trip: Reconciled Data's Match Result cell on that same row
+        # Round trip: Reconciliation Detail's Match Result cell on that same row
         # must link back to exactly the Unresolved Exceptions row we started
         # from -- bidirectional, not just forward.
         reverse_cell = reconciled_ws.cell(target_row, match_col)
@@ -1180,30 +1187,41 @@ def _sheet_headers(ws, row):
     return [cell.value for cell in ws[row]]
 
 
-def test_reconciled_data_places_match_ref_immediately_before_match_result(
+def _link_text(value):
+    """The text a Referenced Match Ref. cell displays. The cell is a live link
+    (an IFERROR/HYPERLINK/MATCH formula) whose third HYPERLINK argument is
+    the shown text."""
+    import re
+
+    if isinstance(value, str) and value.startswith("=IFERROR(HYPERLINK("):
+        return re.search(r',"([^"]*)"\),"[^"]*"\)$', value).group(1)
+    return value
+
+
+def test_reconciliation_detail_places_match_ref_immediately_before_match_result(
     qb_mapping, inf_mapping, make_metadata,
 ):
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
-    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Reconciled Data"]
-    headers = _sheet_headers(ws, 3)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Reconciliation Detail"]
+    headers = _sheet_headers(ws, 4)
     ref_index = headers.index("Match Ref.")
     assert headers[ref_index + 1] == "Match Result"          # Match Ref. immediately before
     assert headers[ref_index + 2] == "Referenced Match Ref."
     ref_col = ref_index + 1
     for position, record in enumerate(result.paired_rows):
-        row_number = 4 + position
+        row_number = 5 + position
         shown = ws.cell(row_number, ref_col).value
-        pointer = ws.cell(row_number, ref_col + 2).value
+        pointer = _link_text(ws.cell(row_number, ref_col + 2).value)
         if record["Section"] == "01 Matched":
             assert shown == record["Match Ref."] and shown
             assert pointer is None
         else:
             assert shown is None                              # never an accepted-match reference
             assert (pointer or "") == record["Referenced Match Ref."]
-    assert any(ws.cell(4 + i, ref_col + 2).value for i in range(len(result.paired_rows)))
+    assert any(ws.cell(5 + i, ref_col + 2).value for i in range(len(result.paired_rows)))
     # Narrow but complete: the workbook autofit must not stretch the reference columns.
     assert ws.column_dimensions[get_column_letter(ref_col)].width <= 14
-    assert ws.column_dimensions[get_column_letter(ref_col + 2)].width <= 18
+    assert ws.column_dimensions[get_column_letter(ref_col + 2)].width <= 24
 
 
 def test_legacy_reconciliation_references_stay_with_their_relationship_after_sorting(
@@ -1252,7 +1270,7 @@ def test_unresolved_exceptions_places_referenced_match_ref_immediately_before_st
     pointer_col = status_col - 1
     rows = []
     for number in range(header_row[0].row + 1, header_row[0].row + 1 + len(result.unmatched_qb)):
-        rows.append((ws.cell(number, status_col).value, ws.cell(number, pointer_col).value))
+        rows.append((ws.cell(number, status_col).value, _link_text(ws.cell(number, pointer_col).value)))
     assert len(rows) == 2
     for status, pointer in rows:
         # Every exception here points at a real match, named the same way in both cells.
@@ -1275,7 +1293,7 @@ def test_every_reference_shown_in_any_workbook_exists_in_the_match_register(
         for ws in wb.worksheets:
             for row in ws.iter_rows():
                 for cell in row:
-                    if isinstance(cell.value, str) and not cell.value.startswith("="):
+                    if isinstance(cell.value, str):
                         cited.update(pattern.findall(cell.value))
     # Nothing is cited that is not a real accepted match; the old six-digit
     # run-local ids (M-000012) would also match this pattern and fail here.
@@ -1378,3 +1396,376 @@ def test_analytics_match_register_lists_every_relationship_with_tying_amounts(
     assert group["Infinium Amount"] == pytest.approx(150.00)
     assert group["Amount Difference"] == pytest.approx(0.0)
     assert all(r["Match Type"] in ("One-to-One", "Grouped") for r in records)
+
+
+# ---------------------------------------------------------------------------
+# Modern main workbook: fiscal-period titles, Reconciliation Detail, Unresolved
+# Exceptions layout, and match-reference navigation
+# ---------------------------------------------------------------------------
+
+INFINIUM_CODE_MAPPING = {"po": "OHPONO", "invoice": "OHOBNO", "amount": "OHTOTA", "period": "OHAPD"}
+
+
+def _infinium_code_row(po, invoice, amount, period="1"):
+    return {
+        "OHAPD": period, "OHOBDE": "1/09/2026", "OHCO": "WP", "CUNO": 50001, "OHOBNO": invoice,
+        "OHTOTA": amount, "OHDESC": "Sales order", "OHPONO": po,
+    }
+
+
+def _clearance_result(qb_mapping, make_metadata):
+    """A QuickBooks record cleared by a prior-period Infinium record, beside an
+    ordinary current-period match and an unresolved exception."""
+    qb_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-H", "Invoice": "INV-H", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-X", "Invoice": "INV-X", "Amount": 7.00, "Qty": 1, "Period": "1"},
+    ]
+    return build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame([_infinium_code_row("PO1", "INV1", 100.00)]),
+        qb_mapping, INFINIUM_CODE_MAPPING, make_metadata(), 2026,
+        inf_secondary_raw=pd.DataFrame([_infinium_code_row("PO-H", "INV-H", 25.00, "12")]),
+        inf_secondary_mapping=INFINIUM_CODE_MAPPING,
+    )
+
+
+def _detail_sheet(result):
+    return load_workbook(io.BytesIO(build_primary_workbook(result)))["Reconciliation Detail"]
+
+
+def test_main_sheet_titles_lead_with_the_fiscal_period(qb_mapping, inf_mapping, make_metadata):
+    """Two runs of the same workbook open side by side must be told apart at a
+    glance: the three QuickBooks titles start with the run's fiscal period."""
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    result_p5 = build_reconciliation(
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Qty": 1, "Period": "5"}]),
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Period": "5"}]),
+        qb_mapping, inf_mapping, make_metadata(fiscal_period=5), 2026,
+    )
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result_p5)))
+    prefix = "FISCAL PERIOD 05 - 2026"
+    assert wb["Raw Data"]["A1"].value == f"{prefix} | QUICKBOOKS | RAW TRANSACTION DETAIL"
+    assert wb["Reconciliation Detail"]["A1"].value == f"{prefix} | QUICKBOOKS | RECONCILIATION DETAIL"
+    assert wb["Unresolved Exceptions"]["A1"].value == f"{prefix} | QUICKBOOKS EXCEPTIONS | JOURNAL ENTRY SUPPORT"
+    # The other run says period 01 -- the titles differ, which is the point.
+    other = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    assert other["Reconciliation Detail"]["A1"].value.startswith("FISCAL PERIOD 01 - 2026 | ")
+    # The Infinium side keeps its own heading.
+    assert wb["Raw Data"]["A1"].value != wb["Raw Data"].cell(1, 12).value
+
+
+def test_main_sheet_titles_when_no_fiscal_period_was_selected(qb_mapping, inf_mapping, make_metadata):
+    result = build_reconciliation(
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Qty": 1, "Period": "5"}]),
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Period": "5"}]),
+        qb_mapping, inf_mapping, make_metadata(fiscal_period=None), 2026,
+    )
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    assert wb["Reconciliation Detail"]["A1"].value == (
+        "FISCAL PERIOD NOT SELECTED - 2026 | QUICKBOOKS | RECONCILIATION DETAIL"
+    )
+
+
+def test_reconciliation_detail_is_named_for_what_it_contains(qb_mapping, inf_mapping, make_metadata):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    assert "Reconciled Data" not in wb.sheetnames
+    ws = wb["Reconciliation Detail"]
+    assert ws["A1"].value.endswith("| QUICKBOOKS | RECONCILIATION DETAIL")
+    infinium_title = next(c.value for c in ws[1] if c.value and str(c.value).startswith("INFINIUM"))
+    assert infinium_title == "INFINIUM | RECONCILIATION DETAIL"
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    assert "RECONCILED TOTAL" not in text and "QUICKBOOKS | RECONCILED" not in text
+
+
+def test_reconciliation_detail_control_strip_ties_to_the_rows_beneath_it(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    from workpapers import qb_record_outcomes
+    from utils import format_currency
+
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = _detail_sheet(result)
+    strip = ws["A3"].value
+    outcomes = qb_record_outcomes(result)
+
+    # Every primary QuickBooks record lands in exactly one outcome, and the
+    # counts agree with the engine's own metrics.
+    assert outcomes["records"] == result.metrics["QuickBooks Rows"]
+    assert outcomes["excluded"] == result.metrics["Duplicate QuickBooks Rows"]
+    primary_ids = set(result.qb_work[QB_ID])
+    register_ids = {
+        qb_id for entry in result.match_register["QuickBooks Row IDs"] for qb_id in entry.split("; ")
+    }
+    assert outcomes["reconciled"] == len(register_ids & primary_ids)
+    assert outcomes["reconciled"] + outcomes["unresolved"] + outcomes["excluded"] == outcomes["records"]
+
+    rate = outcomes["reconciled"] / outcomes["records"] * 100
+    parts = [part.strip() for part in strip.split("|")]
+    noun = "record" if outcomes["records"] == 1 else "records"
+    duplicates = "duplicate" if outcomes["excluded"] == 1 else "duplicates"
+    assert parts == [
+        f"{outcomes['records']:,} QuickBooks {noun}",
+        f"{outcomes['reconciled']:,} reconciled",
+        f"{rate:.1f}%",
+        f"{outcomes['unresolved']:,} unresolved",
+        f"{outcomes['excluded']:,} {duplicates} excluded",
+        f"JE support: {format_currency(result.metrics['Unresolved QuickBooks Amount'])}",
+    ]
+    # The strip is a single narrow row above the header, with the control
+    # result beside it in green for a PASS.
+    assert any(r.min_row == 3 and r.max_row == 3 and r.min_col == 1 for r in ws.merged_cells.ranges)
+    assert ws.row_dimensions[3].height <= 24
+    control = next(c for c in ws[3] if c.value and str(c.value).startswith("Control:"))
+    assert control.value == f"Control: {result.metrics['Control Status']}"
+    assert control.fill.fgColor.rgb.endswith("E8F3EC")   # GREEN_LIGHT: control passed
+    assert [c.value for c in ws[4]][:2] == ["PO", "Invoice"]
+    assert ws.cell(5, 1).value is not None or ws.cell(5, 2).value is not None
+    assert ws.freeze_panes.endswith("5")                  # strip and header stay in view
+    assert ws.print_title_rows == "$1:$4"
+
+
+def test_reconciliation_detail_strip_uses_singular_nouns():
+    from workpapers import _control_strip_text
+
+    class Stub:
+        metrics = {"Unresolved QuickBooks Amount": 0.0}
+        paired_rows = [{"QB Index": 0, "QB Record Scope": "Primary", "Section": "04 Duplicate QuickBooks"}]
+
+    text = _control_strip_text(Stub())
+    assert text.startswith("1 QuickBooks record   |")
+    assert "1 duplicate excluded" in text
+
+
+def test_reconciliation_detail_shows_friendly_infinium_headers_and_keeps_the_codes(
+    qb_mapping, make_metadata,
+):
+    result = _clearance_result(qb_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    ws = wb["Reconciliation Detail"]
+    headers = [c.value for c in ws[4]]
+    inf_headers = headers[headers.index("Referenced Match Ref.") + 1:]
+    assert inf_headers[:8] == [
+        "Period", "Date", "Type", "Customer No.", "Invoice No.", "Amount", "Description", "PO No.",
+    ]
+    for code in ("OHAPD", "OHOBDE", "OHCO", "CUNO", "OHOBNO", "OHTOTA", "OHDESC", "OHPONO"):
+        assert code not in headers
+    # The code stays one hover away, on the renamed header itself.
+    comments = {c.value: c.comment.text for c in ws[4] if c.comment}
+    assert comments["Customer No."] == "Infinium field code: CUNO"
+    assert comments["Amount"] == "Infinium field code: OHTOTA"
+    assert set(comments) == set(inf_headers[:8])
+    # ...and the Raw Data sheet keeps every code exactly as uploaded.
+    raw_headers = [c.value for c in wb["Raw Data"][3]]
+    for code in ("OHAPD", "OHOBDE", "OHCO", "CUNO", "OHOBNO", "OHTOTA", "OHDESC", "OHPONO"):
+        assert code in raw_headers
+    # The renamed amount column is still an amount: right-aligned header,
+    # accounting number format, measured (numeric) font.
+    amount_col = len(headers) - len(inf_headers) + inf_headers.index("Amount") + 1
+    assert ws.cell(4, amount_col).alignment.horizontal == "right"
+    assert "$" in ws.cell(5, amount_col).number_format
+    # The data still comes through under the friendly names.
+    assert 50001 in [c.value for c in ws[5]]
+
+
+def test_record_context_is_blank_unless_a_record_was_accepted_from_a_prior_period(
+    qb_mapping, make_metadata,
+):
+    result = _clearance_result(qb_mapping, make_metadata)
+    ws = _detail_sheet(result)
+    headers = [c.value for c in ws[4]]
+    qb_context = headers.index("QuickBooks Record Context") + 1
+    inf_context = headers.index("Infinium Record Context") + 1
+    qb_values = [ws.cell(r, qb_context).value for r in range(5, 5 + len(result.paired_rows))]
+    inf_values = [ws.cell(r, inf_context).value for r in range(5, 5 + len(result.paired_rows))]
+    assert not any(qb_values)                       # ordinary primary records: blank
+    assert [v for v in inf_values if v] == ["Accepted Prior-Period Record"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    assert "Primary QuickBooks Upload" not in text and "Primary Infinium Upload" not in text
+    assert "Prior Period Match" not in text
+
+
+def test_reconciliation_detail_and_exceptions_link_references_to_the_accepted_match(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Every populated Referenced Match Ref. is a live link that finds its
+    match on Reconciliation Detail by reference (not by a fixed row), so it
+    still lands correctly after that sheet is sorted or filtered."""
+    import re
+
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    detail = wb["Reconciliation Detail"]
+    header = [c.value for c in detail[4]]
+    ref_letter = get_column_letter(header.index("Match Ref.") + 1)
+    ref_column = {detail.cell(r, header.index("Match Ref.") + 1).value for r in range(5, detail.max_row + 1)}
+    pattern = re.compile(
+        r"=IFERROR\(HYPERLINK\(\"#'Reconciliation Detail'!([A-Z]+)\"&MATCH\(\"([^\"]+)\","
+        r"'Reconciliation Detail'!\$\1:\$\1,0\),\"([^\"]*)\"\),\"\3\"\)"
+    )
+
+    linked = []
+    pointer_col = header.index("Referenced Match Ref.") + 1
+    for r in range(5, 5 + len(result.paired_rows)):
+        value = detail.cell(r, pointer_col).value
+        if value:
+            linked.append(value)
+    unresolved = wb["Unresolved Exceptions"]
+    exceptions_header = next(row for row in unresolved.iter_rows() if any(c.value == "Exception Status" for c in row))
+    exceptions_pointer = [c.value for c in exceptions_header].index("Referenced Match Ref.") + 1
+    for r in range(exceptions_header[0].row + 1, exceptions_header[0].row + 1 + len(result.unmatched_qb)):
+        value = unresolved.cell(r, exceptions_pointer).value
+        if value:
+            linked.append(value)
+    assert len(linked) >= 3          # exceptions on both sheets point at matches here
+    for formula in linked:
+        found = pattern.fullmatch(formula)
+        assert found, formula
+        assert found.group(1) == ref_letter        # the Match Ref. column, wherever it sits
+        assert found.group(2) == found.group(3)    # looks up the reference it displays
+        assert found.group(2) in ref_column        # ...and that match exists on the sheet
+    # Match Ref. cells themselves are the destination, not links.
+    assert not any(str(v).startswith("=") for v in ref_column if v)
+    # Links are visibly links.
+    first_link = next(
+        detail.cell(r, pointer_col) for r in range(5, 5 + len(result.paired_rows)) if detail.cell(r, pointer_col).value
+    )
+    assert first_link.font.underline == "single" and first_link.font.bold is True
+
+
+def test_a_reference_link_naming_several_matches_shows_all_and_links_to_the_first():
+    from workpapers import _match_ref_link_formula
+
+    formula = _match_ref_link_formula("M-003; G-001", "K")
+    assert 'MATCH("M-003",' in formula and 'HYPERLINK("#\'Reconciliation Detail\'!K"&MATCH' in formula
+    assert formula.endswith('"M-003; G-001"),"M-003; G-001")')
+
+
+def test_reference_link_columns_are_sized_by_the_reference_not_the_formula(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    unresolved = wb["Unresolved Exceptions"]
+    header_row = next(row for row in unresolved.iter_rows() if any(c.value == "Exception Status" for c in row))
+    column = [c.value for c in header_row].index("Referenced Match Ref.") + 1
+    width = unresolved.column_dimensions[get_column_letter(column)].width
+    assert len("Referenced Match Ref.") <= width          # the full heading fits
+    assert header_row[column - 1].alignment.horizontal == "center"
+    # Sizing reads the reference a link displays, never the formula behind it.
+    from excel_styles import _autofit_display_text
+    from workpapers import _match_ref_link_formula
+
+    assert _autofit_display_text(_match_ref_link_formula("M-012", "K")) == "M-012"
+    assert _autofit_display_text("=SUM(A1:A9)") == "=SUM(A1:A9)"
+
+
+def test_unresolved_exceptions_kpi_blocks_use_explicit_proposed_entry_labels(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    labels = [c.value for c in ws[3] if c.value]
+    assert labels == [
+        "Unresolved Rows", "Proposed Debit Support", "Proposed Credit Support", "Net Proposed JE Support",
+    ]
+    text = _worksheet_text(ws)
+    for old in ("Gross debits", "Credits", "Proposed JE support total", "Unresolved rows"):
+        assert old not in text
+    # Compact: a slim label row over a slim value row, four cards side by side.
+    assert ws.row_dimensions[3].height <= 16 and ws.row_dimensions[4].height <= 24
+    assert len([r for r in ws.merged_cells.ranges if r.min_row == 3 and r.max_row == 3]) == 4
+
+
+def test_unresolved_exceptions_title_to_summary_gap_is_tight(qb_mapping, inf_mapping, make_metadata):
+    """The fiscal-period summary sits close beneath the title -- rows are
+    sized from a merged caption's full width, not its first column."""
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    fiscal_row = next(
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and str(c.value).startswith("QUICKBOOKS EXCEPTIONS BY FISCAL PERIOD")
+    )
+    above = sum(ws.row_dimensions[r].height or 15 for r in range(1, fiscal_row))
+    assert above <= 150, above
+    # The summary's own caption is a line or two, not a dozen.
+    assert (ws.row_dimensions[fiscal_row + 1].height or 15) <= 45
+    # A one-line title band is one designed height everywhere.
+    assert ws.row_dimensions[1].height == 27
+    raw = load_workbook(io.BytesIO(build_primary_workbook(result)))["Raw Data"]
+    assert raw.row_dimensions[1].height == 27
+
+
+def test_unresolved_exceptions_period_classes_are_named_consistently(qb_mapping, inf_mapping, make_metadata):
+    from config import AMBER, GREEN_LIGHT, RED_LIGHT
+
+    qb_rows = [
+        {"PO": "PO-CUR", "Invoice": "INV-CUR", "Amount": 10.00, "Qty": 1, "Period": "5"},
+        {"PO": "PO-P4", "Invoice": "INV-P4", "Amount": 20.00, "Qty": 1, "Period": "4"},
+        {"PO": "PO-P1", "Invoice": "INV-P1", "Amount": 50.00, "Qty": 1, "Period": "1"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame([{"PO": "POX", "Invoice": "INVX", "Amount": 1.0, "Period": "5"}]),
+        qb_mapping, inf_mapping, make_metadata(fiscal_period=5), 2026,
+    )
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    fiscal_header = next(row for row in ws.iter_rows() if any(c.value == "Period Classification" for c in row))
+    class_col = [c.value for c in fiscal_header].index("Period Classification") + 1
+    classes = {}
+    row = fiscal_header[0].row + 1
+    while ws.cell(row, 1).value and not str(ws.cell(row, 1).value).startswith("TOTAL"):
+        classes[ws.cell(row, class_col).value] = ws.cell(row, class_col)
+        # The color sits on the classification cell alone -- not the whole row.
+        for col in range(1, class_col + 1):
+            if col != class_col:
+                assert not ws.cell(row, col).fill.fgColor.rgb.endswith((AMBER, GREEN_LIGHT, RED_LIGHT)), (row, col)
+        row += 1
+    assert set(classes) == {"Current Period", "Prior Period", "Urgent Prior Period"}
+    assert classes["Current Period"].fill.fgColor.rgb.endswith(GREEN_LIGHT)
+    assert classes["Prior Period"].fill.fgColor.rgb.endswith(AMBER)
+    assert classes["Urgent Prior Period"].fill.fgColor.rgb.endswith(RED_LIGHT)
+    # The legend uses those same three names.
+    legend = {c.value for r in ws.iter_rows(min_row=5, max_row=fiscal_header[0].row) for c in r if c.value}
+    assert "Current Period" in legend and "Urgent Prior Period" in legend
+    assert any(text.startswith("Prior Period") for text in legend)
+    caption = next(c.value for r in ws.iter_rows() for c in r if c.value and str(c.value).startswith("Selected current"))
+    assert "Prior Period exception" in caption and "Urgent Prior Period exception" in caption
+
+
+def test_unresolved_exceptions_review_hold_tints_only_its_status_cell(qb_mapping, inf_mapping, make_metadata):
+    from config import AMBER
+
+    result = _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    title_row = next(
+        c.row for row in ws.iter_rows() for c in row if c.value and str(c.value).startswith("DUPLICATE REVIEW HOLD")
+    )
+    header_row = next(
+        row for row in ws.iter_rows(min_row=title_row) if any(c.value == "Reviewer Disposition" for c in row)
+    )
+    headers = [c.value for c in header_row]
+    status_col = headers.index("Status") + 1
+    data_row = header_row[0].row + 1
+    assert ws.cell(data_row, status_col).value == "Pending Review"
+    for col in range(1, len(headers) + 1):
+        filled = ws.cell(data_row, col).fill.fgColor.rgb.endswith(AMBER)
+        assert filled == (col == status_col), col
+
+
+def test_row_autofit_measures_a_merged_caption_across_its_full_width():
+    """A long caption in a merged band must size from the whole band's width;
+    measured against its first column alone it balloons the row."""
+    from openpyxl import Workbook
+
+    from workpapers import _autofit_workbook_rows
+
+    wb = Workbook()
+    ws = wb.active
+    for letter in "ABCDEFGHIJ":
+        ws.column_dimensions[letter].width = 20
+    ws.merge_cells("A5:J5")
+    ws["A5"] = "word " * 60                      # 300 characters across 200 units of width
+    ws["A6"] = "=SUMIF(A1:A5,\">0\",A1:A5)+SUMIF(B1:B5,\">0\",B1:B5)+SUMIF(C1:C5,\">0\",C1:C5)"
+    _autofit_workbook_rows(wb)
+    assert (ws.row_dimensions[5].height or 15) <= 45
+    assert ws.row_dimensions[6].height is None    # a formula is not measured as text

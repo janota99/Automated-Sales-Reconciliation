@@ -10,6 +10,7 @@ sheet" rather than "how a cell block is painted."
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal
 
@@ -71,6 +72,17 @@ BORDER_TOTAL = Border(
 # ---------------------------------------------------------------------------
 # Formatting Engine
 # ---------------------------------------------------------------------------
+
+def fix_row_height(ws, row: int, height: float) -> None:
+    """Give a row a deliberate height and mark it, so the workbook-wide row
+    autofit -- which estimates wrapping from text length -- leaves it alone.
+    Title bands, KPI cards, legends, and control strips are single designed
+    lines; measured as text they would balloon."""
+    ws.row_dimensions[row].height = height
+    fixed = getattr(ws, "_fixed_row_heights", {})
+    fixed[row] = height
+    ws._fixed_row_heights = fixed
+
 
 def _thin_border() -> Border:
     return BORDER_THIN
@@ -306,6 +318,19 @@ def _pin_column_width(ws, letter: str, width: float) -> None:
     ws._pinned_column_letters = pinned
 
 
+# A Referenced Match Ref. cell is a live-link formula whose length has nothing
+# to do with the short reference it displays.
+_MATCH_LINK_FORMULA = re.compile(r'^=IFERROR\(HYPERLINK\(.*,"([^"]*)"\),"[^"]*"\)$')
+
+
+def _autofit_display_text(value) -> str:
+    """The text a cell shows, for sizing its column: a match-reference link
+    formula counts as its short displayed reference, not its formula text."""
+    text = str(value)
+    link = _MATCH_LINK_FORMULA.match(text)
+    return link.group(1) if link else text
+
+
 def _autofit_workbook_columns(
     wb: Workbook,
     minimum: float = 10,
@@ -361,7 +386,7 @@ def _autofit_workbook_columns(
                     else:
                         display = str(value)
                 else:
-                    display = str(value)
+                    display = _autofit_display_text(value)
                 maximum_length = max(
                     maximum_length,
                     max((len(line) for line in display.splitlines()), default=0),
@@ -382,11 +407,12 @@ def _write_title_band(ws, row: int, start_col: int, end_col: int, title: str, co
     cell = ws.cell(row, start_col, title)
     cell.fill = title_fill
     cell.font = FONT_TITLE
-    cell.alignment = ALIGN_LEFT_CENTER
-    
+    # A title longer than its band shrinks to fit instead of being clipped.
+    cell.alignment = Alignment(horizontal="left", vertical="center", shrink_to_fit=True)
+
     for col in range(start_col + 1, end_col + 1):
         ws.cell(row, col).fill = title_fill
-    ws.row_dimensions[row].height = 27
+    fix_row_height(ws, row, 27)
 
 
 def _write_caption_band(ws, row: int, start_col: int, end_col: int, caption: str, color: str) -> None:

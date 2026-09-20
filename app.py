@@ -19,7 +19,7 @@ focused on "what happens, in what order":
 
 The app produces two files from one controlled reconciliation run:
     1. Sales_Reconciliation_<run>.xlsx
-       Raw Data, Reconciled Data, Unresolved Exceptions, and
+       Raw Data, Reconciliation Detail, Unresolved Exceptions, and
        Product Aggregate Summary.
     2. Sales_Reconciliation_Analytics_<run>.xlsx
        Optional technical evidence, normalization, method analytics,

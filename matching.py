@@ -3040,7 +3040,7 @@ def build_rules_and_config(
             {"Priority": 19, "Rule": "Standardized exception-cause classification", "Automatic": "Reporting only",
              "Requirement": (
                  "Every unresolved, duplicate, and amount-variance row receives a controlled cause, confidence, "
-                 "financial treatment, and related-row evidence. Reconciled Data retains the actual duplicate PO, "
+                 "financial treatment, and related-row evidence. Reconciliation Detail retains the actual duplicate PO, "
                  "invoice, signed amount, group ID, copy-set ID, and canonical row ID for audit inspection."
              )},
             {"Priority": 20, "Rule": "Ambiguous duplicate review (see build_ambiguous_duplicate_candidates)",
@@ -3201,24 +3201,24 @@ def build_fiscal_exception_summary(result: ReconciliationResult) -> pd.DataFrame
         if selected_period is None:
             return "Reporting Period Not Selected"
         if int(value) == int(selected_period):
-            return "Current Reporting Period"
+            return "Current Period"
         periods_behind = int(selected_period) - int(value)
         # A row from the immediate prior period (or the one before that) is
         # routine -- the prior period's close is often still trickling in
         # when this period's reconciliation runs. Only a gap wider than that
         # signals a genuinely stale, investigate-now exception.
         if 0 < periods_behind <= PRIOR_PERIOD_URGENT_THRESHOLD:
-            return "Prior-Period Exception"
-        return "Prior-Period Urgent Exception"
+            return "Prior Period"
+        return "Urgent Prior Period"
 
     work["Period Classification"] = work["__PERIOD_NUMBER"].map(classify)
     work["__URGENCY_SORT"] = work["Period Classification"].map(
         {
-            "Prior-Period Urgent Exception": 1,
-            "Prior-Period Exception": 2,
+            "Urgent Prior Period": 1,
+            "Prior Period": 2,
             "Unspecified Period - Review": 3,
             "Reporting Period Not Selected": 4,
-            "Current Reporting Period": 5,
+            "Current Period": 5,
         }
     )
     summary = (
@@ -4363,7 +4363,7 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
         ):
             raise ValueError(
                 "Duplicate-value audit control failure: a confirmed duplicate row lacks "
-                "the values or canonical linkage required in Reconciled Data."
+                "the values or canonical linkage required in Reconciliation Detail."
             )
         if section in {
             "06 Duplicate Review Hold QuickBooks",

@@ -32,12 +32,27 @@ NEUTRAL_GOLD_TEXT = "9C6500"
 METHOD_GREY_FILL = "D9D9D9"
 METHOD_GREY_TEXT = "000000"
 # A true neutral grey (no blue or teal undertone) for a column that exists
-# purely to divide two colored sides -- e.g. Reconciled Data's "Match
+# purely to divide two colored sides -- e.g. Reconciliation Detail's "Match
 # Result" column, sitting between the QuickBooks (navy) and Infinium
 # (teal) blocks. SLATE reads as a third shade of blue next to those two,
 # not as a clear divider; this is deliberately desaturated so it never
 # competes with either side's identity color.
 METHOD_GREY_DARK = "595959"
+
+# Infinium's raw extract headers are cryptic system codes; every reconciliation
+# sheet that shows an Infinium record uses these plain field names instead.
+# Display-only -- the values, widths, and number formats still key off the
+# original header, and the raw upload keeps the codes untouched.
+INFINIUM_FRIENDLY_HEADERS = {
+    "OHAPD": "Period",
+    "OHOBDE": "Date",
+    "OHCO": "Type",
+    "CUNO": "Customer No.",
+    "OHOBNO": "Invoice No.",
+    "OHTOTA": "Amount",
+    "OHDESC": "Description",
+    "OHPONO": "PO No.",
+}
 
 # Accountant's Legacy Format workbook only. A full-row fill repeated across
 # hundreds of rows has to stay quiet, so these are much lighter tints than
