@@ -29,6 +29,7 @@ from workpapers import (
 )
 
 EXPECTED_PRIMARY_SHEETS = [
+    "Posting Summary",
     "Data Search",
     "Data Search QB Source",
     "Data Search INF Source",
@@ -36,6 +37,7 @@ EXPECTED_PRIMARY_SHEETS = [
     "Reconciliation Detail",
     "Unresolved Exceptions",
     "Product Aggregate Summary",
+    "Reason Code Glossary",
 ]
 
 EXPECTED_LEGACY_SHEETS = [
@@ -121,7 +123,7 @@ def test_primary_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping
     assert wb.sheetnames == EXPECTED_PRIMARY_SHEETS
 
     unresolved_text = _worksheet_text(wb["Unresolved Exceptions"])
-    assert any("QUICKBOOKS DUPLICATES EXCLUDED FROM JE" in text for text in unresolved_text)
+    assert any("DUPLICATE EXCLUDED | CONFIRMED COPY" in text for text in unresolved_text)
     # The old schema's columns must never resurface in the rendered output.
     assert not any(text == "Reconciliation Status" for text in unresolved_text)
     assert not any(text == "Source Row IDs" for text in unresolved_text)
@@ -357,7 +359,7 @@ def test_legacy_reconciliation_styling_labels_and_legend(qb_mapping, inf_mapping
     # The blank side reads as one quiet panel -- filled, outlined only at its
     # edges, NOT merged (merged cells of different sizes stop Excel sorting).
     inf_end = len(ws[4])
-    qb_end_col = headers["Match Ref."] - 1  # last QuickBooks column
+    qb_end_col = headers["Final Disposition"] - 1  # last QuickBooks column
     unmatched_row = unmatched[0].row
     _assert_outline_only_panel(ws, unmatched_row, inf_start, inf_end)
     matched_row = matched[0].row
@@ -439,13 +441,14 @@ def test_legacy_short_valued_columns_are_wide_enough_for_their_headings(make_met
     )
     ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
     for cell in ws[4]:
-        if cell.value in ("Match Ref.", "Referenced Match Ref."):
+        if cell.value in ("Match Ref.", "Referenced Match Ref.", "Final Disposition"):
             continue  # narrow by design; the long heading wraps (checked below)
         if cell.value:
             assert ws.column_dimensions[get_column_letter(cell.column)].width >= len(str(cell.value)) + 5, cell.value
     widths = {c.value: ws.column_dimensions[get_column_letter(c.column)].width for c in ws[4] if c.value}
     assert 10 <= widths["Match Ref."] <= 14
     assert 14 <= widths["Referenced Match Ref."] <= 18
+    assert 18 <= widths["Final Disposition"] <= 26
     customer_no = next(c for c in ws[4] if c.value == "Customer No.")
     assert ws.column_dimensions[get_column_letter(customer_no.column)].width >= 16
 
@@ -501,7 +504,7 @@ def test_legacy_intro_note_reports_percent_reconciled_and_us_style_timestamp(qb_
     ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
     note = ws.cell(2, 1).value
     assert re.match(
-        r"^\d[\d,]* of \d[\d,]* QuickBooks records reconciled \(\d+\.\d%\)\. "
+        r"^All \d[\d,]* QuickBooks records accounted for -- \d[\d,]* matched \(\d+\.\d%\)\. "
         r"Gold rows require review; red rows are excluded duplicates\. See Exceptions for details\. "
         r"Generated \d{2}/\d{2}/\d{4} \d{1,2}:\d{2} (AM|PM) [A-Z]{3,4}\.$",
         note,
@@ -633,14 +636,16 @@ def test_data_search_sheet_shows_duplicate_pair_and_clean_match(qb_mapping, inf_
 
 
 def test_data_search_sheet_is_first_and_live_searchable(qb_mapping, inf_mapping, make_metadata):
-    """Data Search must be the first sheet a reviewer sees, back its two
-    live-search panels with hidden source sheets (not visible clutter), and
-    drive its results with a FILTER() formula keyed off the two input cells
-    -- not a static table requiring manual filtering."""
+    """Posting Summary is the landing page (sheet[0]); Data Search follows
+    immediately as the first working sheet, backs its two live-search panels
+    with hidden source sheets (not visible clutter), and drives its results
+    with a FILTER() formula keyed off the two input cells -- not a static
+    table requiring manual filtering."""
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
     wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
 
-    assert wb.sheetnames[0] == "Data Search"
+    assert wb.sheetnames[0] == "Posting Summary"
+    assert wb.sheetnames[1] == "Data Search"
     assert wb["Data Search QB Source"].sheet_state == "hidden"
     assert wb["Data Search INF Source"].sheet_state == "hidden"
 
@@ -717,7 +722,7 @@ def test_unresolved_sheet_has_a_status_color_legend(qb_mapping, inf_mapping, mak
 
     legend_row = first_row_containing("Current Period")
     fiscal_row = first_row_containing("QUICKBOOKS EXCEPTIONS BY FISCAL PERIOD")
-    kpi_row = first_row_containing("Net Proposed JE Support")
+    kpi_row = first_row_containing("Engine Proposed JE Support")
 
     assert kpi_row < legend_row < fiscal_row
     # The key wraps onto a second row rather than dropping entries.
@@ -760,13 +765,13 @@ def test_reference_matched_amount_variance_is_excluded_from_accrual_and_shown_se
     ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
     sheet_text = _worksheet_text(ws)
 
-    assert any("REFERENCE-MATCHED AMOUNT VARIANCE" in text for text in sheet_text)
+    assert any("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE" in text for text in sheet_text)
+    assert any("AMOUNT_VARIANCE" in text for text in sheet_text)
     assert any(text == "QB-1" for text in sheet_text)
-    assert any(text == "INF-1" for text in sheet_text)
     assert any(isinstance(v, (int, float)) and v == 100.0 for v in [c.value for row in ws.iter_rows() for c in row])
     assert any(isinstance(v, (int, float)) and v == 90.0 for v in [c.value for row in ws.iter_rows() for c in row])
     # It must not also appear as an ordinary exception row/PROPOSED JE total contributor.
-    assert not any(text == "Unmatched QuickBooks" for text in sheet_text)
+    assert not any(text == "No matching Infinium records" for text in sheet_text)
 
 
 def test_ambiguous_duplicate_is_excluded_from_accrual_and_labeled_separately(
@@ -796,15 +801,13 @@ def test_ambiguous_duplicate_is_excluded_from_accrual_and_labeled_separately(
     ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
     sheet_text = _worksheet_text(ws)
 
-    assert any("AMBIGUOUS DUPLICATE" in text for text in sheet_text)
+    assert any("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE" in text for text in sheet_text)
+    assert any("MULTIPLE_CANDIDATES" in text for text in sheet_text)
     assert any(text == "QB-1" for text in sheet_text)
     # Both Infinium candidates are listed for the reviewer to research.
     assert any("INF-1" in text and "INF-2" in text for text in sheet_text)
-    # It must not also appear as an ordinary exception row, nor be folded
-    # into the reference-matched amount variance section (no variance rows
-    # were generated at all, per the assertion above).
-    assert not any(text == "Unmatched QuickBooks" for text in sheet_text)
-    assert not any(str(text).startswith("VAR-") for text in sheet_text)
+    # It must not also appear as an ordinary exception row.
+    assert not any(text == "No matching Infinium records" for text in sheet_text)
 
 
 def test_po_reuse_error_is_held_and_shows_grouped_detail(
@@ -834,8 +837,8 @@ def test_po_reuse_error_is_held_and_shows_grouped_detail(
 
     # Both rows are itemized in the review-hold section, labeled PO Re-use
     # Error, and are NOT part of the JE-support total.
-    assert sum("PO Re-use Error" in text for text in sheet_text) >= 2
-    assert any("REVIEW HOLD | REFERENCE EVIDENCE" in text for text in sheet_text)
+    assert sum("PO_REUSE" in text for text in sheet_text) >= 2
+    assert any("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE" in text for text in sheet_text)
     assert any("PO RE-USE ERROR" in text for text in sheet_text)
     assert any("QB-1" in text and "QB-2" in text for text in sheet_text)
     assert any(isinstance(v, (int, float)) and v == 150.0 for v in [c.value for row in ws.iter_rows() for c in row])
@@ -861,7 +864,7 @@ def test_duplicates_and_je_sit_ten_rows_below_the_exceptions_total(
         raise AssertionError(f"{needle!r} not found in sheet")
 
     exceptions_total_row = first_row_containing("PROPOSED JE SUPPORT TOTAL")
-    duplicates_row = first_row_containing("QUICKBOOKS DUPLICATES EXCLUDED FROM JE")
+    duplicates_row = first_row_containing("DUPLICATE EXCLUDED | CONFIRMED COPY")
     je_row = first_row_containing("PROPOSED JOURNAL ENTRY")
 
     assert duplicates_row == exceptions_total_row + 10
@@ -1044,17 +1047,15 @@ def test_render_result_duplicate_badge_never_raises(qb_mapping, inf_mapping, mak
 
 
 def _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata):
-    """QuickBooks weak-basis duplicates no longer land in Duplicate Review
-    Hold under the current policy (see test_full_reconciliation_detects_
-    blank_reference_duplicates and test_weak_basis_review_hold_does_not_
-    block_control_status in test_matching.py) -- a zero-evidence group is
-    now resolved immediately (one canonical exception, the rest excluded)
-    rather than deferred to a human. The "Duplicate Review Hold" section on
-    Unresolved Exceptions is kept for the structural case of a future
-    QuickBooks policy that defers again, so its rendering is tested here
-    by patching a real result's duplicate_analysis into that state directly
-    rather than by re-deriving it through build_reconciliation, since no
-    QuickBooks input can produce it anymore.
+    """Two QuickBooks rows share only an invoice (PO blank on both -- a
+    weak-basis duplicate key) and neither matches anything: under the
+    current policy (see test_exact_duplicate_of_a_matched_row_is_excluded_
+    not_accrued and test_the_representative_of_an_unconfirmed_group_stays_
+    a_true_exception_and_the_rest_are_held in test_matching.py /
+    test_dispositions.py) the earliest row is the group's representative
+    (an ordinary True Unmatched exception) and every other member is a
+    POTENTIAL_DUPLICATE review hold against it -- produced directly by
+    build_reconciliation, no patching required.
     """
     qb_rows = [
         {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
@@ -1062,77 +1063,65 @@ def _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata):
         {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
-    result = build_reconciliation(
+    return build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
-    held_qb_ids = set(result.qb_work.loc[[0, 1], QB_ID])
-    patched = result.duplicate_analysis.copy()
-    held_mask = patched["Source Row ID"].isin(held_qb_ids)
-    patched.loc[held_mask, "Disposition"] = "Held for review - excluded from proposed JE pending disposition"
-    patched.loc[held_mask, "Confidence"] = "Hold"
-    patched.loc[held_mask, "Automatically Excluded"] = True
-    patched.loc[held_mask, "Canonical Source Row ID"] = ""
-    result.duplicate_analysis = patched
-    result.duplicate_review_hold_qb_rows = [0, 1]
-    result.duplicate_qb_rows = []
-    result.metrics["Duplicate Review Hold QuickBooks Rows"] = 2
-    result.metrics["Duplicate Review Hold QuickBooks Amount"] = 50.0
-    result.metrics["Duplicate QuickBooks Rows"] = 0
-    result.metrics["Duplicate QuickBooks Amount"] = 0.0
-    result.metrics["Posting Status"] = "REVIEW REQUIRED"
-    return result
 
 
 def test_duplicate_review_hold_section_renders_with_documented_disposition_dropdown(
     qb_mapping, inf_mapping, make_metadata,
 ):
-    """The Duplicate Review Hold section must appear after the duplicates
-    section (before the JE), list the held items, and give the reviewer a
-    controlled-vocabulary, editable place to record a documented decision
-    -- not just a static, uneditable list. (See _build_result_with_review_
-    hold for why this state is patched in rather than produced by a real
-    QuickBooks scenario under the current policy.)"""
+    """The unified Review Holds section must appear after Duplicate Excluded
+    (before the JE), list the held item, and give the reviewer a
+    controlled-vocabulary, editable place to record a documented decision --
+    not just a static, uneditable list."""
     result = _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata)
     assert result.metrics["Posting Status"] == "REVIEW REQUIRED"
-    assert result.metrics["Duplicate Review Hold QuickBooks Rows"] == 2
+    assert result.metrics["Final Disposition - Review Hold Rows"] == 1
 
     wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
     ws = wb["Unresolved Exceptions"]
 
-    def first_row_containing(needle: str) -> int:
-        for row in ws.iter_rows():
+    def first_row_containing(needle: str, min_row: int = 1) -> int:
+        for row in ws.iter_rows(min_row=min_row):
             for cell in row:
                 if cell.value and needle in str(cell.value):
                     return cell.row
         raise AssertionError(f"{needle!r} not found in sheet")
 
-    duplicates_row = first_row_containing("QUICKBOOKS DUPLICATES EXCLUDED FROM JE")
-    review_hold_row = first_row_containing("DUPLICATE REVIEW HOLD")
+    duplicates_row = first_row_containing("DUPLICATE EXCLUDED | CONFIRMED COPY")
+    review_hold_row = first_row_containing("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE")
     je_row = first_row_containing("PROPOSED JOURNAL ENTRY")
-    disposition_header_row = first_row_containing("Reviewer Disposition")
+    # Both the JE Support and Review Holds tables now carry a Reviewer
+    # Disposition column -- scope the search to the Review Holds table's own.
+    disposition_header_row = first_row_containing("Reviewer Disposition", min_row=review_hold_row)
 
     assert duplicates_row < review_hold_row < je_row
 
     disposition_col = next(
         cell.column for cell in ws[disposition_header_row] if cell.value == "Reviewer Disposition"
     )
-    data_rows = range(disposition_header_row + 1, disposition_header_row + 3)
-    for row in data_rows:
-        cell = ws.cell(row, disposition_col)
-        assert cell.value == "Pending Review"
-        assert cell.protection.locked is False, "reviewer must be able to edit the disposition cell"
+    data_row = disposition_header_row + 1
+    cell = ws.cell(data_row, disposition_col)
+    assert cell.value == "Pending Review"
+    assert cell.protection.locked is False, "reviewer must be able to edit the disposition cell"
+    headers = [c.value for c in ws[disposition_header_row]]
+    for label in ("Reviewer", "Review Date", "Comment"):
+        col = headers.index(label) + 1
+        assert ws.cell(data_row, col).protection.locked is False, label
 
     list_validations = [dv for dv in ws.data_validations.dataValidation if dv.type == "list"]
     disposition_letter = get_column_letter(disposition_col)
     matching_validation = next(
         dv for dv in list_validations
-        if f"{disposition_letter}{disposition_header_row + 1}" in str(dv.sqref)
+        if f"{disposition_letter}{data_row}" in str(dv.sqref)
     )
     assert "Pending Review" in matching_validation.formula1
-    assert "Confirmed Duplicate - Exclude Permanently" in matching_validation.formula1
-    assert "Confirmed Legitimate - Include In JE Manually" in matching_validation.formula1
-    assert "Escalated For Investigation" in matching_validation.formula1
+    assert "Release to JE" in matching_validation.formula1
+    assert "Exclude" in matching_validation.formula1
+    assert "Confirm Match" in matching_validation.formula1
+    assert "Carry Forward" in matching_validation.formula1
 
 
 def test_no_review_hold_items_renders_empty_section_cleanly(qb_mapping, inf_mapping, make_metadata):
@@ -1152,7 +1141,7 @@ def test_no_review_hold_items_renders_empty_section_cleanly(qb_mapping, inf_mapp
     workbook_bytes = build_primary_workbook(result)
     ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
     unresolved_text = _worksheet_text(ws)
-    assert any("No QuickBooks potential duplicates remain unresolved" in t for t in unresolved_text)
+    assert any("No QuickBooks rows are held for review" in t for t in unresolved_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1270,13 +1259,13 @@ def test_unresolved_exceptions_places_referenced_match_ref_immediately_before_st
     # itemized with the match it points at.
     title_row = next(
         c.row for row in ws.iter_rows() for c in row
-        if c.value and str(c.value).startswith("REVIEW HOLD | REFERENCE EVIDENCE")
+        if c.value and str(c.value).startswith("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE")
     )
     hold_header = next(
-        row for row in ws.iter_rows(min_row=title_row) if any(c.value == "Why Held" for c in row)
+        row for row in ws.iter_rows(min_row=title_row) if any(c.value == "Reason" for c in row)
     )
     held_headers = [c.value for c in hold_header]
-    why_col = held_headers.index("Why Held") + 1
+    why_col = held_headers.index("Reason") + 1
     pointer_col = held_headers.index("Referenced Match Ref.") + 1
     rows = []
     for number in range(hold_header[0].row + 1, hold_header[0].row + 1 + len(result.reference_hold_qb_rows)):
@@ -1534,7 +1523,7 @@ def test_reconciliation_detail_control_strip_ties_to_the_rows_beneath_it(
         f"{outcomes['review_hold']:,} review hold",
         f"{outcomes['unmatched']:,} unmatched",
         f"{outcomes['excluded']:,} {duplicates} excluded",
-        f"JE support: {format_currency(result.metrics['Unresolved QuickBooks Amount'])}",
+        f"Engine JE support: {format_currency(result.metrics['Unresolved QuickBooks Amount'])}",
     ]
     # The strip is a single narrow row above the header, with the control
     # result beside it in green for a PASS.
@@ -1637,7 +1626,13 @@ def test_reconciliation_detail_and_exceptions_link_references_to_the_accepted_ma
     unresolved = wb["Unresolved Exceptions"]
     # A row whose PO a match already represents is itemized in the review-hold
     # section, with a live link to that match.
-    hold_header = next(row for row in unresolved.iter_rows() if any(c.value == "Why Held" for c in row))
+    hold_title_row = next(
+        c.row for row in unresolved.iter_rows() for c in row
+        if c.value and str(c.value).startswith("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE")
+    )
+    hold_header = next(
+        row for row in unresolved.iter_rows(min_row=hold_title_row) if any(c.value == "Reason" for c in row)
+    )
     hold_pointer = [c.value for c in hold_header].index("Referenced Match Ref.") + 1
     for r in range(hold_header[0].row + 1, hold_header[0].row + 1 + len(result.reference_hold_qb_rows)):
         value = unresolved.cell(r, hold_pointer).value
@@ -1693,7 +1688,7 @@ def test_unresolved_exceptions_kpi_blocks_use_explicit_proposed_entry_labels(
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
     labels = [c.value for c in ws[3] if c.value]
     assert labels == [
-        "Unresolved Rows", "Proposed Debit Support", "Proposed Credit Support", "Net Proposed JE Support",
+        "Unresolved Rows", "Proposed Debit Support", "Proposed Credit Support", "Engine Proposed JE Support",
     ]
     text = _worksheet_text(ws)
     for old in ("Gross debits", "Credits", "Proposed JE support total", "Unresolved rows"):
@@ -1764,18 +1759,19 @@ def test_unresolved_exceptions_review_hold_tints_only_its_status_cell(qb_mapping
     result = _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata)
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
     title_row = next(
-        c.row for row in ws.iter_rows() for c in row if c.value and "DUPLICATE REVIEW HOLD" in str(c.value)
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and "REVIEW HOLDS | EXCLUDED FROM PROPOSED JE" in str(c.value)
     )
     header_row = next(
         row for row in ws.iter_rows(min_row=title_row) if any(c.value == "Reviewer Disposition" for c in row)
     )
     headers = [c.value for c in header_row]
-    status_col = headers.index("Status") + 1
+    reason_col = headers.index("Reason") + 1
     data_row = header_row[0].row + 1
-    assert ws.cell(data_row, status_col).value == "Pending Review"
+    assert ws.cell(data_row, headers.index("Reviewer Disposition") + 1).value == "Pending Review"
     for col in range(1, len(headers) + 1):
         filled = ws.cell(data_row, col).fill.fgColor.rgb.endswith(AMBER)
-        assert filled == (col == status_col), col
+        assert filled == (col == reason_col), col
 
 
 def test_row_autofit_measures_a_merged_caption_across_its_full_width():
@@ -1795,3 +1791,483 @@ def test_row_autofit_measures_a_merged_caption_across_its_full_width():
     _autofit_workbook_rows(wb)
     assert (ws.row_dimensions[5].height or 15) <= 45
     assert ws.row_dimensions[6].height is None    # a formula is not measured as text
+
+# ---------------------------------------------------------------------------
+# Posting Summary, Reason Code Glossary, and the decision-oriented Product
+# Aggregate Summary -- the UX refinements requested on top of the disposition
+# ledger.
+# ---------------------------------------------------------------------------
+
+def test_posting_summary_is_the_first_sheet_and_states_the_equation(qb_mapping, inf_mapping, make_metadata):
+    from utils import format_currency
+
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    assert wb.sheetnames[0] == "Posting Summary"
+    ws = wb["Posting Summary"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+
+    metrics = result.metrics
+    total = metrics["QuickBooks Rows"]
+    assert f"CURRENT RECONCILIATION PERIOD: PD-{int(result.metadata['fiscal_period']):02d}" in text
+    assert f"{total:,} of {total:,} QBO rows accounted for" in text
+    assert f"CONTROL: {metrics['Control Status']}" in text
+    # The equation names all four dispositions with their counts and dollars.
+    for label in ("Matched", "True Unmatched", "Review Hold", "Duplicate Excluded"):
+        assert f"{label} (" in text
+    assert format_currency(metrics["QuickBooks Source Total"]) in text
+    assert format_currency(metrics["Proposed JE Amount"]) in text
+    # Match rate is present but demoted -- after the headline, not as the title.
+    assert "Match rate (secondary measure)" in text
+    assert "Reason Code Glossary" in text
+
+
+def test_posting_summary_flags_an_inconsistent_fiscal_period(qb_mapping, inf_mapping, make_metadata):
+    """Nearly every row belongs to period 1, but period 9 was selected --
+    the banner must warn, not silently misclassify everything as prior-period."""
+    qb_rows = [
+        {"PO": f"PO{i}", "Invoice": f"INV{i}", "Amount": 10.0, "Qty": 1, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05"}
+        for i in range(5)
+    ]
+    inf_rows = [{"PO": "PO-X", "Invoice": "INV-X", "Amount": 1.0, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(fiscal_period=9), 2026,
+    )
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Posting Summary"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    assert "CURRENT RECONCILIATION PERIOD: PD-09" in text
+    assert "Only 0% of QuickBooks rows" in text or "PD-01" in text
+    assert "⚠" in text
+
+
+def test_posting_summary_is_silent_when_the_period_matches(qb_mapping, inf_mapping, make_metadata):
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)   # all rows are Period "1", selected period 1
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Posting Summary"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    assert "⚠" not in text
+
+
+def test_reason_code_glossary_covers_every_review_hold_and_duplicate_code(qb_mapping, inf_mapping, make_metadata):
+    from matching import REASON_CODE_GLOSSARY
+
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    assert "Reason Code Glossary" in wb.sheetnames
+    ws = wb["Reason Code Glossary"]
+    header_row = next(row for row in ws.iter_rows(max_row=6) if any(c.value == "Reason Code" for c in row))
+    headers = [c.value for c in header_row]
+    rows = {
+        row[headers.index("Reason Code")].value: row
+        for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value
+    }
+    assert set(REASON_CODE_GLOSSARY) <= set(rows)
+    assert rows["PO_ALREADY_REPRESENTED"][headers.index("Disposition")].value == "REVIEW HOLD"
+    assert rows["PO_ALREADY_REPRESENTED"][headers.index("Feeds Proposed JE")].value == "No"
+    assert rows["NO_INFINIUM_CANDIDATE"][headers.index("Disposition")].value == "TRUE UNMATCHED"
+    assert rows["NO_INFINIUM_CANDIDATE"][headers.index("Feeds Proposed JE")].value == "Yes"
+    assert rows["DUPLICATE_EXCLUDED"][headers.index("Disposition")].value == "DUPLICATE EXCLUDED"
+    # Every code the exceptions sheet actually shows is a real glossary entry.
+    unresolved_text = _worksheet_text(wb["Unresolved Exceptions"])
+    assert "PO_ALREADY_REPRESENTED" in unresolved_text
+
+
+def test_legacy_final_disposition_column_matches_the_four_top_level_outcomes(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    headers = {}
+    for cell in ws[4]:
+        headers.setdefault(cell.value, cell.column)
+    disposition_col = headers["Final Disposition"]
+    assert disposition_col == headers["Match Ref."] - 1     # leads the panel, ahead of Match Ref.
+    values = set()
+    for row in ws.iter_rows(min_row=5):
+        value = row[disposition_col - 1].value
+        if value:
+            values.add(value)
+    assert values <= {"MATCHED", "TRUE UNMATCHED", "REVIEW HOLD", "DUPLICATE EXCLUDED"}
+    assert "MATCHED" in values and "DUPLICATE EXCLUDED" in values
+
+
+def test_legacy_fuzzy_match_is_never_counted_as_reconciled(qb_mapping, inf_mapping, make_metadata):
+    """A fuzzy (uncontrolled text-similarity) match is always a review hold,
+    never an accepted match -- the Legacy sheet's reconciled count and tint
+    must agree, not treat it as green/matched while the rest of the workbook
+    treats it as a hold (the reported inconsistency)."""
+    qb_rows = [
+        {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-06-01"},
+    ]
+    inf_rows = [
+        {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-06-01"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(fiscal_period=6), 2026,
+    )
+    assert result.matches == [] and result.fuzzy_match_review_hold_qb_rows == [0]
+    ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    headers = {}
+    for cell in ws[4]:
+        headers.setdefault(cell.value, cell.column)
+    row = next(r for r in ws.iter_rows(min_row=5) if r[headers["PO"] - 1].value == "Hopper")
+    assert row[headers["Final Disposition"] - 1].value == "REVIEW HOLD"
+    assert row[headers["Match Result"] - 1].value == "Possible Match: Similar PO + Amount"
+    from config import LEGACY_MATCHED_FILL, LEGACY_REVIEW_FILL
+    fill = row[headers["PO"] - 1].fill.fgColor.rgb
+    assert fill.endswith(LEGACY_REVIEW_FILL) and not fill.endswith(LEGACY_MATCHED_FILL)
+    # ...and the intro note's reconciled count excludes it.
+    note = ws.cell(2, 1).value
+    assert "0 matched" in note
+
+
+def test_product_aggregate_summary_shows_disposition_breakdown_by_product(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    qb_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 1, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05", "Description": "ALLSUPS 24"},           # matches
+        {"PO": "PO2", "Invoice": "INV2", "Amount": 50.00, "Qty": 1, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05", "Description": "ALLSUPS 24"},           # true unmatched
+        {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Qty": 1, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05", "Description": "JUNIORS 24"},           # matches
+        {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Qty": 1, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05", "Description": "JUNIORS 24"},           # exact duplicate, excluded
+    ]
+    inf_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+    ]
+    qb_mapping_with_product = {**qb_mapping, "product": "Description"}
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping_with_product, inf_mapping,
+        make_metadata(), 2026,
+    )
+    frame = result.product_disposition_summary
+    assert set(frame["Product Name"]) == {"Allsups 24 Case", "Juniors 24 Case"}
+    allsups = frame.set_index("Product Name").loc["Allsups 24 Case"]
+    assert allsups["QuickBooks Rows"] == 2 and allsups["Matched Rows"] == 1
+    assert allsups["JE Support Rows"] == 1 and allsups["JE Support Amount"] == pytest.approx(50.00)
+    juniors = frame.set_index("Product Name").loc["Juniors 24 Case"]
+    assert juniors["QuickBooks Rows"] == 2 and juniors["Matched Rows"] == 1
+    assert juniors["Duplicate Excluded Rows"] == 1
+
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregate Summary"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    assert "JE SUPPORT AND REVIEW HOLD BY PRODUCT" in text
+    header_row = next(row for row in ws.iter_rows(max_row=5) if any(c.value == "Matched %" for c in row))
+    headers = [c.value for c in header_row]
+    assert {"JE Support Amount", "Review Hold Amount", "Duplicate Excluded Rows"} <= set(headers)
+    data_rows = {
+        row[headers.index("Product Name")].value: row
+        for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value and "TOTAL" not in str(row[0].value)
+    }
+    assert data_rows["Allsups 24 Case"][headers.index("Matched %")].value == pytest.approx(0.5)
+
+
+def test_product_aggregate_summary_falls_back_cleanly_with_no_product_mapping(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """No product column mapped: the plain fallback view renders without error."""
+    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
+    assert result.product_disposition_summary.empty
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregate Summary"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    assert "PRODUCT AGGREGATE SUMMARY" in text
+    assert "not mapped" in text.lower() or "no product breakdown" in text.lower()
+
+# ---------------------------------------------------------------------------
+# The journal-entry bridge: the engine's Final Disposition is immutable;
+# Reviewer Disposition is a separate, additive manual layer, bridged from
+# Engine Proposed JE to Final Approved JE.
+# ---------------------------------------------------------------------------
+
+def _bridge_result(qb_mapping, inf_mapping, make_metadata):
+    """One row of each population the bridge cares about: a match, a review
+    hold (PO already represented), a confirmed exact duplicate, and a
+    genuine TRUE_UNMATCHED row (so the JE Support table is never empty)."""
+    qb_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO1", "Invoice": "INV1B", "Amount": 5.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO1", "Invoice": "INV1B", "Amount": 5.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+    ]
+    inf_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+    ]
+    return build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(), 2026,
+    )
+
+
+def test_final_disposition_is_never_overwritten_by_the_reviewer_workflow(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """The engine's own conclusion (Final Disposition, on the QB Disposition
+    Ledger and the Legacy sheet) must be identical whether or not a reviewer
+    workflow exists on Unresolved Exceptions -- nothing about adding Reviewer
+    Disposition columns touches it."""
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    ledger_dispositions = dict(zip(result.qb_dispositions["QBO Row ID"], result.qb_dispositions["Final Disposition"]))
+
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    ws = wb["Unresolved Exceptions"]
+
+    # The main table: every row is TRUE_UNMATCHED by construction, and its
+    # own Reviewer Disposition column (defaulting to "Pending Review") is a
+    # different column entirely.
+    header_row = next(row for row in ws.iter_rows() if any(c.value == "Exception Status" for c in row))
+    headers = [c.value for c in header_row]
+    assert "Reviewer Disposition" in headers and "Exception Status" in headers
+    assert headers.index("Reviewer Disposition") != headers.index("Exception Status")
+    disposition_col = headers.index("Reviewer Disposition") + 1
+    for r in range(header_row[0].row + 1, header_row[0].row + 1 + len(result.unmatched_qb)):
+        assert ws.cell(r, disposition_col).value == "Pending Review"
+
+    # The Review Holds table: same separation, and the ledger's Final
+    # Disposition for every held row is still REVIEW_HOLD, untouched.
+    review_title_row = next(
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and str(c.value).startswith("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE")
+    )
+    review_header_row = next(
+        row for row in ws.iter_rows(min_row=review_title_row) if any(c.value == "Reviewer Disposition" for c in row)
+    )
+    review_headers = [c.value for c in review_header_row]
+    row_id_col = review_headers.index("Row ID") + 1
+    review_disposition_col = review_headers.index("Reviewer Disposition") + 1
+    for r in range(review_header_row[0].row + 1, review_header_row[0].row + 1 + result.metrics["Final Disposition - Review Hold Rows"]):
+        row_id = ws.cell(r, row_id_col).value
+        assert ws.cell(r, review_disposition_col).value == "Pending Review"
+        assert ledger_dispositions[row_id] == "REVIEW_HOLD"          # untouched, from the immutable engine ledger
+
+    # The Legacy sheet's Final Disposition column agrees with the same ledger.
+    legacy_ws = load_workbook(io.BytesIO(build_legacy_workbook(result)))["Legacy Reconciliation"]
+    legacy_headers = {}
+    for cell in legacy_ws[4]:
+        legacy_headers.setdefault(cell.value, cell.column)
+    assert "Reviewer Disposition" not in legacy_headers               # the ledger view has no manual layer at all
+
+
+def test_engine_and_reviewer_dispositions_are_independent_columns_with_their_own_values(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Reviewer Disposition and the engine's own classification (Exception
+    Status / Final Disposition) are separate columns holding independent
+    values -- editing one is structurally incapable of touching the other,
+    since nothing in this workbook ever re-derives the engine columns from
+    the reviewer columns (there is no round trip back into the reconciliation)."""
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    # Every row in this table is TRUE_UNMATCHED by construction (see
+    # build_qb_dispositions) -- confirmed once, for the whole population,
+    # rather than a per-row Row ID lookup this table doesn't carry.
+    assert set(result.qb_dispositions.set_index("QBO Row ID").loc[
+        [result.qb_work.at[idx, QB_ID] for idx in result.unmatched_qb], "Final Disposition",
+    ]) == {"TRUE_UNMATCHED"}
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    header_row = next(row for row in ws.iter_rows() if any(c.value == "Exception Status" for c in row))
+    data_row = header_row[0].row + 1
+    headers = [c.value for c in header_row]
+    status_col = headers.index("Exception Status") + 1
+    disposition_col = headers.index("Reviewer Disposition") + 1
+    for r in range(data_row, header_row[0].row + 1 + len(result.unmatched_qb)):
+        assert ws.cell(r, status_col).value != ws.cell(r, disposition_col).value
+        assert ws.cell(r, disposition_col).value == "Pending Review"
+        # Editable, per this table's existing "annotate exception rows" design.
+        assert ws.cell(r, disposition_col).protection.locked is False
+
+
+def test_je_support_table_offers_only_pending_review_or_exclude(qb_mapping, inf_mapping, make_metadata):
+    """A TRUE_UNMATCHED row's manual layer has exactly two states: stand
+    (Pending Review) or a documented Exclude -- it is not offered Release to
+    JE, Confirm Match, or Carry Forward, which describe a REVIEW HOLD row's
+    workflow, not an already-True-Unmatched one."""
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    header_row = next(row for row in ws.iter_rows() if any(c.value == "Exception Status" for c in row))
+    headers = [c.value for c in header_row]
+    for label in ("Reviewer Disposition", "Reviewer", "Review Date", "Comment"):
+        assert label in headers
+    disposition_col = headers.index("Reviewer Disposition") + 1
+    disposition_letter = get_column_letter(disposition_col)
+    list_validations = [dv for dv in ws.data_validations.dataValidation if dv.type == "list"]
+    matching = next(dv for dv in list_validations if f"{disposition_letter}{header_row[0].row + 1}" in str(dv.sqref))
+    assert matching.formula1 == '"Pending Review,Exclude"'
+
+
+def test_excluding_a_je_support_row_without_a_comment_is_flagged(qb_mapping, inf_mapping, make_metadata):
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    header_row = next(row for row in ws.iter_rows() if any(c.value == "Exception Status" for c in row))
+    headers = [c.value for c in header_row]
+    note_col = headers.index("Comment") + 1
+    data_row = header_row[0].row + 1
+    note_letter = get_column_letter(note_col)
+    disposition_letter = get_column_letter(headers.index("Reviewer Disposition") + 1)
+    rules = [
+        rule for cf in ws.conditional_formatting for rule in cf.rules
+        if rule.type == "expression" and f"{note_letter}{data_row}" in str(cf.sqref)
+    ]
+    assert any(
+        "Exclude" in "".join(rule.formula) and disposition_letter in "".join(rule.formula)
+        for rule in rules
+    )
+
+
+def test_review_holds_confirm_match_without_a_reference_is_flagged(qb_mapping, inf_mapping, make_metadata):
+    """Confirm Match asserts the row IS a match -- if neither the engine's own
+    related reference nor a reviewer comment names what it matched to, the
+    row is flagged rather than silently accepted."""
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    review_title_row = next(
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and str(c.value).startswith("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE")
+    )
+    review_header_row = next(
+        row for row in ws.iter_rows(min_row=review_title_row) if any(c.value == "Reviewer Disposition" for c in row)
+    )
+    headers = [c.value for c in review_header_row]
+    data_row = review_header_row[0].row + 1
+    ref_letter = get_column_letter(headers.index("Referenced Match Ref.") + 1)
+    related_letter = get_column_letter(headers.index("Related Infinium Row IDs") + 1)
+    disposition_letter = get_column_letter(headers.index("Reviewer Disposition") + 1)
+    all_formulas = [
+        "".join(rule.formula) for cf in ws.conditional_formatting for rule in cf.rules
+        if rule.type == "expression" and f"{ref_letter}{data_row}" in str(cf.sqref)
+    ]
+    assert any(
+        "Confirm Match" in formula and disposition_letter in formula and related_letter in formula
+        for formula in all_formulas
+    )
+
+
+def test_review_holds_is_a_formal_table_reviewer_columns_are_editable(qb_mapping, inf_mapping, make_metadata):
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    assert "ReviewHolds" in ws.tables
+    table_ref = ws.tables["ReviewHolds"].ref
+    assert table_ref is not None
+
+
+def test_posting_summary_bridge_reduces_to_engine_je_with_no_overrides(qb_mapping, inf_mapping, make_metadata):
+    """The exact invariant requested: with no reviewer overrides, Final
+    Approved JE = Engine Proposed JE. Every Reviewer Disposition on the
+    freshly generated workbook is "Pending Review", so both SUMIFS criteria
+    ("Release to JE" / "Exclude") match nothing -- verified directly against
+    the written cell values, since openpyxl does not evaluate formulas."""
+    from utils import format_currency
+
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    ws = wb["Unresolved Exceptions"]
+
+    je_header_row = next(row for row in ws.iter_rows() if any(c.value == "Exception Status" for c in row))
+    je_headers = [c.value for c in je_header_row]
+    je_disposition_col = je_headers.index("Reviewer Disposition") + 1
+    je_dispositions = [
+        ws.cell(r, je_disposition_col).value
+        for r in range(je_header_row[0].row + 1, je_header_row[0].row + 1 + len(result.unmatched_qb))
+    ]
+    assert je_dispositions and set(je_dispositions) == {"Pending Review"}
+    manual_exclusions = sum(
+        ws.cell(r, je_headers.index(result.qb_mapping["amount"]) + 1).value
+        for r, disposition in zip(
+            range(je_header_row[0].row + 1, je_header_row[0].row + 1 + len(result.unmatched_qb)), je_dispositions,
+        )
+        if disposition == "Exclude"
+    )
+    assert manual_exclusions == 0
+
+    review_title_row = next(
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and str(c.value).startswith("REVIEW HOLDS | EXCLUDED FROM PROPOSED JE")
+    )
+    review_header_row = next(
+        row for row in ws.iter_rows(min_row=review_title_row) if any(c.value == "Reviewer Disposition" for c in row)
+    )
+    review_headers = [c.value for c in review_header_row]
+    review_disposition_col = review_headers.index("Reviewer Disposition") + 1
+    review_amount_col = review_headers.index("Amount") + 1
+    held_rows = result.metrics["Final Disposition - Review Hold Rows"]
+    review_dispositions = [
+        ws.cell(r, review_disposition_col).value
+        for r in range(review_header_row[0].row + 1, review_header_row[0].row + 1 + held_rows)
+    ]
+    assert review_dispositions and set(review_dispositions) == {"Pending Review"}
+    released_to_je = sum(
+        ws.cell(r, review_amount_col).value
+        for r, disposition in zip(
+            range(review_header_row[0].row + 1, review_header_row[0].row + 1 + held_rows), review_dispositions,
+        )
+        if disposition == "Release to JE"
+    )
+    assert released_to_je == 0
+
+    # So, by construction, Final Approved JE = Engine Proposed JE + 0 - 0.
+    posting = wb["Posting Summary"]
+    text = " ".join(str(c.value) for row in posting.iter_rows() for c in row if c.value)
+    assert "Engine Proposed JE" in text and "FINAL APPROVED JE" in text
+    assert format_currency(result.metrics["Proposed JE Amount"]) in text
+
+
+def test_posting_summary_bridge_formulas_reference_the_reviewer_columns(qb_mapping, inf_mapping, make_metadata):
+    """Structural check of the live formulas themselves (openpyxl cannot
+    evaluate them): Released reads ReviewHolds' own Reviewer Disposition /
+    Amount columns; Excluded reads QuickBooksExceptions' own; Final Approved
+    JE sums the three rows above it."""
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
+    ws = wb["Posting Summary"]
+
+    bridge_row = next(
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and str(c.value).startswith("JOURNAL ENTRY BRIDGE")
+    )
+    rows = list(ws.iter_rows(min_row=bridge_row, max_row=bridge_row + 5))
+    engine_row = next(r for r in rows if r[0].value and "Engine Proposed JE" in str(r[0].value))
+    released_row = next(r for r in rows if r[0].value and "Released to JE" in str(r[0].value))
+    excluded_row = next(r for r in rows if r[0].value and "Manual JE Exclusions" in str(r[0].value))
+    final_row = next(
+        r for r in rows
+        if r[0].row != bridge_row and r[0].value and "FINAL APPROVED JE" in str(r[0].value)
+    )
+
+    engine_cell = next(c for c in engine_row if c.value not in (None, engine_row[0].value))
+    released_cell = next(c for c in released_row if c.value not in (None, released_row[0].value))
+    excluded_cell = next(c for c in excluded_row if c.value not in (None, excluded_row[0].value))
+    final_cell = next(c for c in final_row if c.value not in (None, final_row[0].value))
+
+    assert engine_cell.value == pytest.approx(result.metrics["Proposed JE Amount"])
+    assert isinstance(released_cell.value, str) and released_cell.value.startswith("=")
+    assert "ReviewHolds[Amount]" in released_cell.value and "ReviewHolds[Reviewer Disposition]" in released_cell.value
+    assert '"Release to JE"' in released_cell.value
+    assert isinstance(excluded_cell.value, str) and excluded_cell.value.startswith("=")
+    assert "QuickBooksExceptions[Amount]" in excluded_cell.value
+    assert "QuickBooksExceptions[Reviewer Disposition]" in excluded_cell.value
+    assert '"Exclude"' in excluded_cell.value
+    assert isinstance(final_cell.value, str) and final_cell.value.startswith("=")
+    assert engine_cell.coordinate in final_cell.value
+    assert released_cell.coordinate in final_cell.value
+    assert excluded_cell.coordinate in final_cell.value
+
+
+def test_ac001_je_amount_bridges_engine_released_and_excluded(qb_mapping, inf_mapping, make_metadata):
+    """The journal entry that actually posts (AC001 Sales Accrual) uses the
+    Final Approved JE bridge -- Engine total plus released holds minus
+    documented manual exclusions -- not the raw engine total alone."""
+    result = _bridge_result(qb_mapping, inf_mapping, make_metadata)
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    je_title_row = next(
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and str(c.value).startswith("PROPOSED JOURNAL ENTRY")
+    )
+    debit_formula = next(
+        c.value for row in ws.iter_rows(min_row=je_title_row) for c in row
+        if isinstance(c.value, str) and c.value.startswith("=ABS(")
+    )
+    assert "ReviewHolds[Amount]" in debit_formula and '"Release to JE"' in debit_formula
+    assert "QuickBooksExceptions[Amount]" in debit_formula and '"Exclude"' in debit_formula

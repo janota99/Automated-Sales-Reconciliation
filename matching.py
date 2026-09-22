@@ -80,9 +80,11 @@ __all__ = [
     "DISPOSITION_TRUE_UNMATCHED",
     "FINAL_DISPOSITIONS",
     "QB_DISPOSITION_COLUMNS",
+    "REASON_CODE_GLOSSARY",
     "REFERENCED_MATCH_REF_COLUMN",
     "REFERENCE_HOLD_COLUMNS",
     "REFERENCE_HOLD_SECTION",
+    "short_reason_code",
     "ReconciliationResult",
     "add_duplicate_report_references",
     "apply_referenced_match_references",
@@ -93,6 +95,8 @@ __all__ = [
     "build_qb_dispositions",
     "build_reference_evidence_review_holds",
     "build_po_reuse_errors",
+    "build_product_disposition_summary",
+    "PRODUCT_DISPOSITION_COLUMNS",
     "build_reference_amount_variances",
     "build_reconciliation",
     "cents_or_zero",
@@ -247,6 +251,7 @@ class ReconciliationResult:
     reference_hold_analysis: pd.DataFrame = field(default_factory=pd.DataFrame)
     reference_hold_qb_rows: list[int] = field(default_factory=list)
     qb_dispositions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    product_disposition_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @lru_cache(maxsize=4096)
@@ -1337,6 +1342,94 @@ QB_DISPOSITION_COLUMNS = [
     "Review ID", "Related Match Ref.", "Related Infinium Row IDs",
     "In Proposed JE",
 ]
+
+# A short, stable code for every Reason Code a workbook displays, plus a
+# one-sentence glossary entry -- so a wide sheet can show SHORT_REASON_CODE +
+# a concise reason instead of the full audit-grade explanation, with that full
+# text one lookup away (see build_reason_code_glossary_sheet) rather than
+# widening every row that cites it.
+SHORT_REASON_CODES: dict[str, str] = {
+    "REVIEW_HOLD_POTENTIAL_DUPLICATE": "POTENTIAL_DUPLICATE",
+    "REVIEW_HOLD_ALREADY_REPRESENTED": "POTENTIAL_DUPLICATE",
+    "REVIEW_HOLD_PO_ALREADY_REPRESENTED": "PO_ALREADY_REPRESENTED",
+    "REVIEW_HOLD_PO_REUSE": "PO_REUSE",
+    "REVIEW_HOLD_AMOUNT_VARIANCE": "AMOUNT_VARIANCE",
+    "REVIEW_HOLD_EXACT_CANDIDATE_NOT_UNIQUE": "NON_UNIQUE_CANDIDATE",
+    "REVIEW_HOLD_MULTIPLE_CANDIDATES": "MULTIPLE_CANDIDATES",
+    "REVIEW_HOLD_AMBIGUOUS_CANDIDATES": "MULTIPLE_CANDIDATES",
+    "REVIEW_HOLD_TYPO_CANDIDATES": "TYPO_CANDIDATES",
+    "REVIEW_HOLD_HISTORICAL_CLEARANCE": "HISTORICAL_CLEARANCE",
+    "REVIEW_HOLD_INVALID_AMOUNT": "INVALID_AMOUNT",
+    "REVIEW_HOLD_CANDIDATE_INVALID_AMOUNT": "INVALID_AMOUNT",
+    "REVIEW_HOLD_FUZZY_MATCH": "FUZZY_CANDIDATE",
+    "EXACT_QBO_DUPLICATE_EXCESS_COPY": "DUPLICATE_EXCLUDED",
+    "TRUE_UNMATCHED_NO_INFINIUM_CANDIDATE": "NO_INFINIUM_CANDIDATE",
+    "TRUE_UNMATCHED_PO_REUSE": "PO_REUSE_UNSUPPORTED",
+}
+
+REASON_CODE_GLOSSARY: dict[str, str] = {
+    "POTENTIAL_DUPLICATE": (
+        "Shares its duplicate key (PO, invoice, and signed amount -- or only a PO or only an "
+        "invoice) with another QuickBooks row, but the available evidence does not confirm it is a "
+        "copy of the same underlying line. Held, not excluded: it may be a legitimate repeated sale."
+    ),
+    "PO_ALREADY_REPRESENTED": (
+        "Every Infinium record sharing this row's PO or invoice was already consumed by an accepted "
+        "match. The transaction may already be represented in the accrual, so it is not double-posted."
+    ),
+    "PO_REUSE": (
+        "This PO is reused across two or more unresolved QuickBooks rows, and their grouped total does "
+        "not tie exactly to the grouped Infinium total for that PO -- Infinium has evidence for the PO."
+    ),
+    "AMOUNT_VARIANCE": (
+        "An Infinium record shares this row's PO and/or invoice, but the signed amount differs -- most "
+        "likely a data-entry error on one system. Neither amount is posted until the difference is explained."
+    ),
+    "NON_UNIQUE_CANDIDATE": (
+        "An Infinium record agrees on reference and amount, but the pairing is not uniquely one-to-one, "
+        "so it is not matched automatically."
+    ),
+    "MULTIPLE_CANDIDATES": (
+        "More than one unresolved Infinium record shares this row's PO and/or invoice. The program will "
+        "not guess which one, if any, corresponds to it."
+    ),
+    "TYPO_CANDIDATES": (
+        "More than one Infinium record matches this row's exact amount and differs from its PO only by a "
+        "one-character typo, so none is matched automatically."
+    ),
+    "HISTORICAL_CLEARANCE": (
+        "The only apparent Infinium support is a historical record withheld by an unresolved historical "
+        "duplicate issue, so it cannot yet be used to clear this row."
+    ),
+    "INVALID_AMOUNT": "The QuickBooks amount, or the only candidate's Infinium amount, cannot be read as signed cents.",
+    "FUZZY_CANDIDATE": (
+        "A text-similarity (fuzzy PO) candidate was found with an exact amount match. Always held for "
+        "review -- a fuzzy match is a guess, never posted automatically."
+    ),
+    "DUPLICATE_EXCLUDED": (
+        "Confirmed to be a copy of the same underlying transaction as its canonical row -- by a trusted "
+        "line-level source ID or a sufficient stable-field fingerprint -- and excluded from the JE."
+    ),
+    "NO_INFINIUM_CANDIDATE": "No Infinium record shares this row's PO or invoice at all: a genuine missing transaction.",
+    "PO_REUSE_UNSUPPORTED": (
+        "This PO is reused across unresolved QuickBooks rows and Infinium has no record at all for it -- "
+        "a genuine missing transaction, not evidence of an existing match."
+    ),
+}
+
+
+def short_reason_code(code: Any) -> str:
+    """The compact display code for a Reason Code -- e.g.
+    REVIEW_HOLD_EXACT_CANDIDATE_NOT_UNIQUE -> NON_UNIQUE_CANDIDATE -- falling
+    back to the code with its REVIEW_HOLD_/TRUE_UNMATCHED_ prefix stripped for
+    anything not in the table, so a new code never displays blank."""
+    text = str(code or "")
+    if text in SHORT_REASON_CODES:
+        return SHORT_REASON_CODES[text]
+    for prefix in ("REVIEW_HOLD_", "TRUE_UNMATCHED_"):
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
 
 
 def build_reference_evidence_review_holds(
@@ -3395,6 +3488,60 @@ def build_product_summary(
     )
 
 
+PRODUCT_DISPOSITION_COLUMNS = [
+    "Product Name", "QuickBooks Rows", "Matched Rows", "Matched %",
+    "JE Support Rows", "JE Support Amount",
+    "Review Hold Rows", "Review Hold Amount",
+    "Duplicate Excluded Rows",
+]
+
+
+def build_product_disposition_summary(
+    qb: pd.DataFrame,
+    mapping: dict[str, Optional[str]],
+    qb_dispositions: pd.DataFrame,
+    current_fiscal_period: Optional[int] = None,
+    fiscal_year: Optional[int] = None,
+) -> pd.DataFrame:
+    """Product Aggregate Summary, made decision-oriented: for every
+    classified product, how many rows matched, how much is proposed JE
+    support (TRUE_UNMATCHED), how much is on review hold, and how many
+    copies were excluded as duplicates -- not just a quantity/value total
+    that "does not affect matching" and stops there. Same product
+    classification and period scope as build_product_summary; every QBO row
+    still appears in exactly one product row here, via qb_dispositions."""
+    if not mapping.get("quantity") or not mapping.get("amount") or qb_dispositions.empty:
+        return pd.DataFrame(columns=PRODUCT_DISPOSITION_COLUMNS)
+    work = qb[qb[PRODUCT_STANDARD].notna()].copy()
+    if current_fiscal_period is not None:
+        expected_label = f"P{int(current_fiscal_period):02d}-{int(fiscal_year or 0)}"
+        work = work.loc[work[FISCAL_LABEL].eq(expected_label)].copy()
+    if work.empty:
+        return pd.DataFrame(columns=PRODUCT_DISPOSITION_COLUMNS)
+    work = work[[PRODUCT_STANDARD, QB_ID]].merge(
+        qb_dispositions[["QBO Row ID", "Final Disposition", "Amount"]],
+        left_on=QB_ID, right_on="QBO Row ID", how="left",
+    )
+    records: list[dict[str, Any]] = []
+    for product, group in work.groupby(PRODUCT_STANDARD, sort=True):
+        matched = group.loc[group["Final Disposition"] == DISPOSITION_MATCHED]
+        je_support = group.loc[group["Final Disposition"] == DISPOSITION_TRUE_UNMATCHED]
+        review_hold = group.loc[group["Final Disposition"] == DISPOSITION_REVIEW_HOLD]
+        duplicate = group.loc[group["Final Disposition"] == DISPOSITION_DUPLICATE_EXCLUDED]
+        records.append({
+            "Product Name": product,
+            "QuickBooks Rows": len(group),
+            "Matched Rows": len(matched),
+            "Matched %": len(matched) / len(group) if len(group) else 0.0,
+            "JE Support Rows": len(je_support),
+            "JE Support Amount": round(float(je_support["Amount"].fillna(0).sum()), 2),
+            "Review Hold Rows": len(review_hold),
+            "Review Hold Amount": round(float(review_hold["Amount"].fillna(0).sum()), 2),
+            "Duplicate Excluded Rows": len(duplicate),
+        })
+    return pd.DataFrame(records, columns=PRODUCT_DISPOSITION_COLUMNS).sort_values("Product Name").reset_index(drop=True)
+
+
 def _period_sort(label: str) -> tuple[int, int, str]:
     match = re.fullmatch(r"P(\d{2})-(\d{4})", str(label))
     if not match:
@@ -4354,6 +4501,9 @@ def build_reconciliation(
         metadata.get("fiscal_period"),
         fiscal_year,
     )
+    product_disposition_summary = build_product_disposition_summary(
+        qb, qb_mapping, qb_dispositions, metadata.get("fiscal_period"), fiscal_year,
+    )
     controls = build_controls(
         qb, inf, matches, historical_clearances, unmatched_qb, unmatched_inf,
         duplicate_qb_rows_final, inf_screen.duplicate_rows,
@@ -4622,6 +4772,7 @@ def build_reconciliation(
         reference_hold_analysis=reference_hold_analysis,
         reference_hold_qb_rows=reference_hold_qb,
         qb_dispositions=qb_dispositions,
+        product_disposition_summary=product_disposition_summary,
     )
     validate_reconciliation(result)
     return result
