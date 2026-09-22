@@ -1,9 +1,28 @@
 """Production duplicate controls for the QB-to-Infinium reconciliation.
 
-Detection, classification, and disposition are deliberately separate. Strong
-same-file groups (PO + invoice + signed cents) retain one deterministic
-canonical row per identical payload and exclude only excess copies. Weaker
-PO-only or invoice-only groups remain active and are reported for review.
+Detection, classification, and disposition are deliberately separate. A shared
+PO + invoice + signed-cents key only IDENTIFIES a duplicate relationship; an
+excess row is excluded automatically only when it is CONFIRMED to be a copy of
+the same underlying LINE, by this hierarchy:
+
+  1. a LINE-LEVEL source ID (one that identifies a single source row) shared by
+     the rows -- but only when the data does not contradict that it is line-
+     level. A mapped ID that is shared by rows that are not otherwise the same
+     line (different key or fingerprint) is invoice/transaction-level, and is
+     demoted to supporting evidence;
+  2. otherwise an identical fingerprint over an EXPLICIT set of stable, line-
+     level transaction attributes (see STABLE_FINGERPRINT_ROLES) in addition to
+     the normalized PO + invoice + signed amount -- never "whatever other
+     columns the report happens to contain" -- backed by enough identity-grade
+     evidence (customer, date, item, rate: see MIN_IDENTITY_FIELDS), and, when a
+     transaction-level ID is mapped, that ID agreeing too. Quantity alone, or any
+     reporting-context field such as the fiscal period, is never enough;
+  3. if neither can be established, the rows stay potential duplicates.
+
+Rows that share the key but are not confirmed copies stay active and are
+reported for review (a potential duplicate is never discarded on the key alone).
+Weaker PO-only or invoice-only groups likewise remain active and are reported
+for review.
 Historical screening is explicitly two-stage: same-file copies are handled
 first, then the surviving rows are compared with their primary dataset so
 upload overlap cannot improperly clear an exception.
@@ -16,8 +35,10 @@ ensuring a duplicate candidate can never be repurposed as an amount error.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from types import MappingProxyType
@@ -26,7 +47,7 @@ from typing import Any, Hashable, Iterable, Mapping, Optional
 import pandas as pd
 
 __all__ = [
-    "AMOUNT_CENTS", "NORM_INV", "NORM_PO", "SOURCE_POS",
+    "AMOUNT_CENTS", "NORM_INV", "NORM_PO", "SOURCE_POS", "STABLE_FINGERPRINT_ROLES", "IDENTITY_GRADE_ROLES", "MIN_IDENTITY_FIELDS", "LINE_ID", "TXN_ID",
     "DUPLICATE_ANALYSIS_COLUMNS", "DUPLICATE_BASIS_CROSS_SCOPE",
     "DUPLICATE_BASIS_INVOICE_ONLY", "DUPLICATE_BASIS_PO_ONLY",
     "DUPLICATE_BASIS_STRICT", "DUPLICATE_RULE_VERSION",
@@ -38,7 +59,21 @@ __all__ = [
     "screen_duplicates", "validate_duplicate_input",
 ]
 
+# The mapping roles whose source columns form the duplicate fingerprint. The
+# list is deliberate and fixed: only line-level attributes of the transaction
+# itself (who, when, which item, how many, at what rate) -- not report or export
+# metadata, and not the fiscal period, which is reporting CONTEXT: it can change
+# with carryforward or reclassification, or with which file holds the row.
+STABLE_FINGERPRINT_ROLES = ("customer", "date", "product", "quantity", "rate")
+# The subset that actually distinguishes one line from another. Quantity alone
+# is weak (many lines share it), so an automatic exclusion needs at least
+# MIN_IDENTITY_FIELDS of these present and identical.
+IDENTITY_GRADE_ROLES = ("customer", "date", "product", "rate")
+MIN_IDENTITY_FIELDS = 2
+
 SOURCE_POS = "__REC_SOURCE_POS"
+LINE_ID = "__REC_LINE_ID"
+TXN_ID = "__REC_TXN_ID"
 NORM_PO = "__REC_NORM_PO"
 NORM_INV = "__REC_NORM_INV"
 AMOUNT_CENTS = "__REC_AMOUNT_CENTS"
@@ -77,7 +112,7 @@ DUPLICATE_ANALYSIS_COLUMNS = [
     "Duplicate Group ID", "Confirmed Copy Set ID",
     "Confidence", "Disposition", "Canonical Source Row ID",
     "Reference Source Row IDs", "Automatically Excluded", "Excluded Amount",
-    "Payload Confirmed", "Policy Note",
+    "Payload Confirmed", "Confirmation Basis", "Policy Note",
     "Manual Decision", "Reviewed By", "Review Timestamp", "Review Rationale",
     "Duplicate Rule Version",
 ]
@@ -106,6 +141,8 @@ class _Decision:
     canonical_index: Optional[RowLabel]
     payload_confirmed: bool
     screening_stage: str
+    confirmation_basis: str = ""
+    insufficient_evidence: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,21 +306,93 @@ def _copy_set_id(key: GroupKey, signature: tuple[str, ...]) -> str:
     return f"COPY-{sha256(payload.encode('utf-8')).hexdigest()[:16].upper()}"
 
 
-def _confirmation_columns(frame: pd.DataFrame, id_column: str) -> tuple[str, ...]:
-    """Use original source columns as corroborating duplicate evidence."""
+def _confirmation_columns(
+    frame: pd.DataFrame, id_column: str, fingerprint_columns: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """The explicit stable-field columns that make up the fingerprint, in the
+    order given, limited to those actually present. The frame's other columns
+    are never consulted -- a report-layout change or an added informational
+    column cannot alter duplicate behavior. With none, only a native
+    transaction ID can confirm a copy."""
     internal = {SOURCE_POS, NORM_PO, NORM_INV, AMOUNT_CENTS, id_column}
     return tuple(
-        column for column in frame.columns
-        if column not in internal and not str(column).startswith("__REC_")
+        column for column in dict.fromkeys(fingerprint_columns)
+        if column and column in frame.columns and column not in internal
+        and not str(column).startswith("__REC_")
     )
 
 
+_RE_DATE_TEXT = re.compile(
+    r"^\s*(?:(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})/(\d{1,2})/(\d{2}|\d{4}))"
+    r"(?:[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)?\s*$", re.IGNORECASE,
+)
+
+
 def _payload_value(value: Any) -> str:
+    """A stable, formatting-insensitive form of one fingerprint value, so that
+    "Acme  Corp" vs "ACME CORP", 1 vs 1.0, or 1/5/2026 vs 2026-01-05 (formatting
+    only) never keep two copies of one record from being confirmed."""
     if _is_missing(value):
         return "<NULL>"
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    return f"{type(value).__name__}:{value!s}"
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return f"date:{pd.Timestamp(value).date().isoformat()}"
+    if isinstance(value, bool):
+        return f"bool:{value}"
+    if isinstance(value, (int, float, Decimal)):
+        return f"num:{Decimal(str(value)).normalize()}"
+    text = " ".join(str(value).split())
+    if text == "":
+        return "<NULL>"
+    if _RE_DATE_TEXT.match(text):
+        parsed = pd.to_datetime(text, errors="coerce")
+        if not pd.isna(parsed):
+            return f"date:{parsed.date().isoformat()}"
+    try:
+        return f"num:{Decimal(text.replace(',', '')).normalize()}"
+    except InvalidOperation:
+        return f"text:{text.upper()}"
+
+
+def _id_values(
+    frame: pd.DataFrame, rows: Iterable[RowLabel], column: str,
+) -> Optional[dict[RowLabel, str]]:
+    """The value of an ID column on every row of a duplicate-key group, or None
+    unless the column is mapped AND populated on every row -- a group with even
+    one blank ID never treats blank as a shared identity."""
+    if column not in frame.columns:
+        return None
+    found: dict[RowLabel, str] = {}
+    for index in rows:
+        value = frame.at[index, column]
+        if _is_missing(value) or str(value).strip() == "":
+            return None
+        found[index] = str(value).strip()
+    return found
+
+
+def _line_id_is_trusted(frame: pd.DataFrame, confirmation_columns: tuple[str, ...]) -> bool:
+    """Whether a mapped line-level ID may independently confirm a copy.
+
+    A genuine line-level ID is shared only by copies of the same line, so every
+    set of rows carrying one ID must share the duplicate key and the stable
+    fingerprint. If any shared ID spans rows that differ -- two different sales
+    lines on one invoice, say -- the column is invoice/transaction-level and
+    cannot be trusted to identify a line; it is demoted to supporting evidence."""
+    if LINE_ID not in frame.columns:
+        return False
+    by_id: dict[str, list[RowLabel]] = defaultdict(list)
+    for index in frame.index:
+        value = frame.at[index, LINE_ID]
+        if not _is_missing(value) and str(value).strip() != "":
+            by_id[str(value).strip()].append(index)
+    for rows in by_id.values():
+        if len(rows) < 2:
+            continue
+        keys = {_key_for_row(frame, index) for index in rows}
+        prints = {_payload_signature(frame, index, confirmation_columns) for index in rows}
+        if len(keys) != 1 or None in keys or len(prints) != 1:
+            return False
+    return True
 
 
 def _payload_signature(
@@ -329,6 +438,8 @@ def _decisions(
     *,
     auto_exclude_strict: bool,
     confirmation_columns: tuple[str, ...],
+    identity_columns: tuple[str, ...] = (),
+    min_identity_fields: int = 0,
 ) -> list[_Decision]:
     """Classify duplicates within one file only.
 
@@ -338,21 +449,55 @@ def _decisions(
     from bypassing historical same-file canonicalization.
     """
     current_groups = _groups(frame)
+    line_id_trusted = _line_id_is_trusted(frame, confirmation_columns)
     decisions: list[_Decision] = []
     for key, rows in current_groups.items():
         if len(rows) < 2:
             continue
         group_id = _group_id(key)
-        strong = (
-            key[0] == DUPLICATE_BASIS_STRICT
-            and auto_exclude_strict
-            and bool(confirmation_columns)
+        # The key only identifies a duplicate RELATIONSHIP. Rows are confirmed
+        # copies of one underlying line only through (1) a trusted line-level ID
+        # or (2) a sufficient stable-field fingerprint (with any mapped
+        # transaction-level or untrusted ID agreeing). Rows that share the key
+        # but not that identity are distinct copy sets -- potential duplicates --
+        # and are never excluded on the key alone.
+        line_ids = _id_values(frame, rows, LINE_ID) if line_id_trusted else None
+        supporting: list[dict[RowLabel, str]] = []
+        if line_ids is None:
+            for column in (TXN_ID, LINE_ID):
+                values = _id_values(frame, rows, column)
+                if values is not None:
+                    supporting.append(values)
+        identity_present = sum(
+            1 for column in identity_columns
+            if column in confirmation_columns
+            and all(_payload_value(frame.at[index, column]) != "<NULL>" for index in rows)
         )
+        # Callers pass MIN_IDENTITY_FIELDS for every dataset: an exclusion needs a
+        # trusted line-level ID or enough identity-grade evidence. (0 disables the
+        # requirement and exists only for direct unit tests of the mechanism.)
+        sufficient = line_ids is not None or identity_present >= min_identity_fields
+        strong = key[0] == DUPLICATE_BASIS_STRICT and auto_exclude_strict and sufficient
+        if line_ids is not None:
+            confirmation_basis = "Line-level source ID"
+        else:
+            confirmation_basis = f"Stable-field fingerprint ({', '.join(confirmation_columns)})"
+            if supporting:
+                confirmation_basis += " + transaction ID"
+
+        def signature_for(index: RowLabel) -> tuple[str, ...]:
+            if line_ids is not None:
+                return (line_ids[index],)
+            return (
+                *(values[index] for values in supporting),
+                *_payload_signature(frame, index, confirmation_columns),
+            )
+
         payload_groups: dict[tuple[str, ...], list[RowLabel]] = defaultdict(list)
         for index in rows:
-            payload_groups[_payload_signature(frame, index, confirmation_columns)].append(index)
+            payload_groups[signature_for(index)].append(index)
         for payload_rows in payload_groups.values():
-            signature = _payload_signature(frame, payload_rows[0], confirmation_columns)
+            signature = signature_for(payload_rows[0])
             copy_set_id = _copy_set_id(key, signature)
             payload_confirmed = strong and len(payload_rows) > 1
             canonical = payload_rows[0] if payload_confirmed else None
@@ -367,6 +512,8 @@ def _decisions(
                     index, key[0], key, group_id, copy_set_id, tuple(rows),
                     tuple(payload_rows), (),
                     disposition, confidence, canonical, payload_confirmed, "Same-file",
+                    confirmation_basis if payload_confirmed else "",
+                    key[0] == DUPLICATE_BASIS_STRICT and auto_exclude_strict and not sufficient,
                 ))
     return decisions
 
@@ -467,7 +614,14 @@ def _report_from_decisions(
             )
         elif decision.payload_confirmed:
             duplicate_reason = (
-                "Same normalized PO, invoice, signed amount, and confirmation payload."
+                "Same normalized PO, invoice, signed amount, and line-level source ID."
+                if decision.confirmation_basis == "Line-level source ID"
+                else "Same normalized PO, invoice, signed amount, and stable-field fingerprint."
+            )
+        elif decision.insufficient_evidence:
+            duplicate_reason = (
+                "Same normalized PO, invoice, and signed amount, but the available fields are not "
+                "sufficient to establish that these rows are copies of one underlying line."
             )
         else:
             duplicate_reason = (
@@ -525,6 +679,7 @@ def _report_from_decisions(
             "Automatically Excluded": excluded,
             "Excluded Amount": amount if excluded else None,
             "Payload Confirmed": decision.payload_confirmed,
+            "Confirmation Basis": decision.confirmation_basis,
             "Policy Note": policy_note,
             "Manual Decision": None,
             "Reviewed By": None,
@@ -586,6 +741,9 @@ def screen_duplicates(
     reference_frame: Optional[pd.DataFrame] = None,
     reference_id_column: Optional[str] = None,
     allow_missing_amounts: bool = True,
+    fingerprint_columns: Iterable[str] = (),
+    identity_columns: Iterable[str] = (),
+    min_identity_fields: int = 0,
 ) -> DuplicateScreeningResult:
     """Detect candidates, apply policy, and return active/excluded populations."""
     frame_label = f"{dataset_label} {source_scope}".strip()
@@ -603,11 +761,14 @@ def screen_duplicates(
             frame_label=f"{dataset_label} Primary Reference",
             allow_missing_amounts=allow_missing_amounts,
         )
-    candidate_confirmation_columns = _confirmation_columns(frame, id_column)
+    fingerprint_columns = tuple(column for column in fingerprint_columns if column)
+    candidate_confirmation_columns = _confirmation_columns(frame, id_column, fingerprint_columns)
     if reference_frame is None:
         confirmation_columns = candidate_confirmation_columns
     else:
-        reference_candidates = set(_confirmation_columns(reference_frame, reference_id_column))
+        reference_candidates = set(
+            _confirmation_columns(reference_frame, reference_id_column, fingerprint_columns)
+        )
         confirmation_columns = tuple(
             column for column in candidate_confirmation_columns
             if column in reference_candidates
@@ -615,6 +776,8 @@ def screen_duplicates(
     same_file_decisions = _decisions(
         frame, auto_exclude_strict=auto_exclude_strict,
         confirmation_columns=candidate_confirmation_columns,
+        identity_columns=tuple(column for column in identity_columns if column),
+        min_identity_fields=min_identity_fields,
     )
     same_file_excluded = {
         decision.row_index for decision in same_file_decisions
@@ -685,6 +848,7 @@ def finalize_review_dispositions(
     historical_hold_ids: Iterable[Any] = (),
     excess_ids: Mapping[Any, Any] = MappingProxyType({}),
     canonical_survivor_ids: Iterable[Any] = (),
+    held_canonical_ids: Mapping[Any, Any] = MappingProxyType({}),
 ) -> pd.DataFrame:
     """Patch review-tier rows with their final match outcome.
 
@@ -695,10 +859,9 @@ def finalize_review_dispositions(
 
       * A row in ``resolved_ids`` matched normally -- no exclusion was ever
         needed, so its disposition becomes ``DISPOSITION_REVIEW_RESOLVED``.
-        This also covers a row that personally never matched but whose
-        group has a matched sibling: real evidence the pattern recurs, so
-        it is included in the accrual as an ordinary exception rather than
-        excluded -- callers pass those IDs in ``resolved_ids`` too.
+        Only rows that themselves matched belong here; an unmatched sibling
+        of a matched member is passed in ``held_ids`` instead -- it is
+        already-represented evidence, not a fresh transaction.
       * A row in ``held_ids`` stayed unresolved -- it is pulled from the
         accrual and marked ``DISPOSITION_REVIEW_HOLD``, requiring a
         documented human decision before the proposed JE is posted.
@@ -757,10 +920,15 @@ def finalize_review_dispositions(
     updated.loc[held_mask, "Automatically Excluded"] = True
     updated.loc[held_mask, "Excluded Amount"] = updated.loc[held_mask, "Amount"]
     updated.loc[held_mask, "Policy Note"] = (
-        "This candidate remained unresolved after matching. It is excluded from the "
-        "accrual/proposed journal entry and held in Duplicate Review Hold pending a "
-        "documented human disposition."
+        "This row shares its duplicate key with another row but is not confirmed to be a copy of "
+        "the same underlying transaction. It is not discarded; it is excluded from the accrual/"
+        "proposed journal entry and held in Duplicate Review Hold pending a documented human "
+        "disposition."
     )
+    held_canonical = {str(key): str(value) for key, value in held_canonical_ids.items()}
+    if held_canonical:
+        held_ids_present = row_ids.loc[held_mask]
+        updated.loc[held_mask, "Canonical Source Row ID"] = held_ids_present.map(held_canonical).fillna("")
 
     updated.loc[historical_held_mask, "Disposition"] = (
         DISPOSITION_HISTORICAL_REVIEW_HOLD
@@ -792,7 +960,7 @@ def finalize_review_dispositions(
     updated.loc[canonical_mask, "Confidence"] = CONFIDENCE_CONFIRMED
     updated.loc[canonical_mask, "Policy Note"] = (
         "No member of this duplicate-key group matched during reconciliation. This earliest-"
-        "listed member is retained in the accrual as the sole representative of the group; "
-        "every other member is excluded as an excess copy."
+        "listed member is retained as the group's representative; every other member is a "
+        "potential duplicate held for review."
     )
     return updated

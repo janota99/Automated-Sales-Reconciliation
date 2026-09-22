@@ -104,11 +104,11 @@ def test_fuzzy_lexicon_match_never_affects_matching_only_labels_products():
 
 def test_one_to_one_strong_match(qb_mapping, inf_mapping):
     qb = _prepare(
-        [{"PO": "PO1", "Invoice": "INV1", "Amount": 100.0, "Qty": 1, "Period": "1"}],
+        [{"PO": "PO1", "Invoice": "INV1", "Amount": 100.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "PO1", "Invoice": "INV1", "Amount": 100.0, "Period": "1"}],
+        [{"PO": "PO1", "Invoice": "INV1", "Amount": 100.0, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
@@ -124,11 +124,11 @@ def test_invoice_and_amount_match_is_strong_confidence_even_with_no_po(qb_mappin
     'Strong' confidence the same as a PO match, even when the PO itself is
     missing or doesn't agree between the two sides."""
     qb = _prepare(
-        [{"PO": "", "Invoice": "INV1", "Amount": 100.0, "Qty": 1, "Period": "1"}],
+        [{"PO": "", "Invoice": "INV1", "Amount": 100.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "SOMETHING-ELSE", "Invoice": "INV1", "Amount": 100.0, "Period": "1"}],
+        [{"PO": "SOMETHING-ELSE", "Invoice": "INV1", "Amount": 100.0, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
@@ -144,13 +144,13 @@ def test_grouped_aggregate_sums_two_differing_amounts_to_one_entry(qb_mapping, i
     Infinium entry -- never assumed to be duplicates of each other."""
     qb = _prepare(
         [
-            {"PO": "PO1", "Invoice": "INVA", "Amount": 30.0, "Qty": 1, "Period": "1"},
-            {"PO": "PO1", "Invoice": "INVB", "Amount": 70.0, "Qty": 1, "Period": "1"},
+            {"PO": "PO1", "Invoice": "INVA", "Amount": 30.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "PO1", "Invoice": "INVB", "Amount": 70.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
         ],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "PO1", "Invoice": "INVAGG", "Amount": 100.0, "Period": "1"}],
+        [{"PO": "PO1", "Invoice": "INVAGG", "Amount": 100.0, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
@@ -165,15 +165,15 @@ def test_ambiguous_grouped_candidates_are_left_unresolved(qb_mapping, inf_mappin
     equal 50) must never be guessed -- both stay unresolved for review."""
     qb = _prepare(
         [
-            {"PO": "PO1", "Invoice": "", "Amount": 10.0, "Qty": 1, "Period": "1"},
-            {"PO": "PO1", "Invoice": "", "Amount": 20.0, "Qty": 1, "Period": "1"},
-            {"PO": "PO1", "Invoice": "", "Amount": 30.0, "Qty": 1, "Period": "1"},
-            {"PO": "PO1", "Invoice": "", "Amount": 40.0, "Qty": 1, "Period": "1"},
+            {"PO": "PO1", "Invoice": "", "Amount": 10.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "PO1", "Invoice": "", "Amount": 20.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "PO1", "Invoice": "", "Amount": 30.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "PO1", "Invoice": "", "Amount": 40.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
         ],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "PO1", "Invoice": "", "Amount": 50.0, "Period": "1"}],
+        [{"PO": "PO1", "Invoice": "", "Amount": 50.0, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
@@ -184,11 +184,11 @@ def test_ambiguous_grouped_candidates_are_left_unresolved(qb_mapping, inf_mappin
 
 def test_invalid_amount_rows_are_never_matched(qb_mapping, inf_mapping):
     qb = _prepare(
-        [{"PO": "PO1", "Invoice": "INV1", "Amount": "not-a-number", "Qty": 1, "Period": "1"}],
+        [{"PO": "PO1", "Invoice": "INV1", "Amount": "not-a-number", "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "PO1", "Invoice": "INV1", "Amount": "not-a-number", "Period": "1"}],
+        [{"PO": "PO1", "Invoice": "INV1", "Amount": "not-a-number", "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, candidates = perform_matching(qb, inf)
@@ -202,11 +202,11 @@ def test_fuzzy_po_pass_resolves_the_hopper_scenario_after_exact_passes(qb_mappin
     real-world case. No exact pass can match these (different normalized
     PO, no invoice overlap), so only the fuzzy PO pass should resolve it."""
     qb = _prepare(
-        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"}],
+        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
@@ -219,11 +219,11 @@ def test_fuzzy_po_pass_resolves_the_hopper_scenario_after_exact_passes(qb_mappin
 
 def test_fuzzy_po_pass_never_overrides_amount_mismatch(qb_mapping, inf_mapping):
     qb = _prepare(
-        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 999.00, "Period": "6"}],
+        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 999.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf)
@@ -235,13 +235,13 @@ def test_fuzzy_po_pass_never_guesses_among_ambiguous_candidates(qb_mapping, inf_
     """One QB row fuzzy-matches two Infinium rows at the same amount --
     the engine must leave all three unresolved rather than guess."""
     qb = _prepare(
-        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
         [
-            {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
-            {"PO": "HOPPER LOGISTICS", "Invoice": "88888", "Amount": 225.00, "Period": "6"},
+            {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "HOPPER LOGISTICS", "Invoice": "88888", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
         ],
         inf_mapping, "INF",
     )
@@ -260,13 +260,13 @@ def test_fuzzy_po_pass_ignores_an_unrelated_near_miss_row(qb_mapping, inf_mappin
     before near-miss ones are considered, so the unrelated row is left
     alone and the true pair still clears."""
     qb = _prepare(
-        [{"PO": "hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6"}],
+        [{"PO": "hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
         [
-            {"PO": "DAVID HOPPER", "Invoice": "99999", "Amount": 675.00, "Period": "6"},
-            {"PO": "MYSTERY SHOPPER PROGRAM", "Invoice": "12345", "Amount": 300.00, "Period": "6"},
+            {"PO": "DAVID HOPPER", "Invoice": "99999", "Amount": 675.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "MYSTERY SHOPPER PROGRAM", "Invoice": "12345", "Amount": 300.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
         ],
         inf_mapping, "INF",
     )
@@ -286,11 +286,11 @@ def test_vendor_alias_resolves_a_pair_no_fuzzy_rule_can_bridge(qb_mapping, inf_m
     could ever have matched them. A confirmed vendor alias resolves it and
     is posted like an exact match rather than held for review."""
     qb = _prepare(
-        [{"PO": "Hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6"}],
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "David", "Invoice": "99999", "Amount": 675.00, "Period": "6"}],
+        [{"PO": "David", "Invoice": "99999", "Amount": 675.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     alias = VendorAlias(
@@ -313,8 +313,8 @@ def test_vendor_alias_resolves_a_pair_no_fuzzy_rule_can_bridge(qb_mapping, inf_m
 def test_vendor_alias_match_is_posted_not_held_for_review(qb_mapping, inf_mapping, make_metadata):
     """Unlike a fuzzy text guess, a confirmed alias is a decided fact and
     must never be pulled into the fuzzy match review hold."""
-    qb_rows = [{"PO": "Hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6"}]
-    inf_rows = [{"PO": "David", "Invoice": "99999", "Amount": 675.00, "Period": "6"}]
+    qb_rows = [{"PO": "Hopper", "Invoice": "20044", "Amount": 675.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}]
+    inf_rows = [{"PO": "David", "Invoice": "99999", "Amount": 675.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}]
     alias = VendorAlias(
         "ALIAS-0001", ["HOPPER", "DAVID"], "David Hopper (dock sales)",
         "J. Reviewer", "2026-09-15", "Confirmed via golden-master validation.",
@@ -333,11 +333,11 @@ def test_perform_matching_enable_fuzzy_false_leaves_hopper_row_unmatched(qb_mapp
     Hopper-style row must stay unmatched rather than fuzzy-clear against a
     population that is not the accrual source of truth."""
     qb = _prepare(
-        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"}],
+        [{"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         qb_mapping, "QB",
     )
     inf = _prepare(
-        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"}],
+        [{"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"}],
         inf_mapping, "INF",
     )
     matches, unmatched_qb, unmatched_inf, _ = perform_matching(qb, inf, enable_fuzzy=False)
@@ -348,16 +348,16 @@ def test_perform_matching_enable_fuzzy_false_leaves_hopper_row_unmatched(qb_mapp
 def test_build_fuzzy_match_review_holds_classifies_single_and_grouped(qb_mapping, inf_mapping):
     qb = _prepare(
         [
-            {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"},
-            {"PO": "Hopper", "Invoice": "20055", "Amount": 100.00, "Qty": 1, "Period": "6"},
-            {"PO": "Hopper", "Invoice": "20066", "Amount": 125.00, "Qty": 1, "Period": "6"},
+            {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "Hopper", "Invoice": "20055", "Amount": 100.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "Hopper", "Invoice": "20066", "Amount": 125.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
         ],
         qb_mapping, "QB",
     )
     inf = _prepare(
         [
-            {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
-            {"PO": "DAVID HOPPER 3.1", "Invoice": "88888", "Amount": 225.00, "Period": "6"},
+            {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
+            {"PO": "DAVID HOPPER 3.1", "Invoice": "88888", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
         ],
         inf_mapping, "INF",
     )
@@ -384,11 +384,11 @@ def test_full_reconciliation_resolves_hopper_style_po_mismatch(qb_mapping, inf_m
     relationship -- it must never be posted like an exact match. It goes to
     its own review-hold population instead, and blocks posting."""
     qb_rows = [
-        {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"},
-        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "6"},
+        {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
+        {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -409,30 +409,32 @@ def test_full_reconciliation_resolves_hopper_style_po_mismatch(qb_mapping, inf_m
 # the two reliability fixes, exercised together the way app.py would.
 # ---------------------------------------------------------------------------
 
-def test_duplicate_group_one_of_two_matches_other_becomes_ordinary_exception(
+def test_exact_duplicate_of_a_matched_row_is_excluded_not_accrued(
     qb_mapping, inf_mapping, make_metadata,
 ):
-    """The reported example 1: two $500 QuickBooks entries share a PO. One
-    has a real Infinium counterpart and matches; the other does not. The
-    unmatched one must be included in the accrual as an ordinary exception
-    -- not silently collapsed away as if it were a data-entry duplicate --
-    because its sibling matching is real evidence the group is genuinely
-    two transactions, not one entered twice."""
+    """Two $500 QuickBooks entries share PO, invoice, and signed amount: one
+    transaction entered twice. The exact duplicate is identified BEFORE
+    matching -- one canonical row, one excluded excess copy -- so the copy can
+    never surface afterwards as a fresh unmatched transaction feeding the JE.
+    (This supersedes the earlier policy that accrued the sibling of a matched
+    row.)"""
     qb_rows = [
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Period": "1"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
     assert len(result.matches) == 1
-    assert result.metrics["Duplicate QuickBooks Rows"] == 0
-    assert result.metrics["Unresolved QuickBooks Rows"] == 1
-    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(500.00)
+    assert result.metrics["Duplicate QuickBooks Rows"] == 1
+    assert result.metrics["Duplicate QuickBooks Amount"] == pytest.approx(500.00)
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(0.00)
+    assert result.metrics["Proposed JE Amount"] == pytest.approx(0.00)
     assert result.metrics["Control Status"] == "PASS"
 
 
@@ -446,11 +448,11 @@ def test_duplicate_group_none_match_only_one_included_in_accrual(
     original duplicate-canonicalization outcome, just decided after
     matching is attempted instead of before."""
     qb_rows = [
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "UNRELATED", "Invoice": "UNRELATED", "Amount": 1.00, "Period": "1"},
+        {"PO": "UNRELATED", "Invoice": "UNRELATED", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -464,46 +466,45 @@ def test_duplicate_group_none_match_only_one_included_in_accrual(
     assert result.metrics["Control Status"] == "PASS"
 
 
-def test_duplicate_group_of_three_one_matches_both_others_become_exceptions(
+def test_exact_duplicate_group_of_three_keeps_one_canonical_and_excludes_two(
     qb_mapping, inf_mapping, make_metadata,
 ):
-    """Generalizing example 1 to 3+ duplicates: once ANY member of the
-    group matches, every other unmatched member becomes its own ordinary
-    accrual exception -- not capped at one leftover the way the
-    zero-evidence case is."""
+    """Generalizing to 3+ exact duplicates: one canonical row matches, every
+    excess copy is excluded from matching and from the proposed JE."""
     qb_rows = [
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Period": "1"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 500.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
     assert len(result.matches) == 1
-    assert result.metrics["Duplicate QuickBooks Rows"] == 0
-    assert result.metrics["Unresolved QuickBooks Rows"] == 2
-    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(1000.00)
+    assert result.metrics["Duplicate QuickBooks Rows"] == 2
+    assert result.metrics["Duplicate QuickBooks Amount"] == pytest.approx(1000.00)
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert result.metrics["Proposed JE Amount"] == pytest.approx(0.00)
     assert result.metrics["Control Status"] == "PASS"
 
 
 def test_full_reconciliation_applies_all_four_duplicate_rules(qb_mapping, inf_mapping, make_metadata):
     qb_rows = [
-        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1"},  # 1:1 match
-        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1"},    # true duplicate pair
-        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO300", "Invoice": "INV301", "Amount": 30.00, "Qty": 1, "Period": "1"},    # sums to one Infinium row
-        {"PO": "PO300", "Invoice": "INV302", "Amount": 70.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1"},    # genuine exception
+        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},  # 1:1 match
+        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},    # true duplicate pair
+        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO300", "Invoice": "INV301", "Amount": 30.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},    # sums to one Infinium row
+        {"PO": "PO300", "Invoice": "INV302", "Amount": 70.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},    # genuine exception
     ]
     inf_rows = [
-        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Period": "1"},
-        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1"},              # Infinium duplicate pair
-        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1"},
-        {"PO": "PO300", "Invoice": "INV300AGG", "Amount": 100.00, "Period": "1"},
+        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},              # Infinium duplicate pair
+        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO300", "Invoice": "INV300AGG", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -552,14 +553,14 @@ def test_full_reconciliation_canonicalizes_duplicated_historical_rows_before_cle
     *primary* file -- is covered at the unit level in test_duplicates.py.)
     """
     qb_rows = [
-        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 555.00, "Qty": 1, "Period": "1"},
+        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 555.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "POOTHER", "Invoice": "INVOTHER", "Amount": 1.00, "Period": "1"},
+        {"PO": "POOTHER", "Invoice": "INVOTHER", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_secondary_rows = [
-        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 555.00, "Period": "12"},
-        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 555.00, "Period": "12"},
+        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 555.00, "Period": "12", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 555.00, "Period": "12", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -575,35 +576,32 @@ def test_full_reconciliation_canonicalizes_duplicated_historical_rows_before_cle
 
 def test_full_reconciliation_detects_blank_reference_duplicates(qb_mapping, inf_mapping, make_metadata):
     """A duplicate pair missing its PO is a weak-basis (invoice-only)
-    candidate: it is never auto-excluded up front, but since neither copy
-    matches anything here, there is zero evidence more than one real
-    transaction exists -- the earliest is retained as the sole accrual
-    exception (canonical) and the other is excluded as excess, unified
-    with how a strict PO+invoice+amount duplicate has always been treated
-    (see test_full_reconciliation_applies_all_four_duplicate_rules)."""
+    candidate: it is never auto-excluded. Neither copy matches anything, so
+    the earliest stays the group's representative (an ordinary exception) and
+    the other is a potential duplicate HELD for review -- not discarded, not
+    accrued."""
     qb_rows = [
-        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
-        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1"},
+        {"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
-    assert result.metrics["Duplicate QuickBooks Rows"] == 1
-    assert result.metrics["Duplicate QuickBooks Amount"] == pytest.approx(25.00)
-    assert result.metrics["Duplicate Review Hold QuickBooks Rows"] == 0
+    assert result.metrics["Duplicate QuickBooks Rows"] == 0                 # nothing confirmed, nothing discarded
+    assert result.metrics["Duplicate Review Hold QuickBooks Rows"] == 1
+    assert result.metrics["Duplicate Review Hold QuickBooks Amount"] == pytest.approx(25.00)
     assert result.metrics["Unresolved QuickBooks Rows"] == 1
     assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(25.00)
-    # An automatic duplicate exclusion always requires the source-report
-    # grain to be documented as validated before posting, same as any
-    # other confirmed duplicate exclusion -- unrelated to this policy.
     assert result.metrics["Posting Status"] == "REVIEW REQUIRED"
     assert set(result.duplicate_analysis["Disposition"]) == {
-        "Retained canonical row", "Excluded excess copy",
+        "Retained canonical row", "Held for review - excluded from proposed JE pending disposition",
     }
+    held = result.duplicate_analysis.set_index("Source Row ID").loc["QB-2"]
+    assert held["Canonical Source Row ID"] == "QB-1"                        # the row it may duplicate
     basis_values = set(result.duplicate_analysis["Duplicate Basis"])
     assert "Invoice + Amount (PO blank on both rows)" in basis_values
 
@@ -618,14 +616,14 @@ def test_fiscal_exception_summary_treats_one_and_two_periods_behind_as_routine(
     gap wider than PRIOR_PERIOD_URGENT_THRESHOLD periods, which signals a
     genuinely stale item worth investigating now."""
     qb_rows = [
-        {"PO": "PO-CUR", "Invoice": "INV-CUR", "Amount": 10.00, "Qty": 1, "Period": "5"},   # current
-        {"PO": "PO-P4", "Invoice": "INV-P4", "Amount": 20.00, "Qty": 1, "Period": "4"},     # 1 behind
-        {"PO": "PO-P3", "Invoice": "INV-P3", "Amount": 30.00, "Qty": 1, "Period": "3"},     # 2 behind
-        {"PO": "PO-P2", "Invoice": "INV-P2", "Amount": 40.00, "Qty": 1, "Period": "2"},     # 3 behind
-        {"PO": "PO-P1", "Invoice": "INV-P1", "Amount": 50.00, "Qty": 1, "Period": "1"},     # 4 behind
+        {"PO": "PO-CUR", "Invoice": "INV-CUR", "Amount": 10.00, "Qty": 1, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"},   # current
+        {"PO": "PO-P4", "Invoice": "INV-P4", "Amount": 20.00, "Qty": 1, "Period": "4", "Customer": "Acme", "Date": "2026-01-05"},     # 1 behind
+        {"PO": "PO-P3", "Invoice": "INV-P3", "Amount": 30.00, "Qty": 1, "Period": "3", "Customer": "Acme", "Date": "2026-01-05"},     # 2 behind
+        {"PO": "PO-P2", "Invoice": "INV-P2", "Amount": 40.00, "Qty": 1, "Period": "2", "Customer": "Acme", "Date": "2026-01-05"},     # 3 behind
+        {"PO": "PO-P1", "Invoice": "INV-P1", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},     # 4 behind
     ]
     inf_rows = [
-        {"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "5"},
+        {"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -648,11 +646,11 @@ def test_ambiguous_duplicate_candidates_are_withheld_from_accrual(qb_mapping, in
     duplicate, distinct from both a confirmed same-side duplicate and a
     (single-candidate) reference-matched amount variance."""
     qb_rows = [
-        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 90.00, "Period": "1"},
-        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 80.00, "Period": "1"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 90.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 80.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -675,22 +673,24 @@ def test_po_reuse_error_flags_repeated_po_with_disagreeing_grouped_totals(
     """A PO reused across 2+ still-unresolved QuickBooks rows whose grouped
     total does not tie to the grouped Infinium total for that PO must be
     classified as a PO Re-use Error and reported with PO/QuickBooks
-    total/Infinium total/difference/row counts -- but, unlike a duplicate
-    or a review-hold row, it stays in the accrual rather than being
-    withheld."""
+    total/Infinium total/difference/row counts. Infinium holds evidence for
+    that PO, so the rows may already be represented: they are HELD for
+    review, not accrued."""
     qb_rows = [
-        {"PO": "PO-REUSE1", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-REUSE1", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE1", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-REUSE1", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO-REUSE1", "Invoice": "", "Amount": 140.00, "Period": "1"},
+        {"PO": "PO-REUSE1", "Invoice": "", "Amount": 140.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
-    assert sorted(result.unmatched_qb) == [0, 1]
-    assert result.metrics["Unresolved QuickBooks Rows"] == 2
+    assert result.unmatched_qb == [] and result.reference_hold_qb_rows == [0, 1]
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert set(result.reference_hold_analysis["Reason Code"]) == {"REVIEW_HOLD_PO_REUSE"}
+    assert set(result.reference_hold_analysis["Related Infinium Row IDs"]) == {"INF-1"}
     assert result.amount_variance_analysis.empty
     assert result.ambiguous_duplicate_analysis.empty
     assert len(result.po_reuse_errors) == 1
@@ -714,11 +714,11 @@ def test_po_reuse_error_does_not_flag_a_repeated_po_whose_grouped_totals_tie_exa
     Error classification, per the requirement to preserve the existing
     resolution/review treatment when totals agree."""
     qb_rows = [
-        {"PO": "PO-REUSE2", "Invoice": "INV-C", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-REUSE2", "Invoice": "INV-D", "Amount": 50.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE2", "Invoice": "INV-C", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-REUSE2", "Invoice": "INV-D", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO-REUSE2", "Invoice": "", "Amount": 150.00, "Period": "1"},
+        {"PO": "PO-REUSE2", "Invoice": "", "Amount": 150.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -735,11 +735,11 @@ def test_po_reuse_error_applies_zero_tolerance_at_one_cent(qb_mapping, inf_mappi
     one-cent grouped-total difference on a reused PO must still be flagged
     -- not silently accepted as immaterial rounding."""
     qb_rows = [
-        {"PO": "PO-REUSE3", "Invoice": "INV-E", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-REUSE3", "Invoice": "INV-F", "Amount": 50.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE3", "Invoice": "INV-E", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-REUSE3", "Invoice": "INV-F", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO-REUSE3", "Invoice": "", "Amount": 149.99, "Period": "1"},
+        {"PO": "PO-REUSE3", "Invoice": "", "Amount": 149.99, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -753,11 +753,11 @@ def test_po_reuse_error_ignores_blank_po_values(qb_mapping, inf_mapping, make_me
     """Two QuickBooks rows with a blank PO are not "the same PO reused" --
     grouping must key on a populated normalized PO, never on blank."""
     qb_rows = [
-        {"PO": "", "Invoice": "INV-G", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "", "Invoice": "INV-H", "Amount": 50.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INV-G", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "", "Invoice": "INV-H", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "", "Invoice": "INV-Z", "Amount": 1.00, "Period": "1"},
+        {"PO": "", "Invoice": "INV-Z", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -772,11 +772,11 @@ def test_weak_basis_pair_resolved_via_match_proceeds_normally(qb_mapping, inf_ma
     is excluded from the JE, neither is held for review, and their
     duplicate-report disposition reflects the successful resolution."""
     qb_rows = [
-        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
-        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "", "Invoice": "INV-DUP", "Amount": 50.00, "Period": "1"},
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 50.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -800,11 +800,11 @@ def test_weak_basis_review_hold_does_not_block_control_status(qb_mapping, inf_ma
     (QuickBooks duplicates no longer use this path -- see
     test_full_reconciliation_detects_blank_reference_duplicates)."""
     qb_rows = [
-        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Period": "1"},
-        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Period": "1"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -822,15 +822,16 @@ def test_weak_basis_review_hold_does_not_block_control_status(qb_mapping, inf_ma
 
 def test_rules_table_documents_duplicate_handling(qb_mapping, inf_mapping, make_metadata):
     result = build_reconciliation(
-        pd.DataFrame([{"PO": "PO1", "Invoice": "INV1", "Amount": 1.0, "Qty": 1, "Period": "1"}]),
-        pd.DataFrame([{"PO": "PO1", "Invoice": "INV1", "Amount": 1.0, "Period": "1"}]),
+        pd.DataFrame([{"PO": "PO1", "Invoice": "INV1", "Amount": 1.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]),
+        pd.DataFrame([{"PO": "PO1", "Invoice": "INV1", "Amount": 1.0, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]),
         qb_mapping, inf_mapping, make_metadata(), 2026,
     )
     rule_names = set(result.rules["Rule"])
     assert (
-        "QuickBooks duplicate-key groups: matched normally, evidence-based accrual (see duplicates.py)"
+        "QuickBooks exact duplicates: excluded before matching; weaker groups decided after (see duplicates.py)"
         in rule_names
     )
+    assert "Final QuickBooks disposition and JE population" in rule_names
     assert "Infinium duplicate-key groups: matched normally, held if unresolved" in rule_names
     assert "Historical overlap exclusion" in rule_names
 
@@ -842,10 +843,10 @@ def test_validate_reconciliation_rejects_duplicate_leaking_into_unresolved(
     screening: if a duplicate ever ends up back in the unresolved
     (accrual-driving) population, validation must fail loudly."""
     qb_rows = [
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
-    inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1"}]
+    inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
@@ -860,10 +861,10 @@ def test_validate_reconciliation_rejects_duplicate_inside_an_accepted_match(
     qb_mapping, inf_mapping, make_metadata,
 ):
     qb_rows = [
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
-    inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1"}]
+    inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
@@ -882,11 +883,11 @@ def test_validate_reconciliation_rejects_fuzzy_held_row_in_accepted_match(
     hold: if a fuzzy-held row were ever also posted inside an accepted
     match, validation must fail loudly rather than silently double-count it."""
     qb_rows = [
-        {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6"},
-        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "6"},
+        {"PO": "Hopper", "Invoice": "20044", "Amount": 225.00, "Qty": 3, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6"},
+        {"PO": "DAVID HOPPER 2.2", "Invoice": "99999", "Amount": 225.00, "Period": "6", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,

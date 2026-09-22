@@ -48,6 +48,7 @@ EXPECTED_ANALYTICS_SHEETS = [
     "Executive Summary",
     "Match Method Summary",
     "Match Register",
+    "QB Disposition Ledger",
     "Detailed Match Ledger",
     "Normalization Detail",
     "Match Assessment",
@@ -65,21 +66,21 @@ def _worksheet_text(ws) -> list[str]:
 
 def _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata):
     qb_rows = [
-        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1"},  # 1:1 match
-        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1"},    # QB duplicate pair
-        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1"},    # genuine exception
+        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},  # 1:1 match
+        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},    # QB duplicate pair
+        {"PO": "PO200", "Invoice": "INV200", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},    # genuine exception
     ]
     inf_rows = [
-        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Period": "1"},
-        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1"},              # Infinium duplicate pair
-        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1"},
+        {"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},              # Infinium duplicate pair
+        {"PO": "PO400", "Invoice": "INV400", "Amount": 20.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_secondary_rows = [
-        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 5.00, "Period": "12"},
+        {"PO": "POHIST", "Invoice": "INVHIST", "Amount": 5.00, "Period": "12", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     qb_secondary_rows = [
-        {"PO": "POSEC", "Invoice": "INVSEC", "Amount": 9.00, "Qty": 1, "Period": "12"},
+        {"PO": "POSEC", "Invoice": "INVSEC", "Amount": 9.00, "Qty": 1, "Period": "12", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     return build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -93,11 +94,11 @@ def _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata):
 
 def _build_result_without_duplicates(qb_mapping, inf_mapping, make_metadata):
     qb_rows = [
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO2", "Invoice": "INV2", "Amount": 15.00, "Qty": 1, "Period": "1"},  # unresolved
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO2", "Invoice": "INV2", "Amount": 15.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},  # unresolved
     ]
     inf_rows = [
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Period": "1"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     return build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -408,10 +409,10 @@ def test_legacy_already_matched_duplicate_reads_as_a_review_action(qb_mapping, i
     """An unresolved QuickBooks row whose PO/invoice belongs to an Infinium
     row already matched elsewhere is labeled as a review action."""
     qb_rows = [
-        {"PO": "PO-USED", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-USED", "Invoice": "INV-B", "Amount": 55.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-USED", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-USED", "Invoice": "INV-B", "Amount": 55.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
-    inf_rows = [{"PO": "PO-USED", "Invoice": "INV-A", "Amount": 100.00, "Period": "1"}]
+    inf_rows = [{"PO": "PO-USED", "Invoice": "INV-A", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
@@ -426,7 +427,7 @@ def test_legacy_already_matched_duplicate_reads_as_a_review_action(qb_mapping, i
 def test_legacy_short_valued_columns_are_wide_enough_for_their_headings(make_metadata, qb_mapping):
     """Infinium's five-digit "Customer No" column is sized to its data, which
     clips its heading (and the autofilter button) to "Customer N"."""
-    qb_rows = [{"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1"}]
+    qb_rows = [{"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
     inf_rows = [{
         "OHAPD": "1", "OHOBDE": "1/09/2026", "OHCO": "WP", "CUNO": 50001, "OHOBNO": "INV100",
         "OHTOTA": 100.00, "OHDESC": "PO 100", "OHPONO": "PO100",
@@ -548,7 +549,7 @@ def test_legacy_workbook_suppresses_number_stored_as_text_warnings(qb_mapping, i
 
 
 def test_legacy_reconciliation_normalizes_infinium_column_names(qb_mapping, make_metadata):
-    qb_rows = [{"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1"}]
+    qb_rows = [{"PO": "PO100", "Invoice": "INV100", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
     inf_rows = [{
         "OHAPD": "1", "OHOBDE": "1/09/2026", "OHCO": "WP", "CUNO": 50001, "OHOBNO": "INV100",
         "OHTOTA": 100.00, "OHDESC": "PO 100", "OHPONO": "PO100",
@@ -741,10 +742,10 @@ def test_reference_matched_amount_variance_is_excluded_from_accrual_and_shown_se
     to a reviewer in a dedicated "likely data entry error" section rather
     than silently disappearing from the workpaper."""
     qb_rows = [
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO500", "Invoice": "INV500", "Amount": 90.00, "Period": "1"},
+        {"PO": "PO500", "Invoice": "INV500", "Amount": 90.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -777,11 +778,11 @@ def test_ambiguous_duplicate_is_excluded_from_accrual_and_labeled_separately(
     "ambiguous duplicate" (not folded into the confirmed-duplicate or
     amount-variance sections), so a reviewer can research the candidates."""
     qb_rows = [
-        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 100.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 90.00, "Period": "1"},
-        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 80.00, "Period": "1"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 90.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-AMBIG", "Invoice": "INV-AMBIG", "Amount": 80.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -806,37 +807,35 @@ def test_ambiguous_duplicate_is_excluded_from_accrual_and_labeled_separately(
     assert not any(str(text).startswith("VAR-") for text in sheet_text)
 
 
-def test_po_reuse_error_stays_in_accrual_and_shows_grouped_detail(
+def test_po_reuse_error_is_held_and_shows_grouped_detail(
     qb_mapping, inf_mapping, make_metadata,
 ):
     """A PO reused across 2+ unresolved QuickBooks rows whose grouped total
-    disagrees with Infinium's must remain in the exceptions table and
-    accrual total (unlike a duplicate, amount variance, or ambiguous
-    duplicate, none of which stay), labeled "PO Re-use Error" at the row
-    level, with a supplementary grouped-detail section showing the PO,
-    both totals, the difference, and both row counts."""
+    disagrees with Infinium's is held for review (Infinium has evidence for
+    that PO), labeled "PO Re-use Error", with a supplementary grouped-detail
+    section showing the PO, both totals, the difference, and both row counts."""
     qb_rows = [
-        {"PO": "PO-REUSE1", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-REUSE1", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-REUSE1", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-REUSE1", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO-REUSE1", "Invoice": "", "Amount": 140.00, "Period": "1"},
+        {"PO": "PO-REUSE1", "Invoice": "", "Amount": 140.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
     )
-    assert sorted(result.unmatched_qb) == [0, 1]
+    assert result.unmatched_qb == [] and result.reference_hold_qb_rows == [0, 1]
     assert len(result.po_reuse_errors) == 1
 
     workbook_bytes = build_primary_workbook(result)
     ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
     sheet_text = _worksheet_text(ws)
 
-    # Both rows stay as ordinary exceptions, labeled PO Re-use Error, and
-    # are still part of the JE-support total (they are never pulled into a
-    # withheld/excluded section like the other review-hold categories).
-    assert sheet_text.count("PO Re-use Error") >= 2
+    # Both rows are itemized in the review-hold section, labeled PO Re-use
+    # Error, and are NOT part of the JE-support total.
+    assert sum("PO Re-use Error" in text for text in sheet_text) >= 2
+    assert any("REVIEW HOLD | REFERENCE EVIDENCE" in text for text in sheet_text)
     assert any("PO RE-USE ERROR" in text for text in sheet_text)
     assert any("QB-1" in text and "QB-2" in text for text in sheet_text)
     assert any(isinstance(v, (int, float)) and v == 150.0 for v in [c.value for row in ws.iter_rows() for c in row])
@@ -1058,11 +1057,11 @@ def _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata):
     QuickBooks input can produce it anymore.
     """
     qb_rows = [
-        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
-        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "", "Invoice": "INVBLANK", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO999", "Invoice": "INV999", "Amount": 15.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
-    inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1"}]
+    inf_rows = [{"PO": "POX", "Invoice": "INVX", "Amount": 1.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
@@ -1141,10 +1140,10 @@ def test_no_review_hold_items_renders_empty_section_cleanly(qb_mapping, inf_mapp
     Hold section must still render (with an explanatory 'none' caption)
     rather than crash on an empty frame."""
     qb_rows = [
-        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
-        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1"},
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "", "Invoice": "INV-DUP", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
-    inf_rows = [{"PO": "", "Invoice": "INV-DUP", "Amount": 50.00, "Period": "1"}]
+    inf_rows = [{"PO": "", "Invoice": "INV-DUP", "Amount": 50.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]
     result = build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
         make_metadata(), 2026,
@@ -1153,7 +1152,7 @@ def test_no_review_hold_items_renders_empty_section_cleanly(qb_mapping, inf_mapp
     workbook_bytes = build_primary_workbook(result)
     ws = load_workbook(io.BytesIO(workbook_bytes))["Unresolved Exceptions"]
     unresolved_text = _worksheet_text(ws)
-    assert any("No QuickBooks weak-basis duplicate candidates remain unresolved" in t for t in unresolved_text)
+    assert any("No QuickBooks potential duplicates remain unresolved" in t for t in unresolved_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1165,17 +1164,17 @@ def _reference_result(qb_mapping, inf_mapping, make_metadata):
     match, an exception whose PO a match already used, and a duplicate of a
     matched row -- so every reference kind appears at least once."""
     qb_rows = [
-        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-G", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-G", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO1", "Invoice": "INV1B", "Amount": 5.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-G", "Invoice": "INV-A", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-G", "Invoice": "INV-B", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO1", "Invoice": "INV1B", "Amount": 5.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     inf_rows = [
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Period": "1"},
-        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Period": "1"},
-        {"PO": "PO-G", "Invoice": "", "Amount": 150.00, "Period": "1"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 10.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO9", "Invoice": "INV9", "Amount": 90.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-G", "Invoice": "", "Amount": 150.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     return build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
@@ -1254,7 +1253,7 @@ def test_legacy_reconciliation_references_stay_with_their_relationship_after_sor
     assert ref_order != sorted(ref_order)
     # Exceptions cite the exact match they point at.
     labels = {c.value for row in ws.iter_rows(min_row=5) for c in row if isinstance(c.value, str)}
-    assert any(label.startswith("Potential Duplicate of Match M-") for label in labels)
+    assert any(label.startswith("Exact Duplicate of Match M-") and label.endswith("- Excluded") for label in labels)
     assert any(label.startswith("Review: PO Already Used by Match M-") for label in labels)
 
 
@@ -1263,19 +1262,30 @@ def test_unresolved_exceptions_places_referenced_match_ref_immediately_before_st
 ):
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
+    # The main table still carries the pointer column immediately before the status...
     header_row = next(row for row in ws.iter_rows() if any(c.value == "Exception Status" for c in row))
     headers = [c.value for c in header_row]
-    status_col = headers.index("Exception Status") + 1
-    assert headers[status_col - 2] == "Referenced Match Ref."
-    pointer_col = status_col - 1
+    assert headers[headers.index("Exception Status") - 1] == "Referenced Match Ref."
+    # ...but a row whose PO an accepted match already represents is a review hold now,
+    # itemized with the match it points at.
+    title_row = next(
+        c.row for row in ws.iter_rows() for c in row
+        if c.value and str(c.value).startswith("REVIEW HOLD | REFERENCE EVIDENCE")
+    )
+    hold_header = next(
+        row for row in ws.iter_rows(min_row=title_row) if any(c.value == "Why Held" for c in row)
+    )
+    held_headers = [c.value for c in hold_header]
+    why_col = held_headers.index("Why Held") + 1
+    pointer_col = held_headers.index("Referenced Match Ref.") + 1
     rows = []
-    for number in range(header_row[0].row + 1, header_row[0].row + 1 + len(result.unmatched_qb)):
-        rows.append((ws.cell(number, status_col).value, _link_text(ws.cell(number, pointer_col).value)))
-    assert len(rows) == 2
-    for status, pointer in rows:
-        # Every exception here points at a real match, named the same way in both cells.
+    for number in range(hold_header[0].row + 1, hold_header[0].row + 1 + len(result.reference_hold_qb_rows)):
+        rows.append((ws.cell(number, why_col).value, _link_text(ws.cell(number, pointer_col).value)))
+    assert len(rows) == 1
+    for why, pointer in rows:
+        # Named the same way in both cells.
         assert pointer in {"M-001", "M-002", "G-001"}
-        assert pointer in status
+        assert pointer in why
 
 
 def test_every_reference_shown_in_any_workbook_exists_in_the_match_register(
@@ -1351,8 +1361,12 @@ def test_reference_feature_changes_no_reconciliation_total(qb_mapping, inf_mappi
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
     assert result.metrics["Control Status"] == "PASS"
     assert len(result.matches) == 3                                # PO1, PO9, and the PO-G group
-    assert result.metrics["Unresolved QuickBooks Rows"] == 2       # PO1/INV1B and the PO9 duplicate copy
-    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(5.00 + 90.00)
+    # PO1/INV1B (its PO already used by a match) is a review hold; the PO9 copy is
+    # an excluded exact duplicate -- neither feeds the proposed JE.
+    assert result.metrics["Unresolved QuickBooks Rows"] == 0
+    assert result.metrics["Proposed JE Amount"] == pytest.approx(0.0)
+    assert result.metrics["Reference Review Hold QuickBooks Amount"] == pytest.approx(5.00)
+    assert result.metrics["Duplicate QuickBooks Amount"] == pytest.approx(90.00)
     assert result.metrics["QuickBooks Source Total"] == pytest.approx(345.00)
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
     assert any("SUM(QuickBooksExceptions[Amount])" in t for t in _worksheet_text(ws))
@@ -1417,9 +1431,9 @@ def _clearance_result(qb_mapping, make_metadata):
     """A QuickBooks record cleared by a prior-period Infinium record, beside an
     ordinary current-period match and an unresolved exception."""
     qb_rows = [
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-H", "Invoice": "INV-H", "Amount": 25.00, "Qty": 1, "Period": "1"},
-        {"PO": "PO-X", "Invoice": "INV-X", "Amount": 7.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-H", "Invoice": "INV-H", "Amount": 25.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-X", "Invoice": "INV-X", "Amount": 7.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     return build_reconciliation(
         pd.DataFrame(qb_rows), pd.DataFrame([_infinium_code_row("PO1", "INV1", 100.00)]),
@@ -1438,8 +1452,8 @@ def test_main_sheet_titles_lead_with_the_fiscal_period(qb_mapping, inf_mapping, 
     glance: the three QuickBooks titles start with the run's fiscal period."""
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
     result_p5 = build_reconciliation(
-        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Qty": 1, "Period": "5"}]),
-        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Period": "5"}]),
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Qty": 1, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"}]),
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"}]),
         qb_mapping, inf_mapping, make_metadata(fiscal_period=5), 2026,
     )
     wb = load_workbook(io.BytesIO(build_primary_workbook(result_p5)))
@@ -1456,8 +1470,8 @@ def test_main_sheet_titles_lead_with_the_fiscal_period(qb_mapping, inf_mapping, 
 
 def test_main_sheet_titles_when_no_fiscal_period_was_selected(qb_mapping, inf_mapping, make_metadata):
     result = build_reconciliation(
-        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Qty": 1, "Period": "5"}]),
-        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Period": "5"}]),
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Qty": 1, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"}]),
+        pd.DataFrame([{"PO": "P", "Invoice": "I", "Amount": 1.0, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"}]),
         qb_mapping, inf_mapping, make_metadata(fiscal_period=None), 2026,
     )
     wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
@@ -1498,7 +1512,16 @@ def test_reconciliation_detail_control_strip_ties_to_the_rows_beneath_it(
         qb_id for entry in result.match_register["QuickBooks Row IDs"] for qb_id in entry.split("; ")
     }
     assert outcomes["reconciled"] == len(register_ids & primary_ids)
-    assert outcomes["reconciled"] + outcomes["unresolved"] + outcomes["excluded"] == outcomes["records"]
+    assert (
+        outcomes["reconciled"] + outcomes["review_hold"] + outcomes["unmatched"] + outcomes["excluded"]
+        == outcomes["records"]
+    )
+    assert outcomes["review_hold"] + outcomes["unmatched"] == (
+        len(result.unmatched_qb) + len(result.reference_hold_qb_rows)
+        + len(result.duplicate_review_hold_qb_rows) + len(result.amount_variance_review_hold_qb_rows)
+        + len(result.ambiguous_duplicate_qb_rows) + len(result.fuzzy_match_review_hold_qb_rows)
+    )
+    assert outcomes["unmatched"] == len(result.unmatched_qb)
 
     rate = outcomes["reconciled"] / outcomes["records"] * 100
     parts = [part.strip() for part in strip.split("|")]
@@ -1508,7 +1531,8 @@ def test_reconciliation_detail_control_strip_ties_to_the_rows_beneath_it(
         f"{outcomes['records']:,} QuickBooks {noun}",
         f"{outcomes['reconciled']:,} reconciled",
         f"{rate:.1f}%",
-        f"{outcomes['unresolved']:,} unresolved",
+        f"{outcomes['review_hold']:,} review hold",
+        f"{outcomes['unmatched']:,} unmatched",
         f"{outcomes['excluded']:,} {duplicates} excluded",
         f"JE support: {format_currency(result.metrics['Unresolved QuickBooks Amount'])}",
     ]
@@ -1611,10 +1635,12 @@ def test_reconciliation_detail_and_exceptions_link_references_to_the_accepted_ma
         if value:
             linked.append(value)
     unresolved = wb["Unresolved Exceptions"]
-    exceptions_header = next(row for row in unresolved.iter_rows() if any(c.value == "Exception Status" for c in row))
-    exceptions_pointer = [c.value for c in exceptions_header].index("Referenced Match Ref.") + 1
-    for r in range(exceptions_header[0].row + 1, exceptions_header[0].row + 1 + len(result.unmatched_qb)):
-        value = unresolved.cell(r, exceptions_pointer).value
+    # A row whose PO a match already represents is itemized in the review-hold
+    # section, with a live link to that match.
+    hold_header = next(row for row in unresolved.iter_rows() if any(c.value == "Why Held" for c in row))
+    hold_pointer = [c.value for c in hold_header].index("Referenced Match Ref.") + 1
+    for r in range(hold_header[0].row + 1, hold_header[0].row + 1 + len(result.reference_hold_qb_rows)):
+        value = unresolved.cell(r, hold_pointer).value
         if value:
             linked.append(value)
     assert len(linked) >= 3          # exceptions on both sheets point at matches here
@@ -1700,12 +1726,12 @@ def test_unresolved_exceptions_period_classes_are_named_consistently(qb_mapping,
     from config import AMBER, GREEN_LIGHT, RED_LIGHT
 
     qb_rows = [
-        {"PO": "PO-CUR", "Invoice": "INV-CUR", "Amount": 10.00, "Qty": 1, "Period": "5"},
-        {"PO": "PO-P4", "Invoice": "INV-P4", "Amount": 20.00, "Qty": 1, "Period": "4"},
-        {"PO": "PO-P1", "Invoice": "INV-P1", "Amount": 50.00, "Qty": 1, "Period": "1"},
+        {"PO": "PO-CUR", "Invoice": "INV-CUR", "Amount": 10.00, "Qty": 1, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-P4", "Invoice": "INV-P4", "Amount": 20.00, "Qty": 1, "Period": "4", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO-P1", "Invoice": "INV-P1", "Amount": 50.00, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
     ]
     result = build_reconciliation(
-        pd.DataFrame(qb_rows), pd.DataFrame([{"PO": "POX", "Invoice": "INVX", "Amount": 1.0, "Period": "5"}]),
+        pd.DataFrame(qb_rows), pd.DataFrame([{"PO": "POX", "Invoice": "INVX", "Amount": 1.0, "Period": "5", "Customer": "Acme", "Date": "2026-01-05"}]),
         qb_mapping, inf_mapping, make_metadata(fiscal_period=5), 2026,
     )
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
@@ -1738,7 +1764,7 @@ def test_unresolved_exceptions_review_hold_tints_only_its_status_cell(qb_mapping
     result = _build_result_with_review_hold(qb_mapping, inf_mapping, make_metadata)
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Unresolved Exceptions"]
     title_row = next(
-        c.row for row in ws.iter_rows() for c in row if c.value and str(c.value).startswith("DUPLICATE REVIEW HOLD")
+        c.row for row in ws.iter_rows() for c in row if c.value and "DUPLICATE REVIEW HOLD" in str(c.value)
     )
     header_row = next(
         row for row in ws.iter_rows(min_row=title_row) if any(c.value == "Reviewer Disposition" for c in row)

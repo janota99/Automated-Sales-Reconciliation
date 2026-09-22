@@ -74,12 +74,24 @@ QB_COLUMN_PATTERNS = {
     "quantity": ["QTY", "QUANTITY"],
     "product": ["MEMO/DESCRIPTION", "MEMO", "DESCRIPTION", "PRODUCT"],
     "period": ["FISCAL PERIOD", "SOURCE PERIOD", "PERIOD", "PD"],
+    # Optional IDs. A transaction/invoice-level ID only supports a duplicate match;
+    # a line-level ID is never auto-detected (a "Line #" often restarts on every
+    # invoice) -- map it yourself if your report has a unique-per-row source ID.
+    "transaction_id": ["TRANSACTION ID", "TRANS ID", "TXN ID", "TRNS #", "TRANSACTION #"],
+    "line_id": [],
+    "rate": ["RATE", "UNIT PRICE", "PRICE", "SALES PRICE"],
+    # Stable transaction fields for the duplicate fingerprint (see duplicates.py).
+    "customer": ["CUSTOMER", "CUSTOMER NAME", "NAME", "CLIENT"],
+    "date": ["TRANSACTION DATE", "TRANS DATE", "INVOICE DATE", "DATE"],
 }
 INF_COLUMN_PATTERNS = {
     "po": ["OHDESC", "PO", "PO NUMBER", "PO#"],
     "invoice": ["OHOBNO", "INVOICE", "INVOICE NUMBER", "INVOICE #"],
     "amount": ["OHTOTA", "AMOUNT", "TOTAL AMOUNT", "TOTAL"],
     "period": ["FISCAL PERIOD", "SOURCE PERIOD", "PERIOD", "PD"],
+    "customer": ["CUNO", "CUSTOMER", "CUSTOMER NO", "CUSTOMER NUMBER"],
+    "date": ["OHOBDE", "INVOICE DATE", "DATE"],
+    "line_id": [],
 }
 
 def file_sha256(data: bytes) -> str:
@@ -613,6 +625,29 @@ def mapping_panel(
                 "Product description", qb_columns, QB_COLUMN_PATTERNS["product"],
                 f"qb_map_product_{key_suffix}", optional=True, default_column=qb_defaults["product"],
             ),
+            "line_id": select_column(
+                "Line-level source ID (optional -- unique per row; confirms exact copies)", qb_columns,
+                QB_COLUMN_PATTERNS["line_id"], f"qb_map_line_{key_suffix}", optional=True,
+                default_column=qb_defaults.get("line_id"),
+            ),
+            "transaction_id": select_column(
+                "Transaction/invoice-level ID (optional -- supporting evidence only)", qb_columns,
+                QB_COLUMN_PATTERNS["transaction_id"], f"qb_map_txn_{key_suffix}", optional=True,
+                default_column=qb_defaults.get("transaction_id"),
+            ),
+            "rate": select_column(
+                "Rate / unit price (optional -- duplicate fingerprint)", qb_columns,
+                QB_COLUMN_PATTERNS["rate"], f"qb_map_rate_{key_suffix}", optional=True,
+                default_column=qb_defaults.get("rate"),
+            ),
+            "customer": select_column(
+                "Customer (optional -- duplicate fingerprint)", qb_columns, QB_COLUMN_PATTERNS["customer"],
+                f"qb_map_customer_{key_suffix}", optional=True, default_column=qb_defaults.get("customer"),
+            ),
+            "date": select_column(
+                "Transaction date (optional -- duplicate fingerprint)", qb_columns, QB_COLUMN_PATTERNS["date"],
+                f"qb_map_date_{key_suffix}", optional=True, default_column=qb_defaults.get("date"),
+            ),
         }
         qb_period_detail, _ = filter_qb_subtotal_rows(qb_raw, qb_mapping)
         detected_qb_period = infer_qb_period_column(
@@ -631,6 +666,19 @@ def mapping_panel(
             "period": select_column(
                 "Source fiscal period", inf_columns, INF_COLUMN_PATTERNS["period"],
                 f"inf_map_period_{key_suffix}", default_column=inf_defaults["period"],
+            ),
+            "line_id": select_column(
+                "Line-level source ID (optional -- unique per row; confirms exact copies)", inf_columns,
+                INF_COLUMN_PATTERNS["line_id"], f"inf_map_line_{key_suffix}", optional=True,
+                default_column=inf_defaults.get("line_id"),
+            ),
+            "customer": select_column(
+                "Customer (optional -- duplicate fingerprint)", inf_columns, INF_COLUMN_PATTERNS["customer"],
+                f"inf_map_customer_{key_suffix}", optional=True, default_column=inf_defaults.get("customer"),
+            ),
+            "date": select_column(
+                "Transaction date (optional -- duplicate fingerprint)", inf_columns, INF_COLUMN_PATTERNS["date"],
+                f"inf_map_date_{key_suffix}", optional=True, default_column=inf_defaults.get("date"),
             ),
         }
 
@@ -682,6 +730,16 @@ def secondary_mapping_panel(
                 f"{prefix}_map_quantity_{key_suffix}", optional=True,
                 default_column=defaults["quantity"],
             )
+        # Line-identity fields for the duplicate standard of evidence (optional).
+        for role, label in (
+            ("customer", "Customer (optional)"),
+            ("date", "Transaction date (optional)"),
+            ("line_id", "Line-level source ID (optional)"),
+        ):
+            mapping[role] = select_column(
+                label, columns, patterns[role], f"{prefix}_map_{role}_{key_suffix}",
+                optional=True, default_column=defaults.get(role),
+            )
         return mapping
 
     qb_mapping: Optional[dict[str, Optional[str]]] = None
@@ -690,7 +748,8 @@ def secondary_mapping_panel(
         with st.sidebar.expander("Secondary historical mappings", expanded=False):
             st.caption(
                 "Secondary rows are historical background data. Only PO, invoice, "
-                "and exact signed amount are considered."
+                "and exact signed amount are matched; customer, date, and a line-level ID "
+                "(optional) let a duplicate copy be confirmed rather than held."
             )
             if qb_secondary_raw is not None:
                 st.markdown("**QuickBooks secondary**")

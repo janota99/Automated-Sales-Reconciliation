@@ -12,12 +12,18 @@ def qb_mapping():
         "quantity": "Qty",
         "period": "Period",
         "product": None,
+        # Line-level identity fields for the duplicate fingerprint.
+        "customer": "Customer",
+        "date": "Date",
     }
 
 
 @pytest.fixture
 def inf_mapping():
-    return {"po": "PO", "invoice": "Invoice", "amount": "Amount", "period": "Period"}
+    return {
+        "po": "PO", "invoice": "Invoice", "amount": "Amount", "period": "Period",
+        "customer": "Customer", "date": "Date",
+    }
 
 
 @pytest.fixture

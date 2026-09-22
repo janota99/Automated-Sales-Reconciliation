@@ -345,15 +345,18 @@ def render_result(result: ReconciliationResult) -> None:
 
     posting_status = metrics.get("Posting Status", "READY TO POST")
     if posting_status == "REVIEW REQUIRED":
-        review_hold_qb = int(metrics.get("Duplicate Review Hold QuickBooks Rows", 0))
-        review_hold_amount = metrics.get("Duplicate Review Hold QuickBooks Amount", 0.0)
+        review_hold_qb = int(metrics.get("Final Disposition - Review Hold Rows", 0))
+        review_hold_amount = metrics.get("Final Disposition - Review Hold Amount", 0.0)
         render_notice_panel(
             "Review required before posting",
             (
-                f"{review_hold_qb:,} weak-basis duplicate candidate(s) totaling "
-                f"{format_currency(review_hold_amount)} remained unresolved after matching. They are excluded "
-                "from the proposed journal entry and held in Duplicate Review Hold pending a documented human "
-                "disposition -- see the Unresolved Exceptions sheet in the download."
+                f"{review_hold_qb:,} QuickBooks record(s) totaling {format_currency(review_hold_amount)} are "
+                "on review hold: they could not be safely matched but have duplicate, amount, or reference "
+                "evidence in Infinium, so they are excluded from the proposed journal entry pending a "
+                "documented human disposition -- see the Unresolved Exceptions sheet and the QB Disposition "
+                "Ledger in the downloads."
+                if review_hold_qb
+                else "One or more posting blockers remain -- see the Executive Summary in the analytics download."
             ),
             tone="warning",
             icon="!",
@@ -393,8 +396,8 @@ def render_result(result: ReconciliationResult) -> None:
             )
         with cols[1]:
             render_kpi(
-                "Unresolved QB",
-                format_currency(metrics["Unresolved QuickBooks Amount"]),
+                "Proposed JE (true unmatched)",
+                format_currency(metrics["Proposed JE Amount"]),
                 f"{metrics['Unresolved QuickBooks Rows']:,} transactions",
             )
         with cols[2]:
@@ -461,8 +464,24 @@ def render_result(result: ReconciliationResult) -> None:
             st.caption("No unresolved QuickBooks exceptions remain.")
         else:
             render_limited_dataframe(unresolved, height=440)
-        st.metric("Proposed journal-entry support total", format_currency(metrics["Unresolved QuickBooks Amount"]))
-        st.caption("This is the net signed amount of unresolved QuickBooks transactions. Review credits and reversals before posting.")
+        st.metric("Proposed journal-entry support total", format_currency(metrics["Proposed JE Amount"]))
+        st.caption(
+            "Only TRUE UNMATCHED QuickBooks transactions -- no Infinium support after every matching pass -- "
+            "feed this net signed amount. Review credits and reversals before posting."
+        )
+        held = result.qb_dispositions.loc[result.qb_dispositions["Final Disposition"] == "REVIEW_HOLD"]
+        if not held.empty:
+            st.markdown("#### Review holds (excluded from the journal entry)")
+            render_limited_dataframe(
+                held[["Review ID", "QBO Row ID", "Amount", "Final Reason", "Related Match Ref.", "Related Infinium Row IDs"]],
+                height=260,
+            )
+        st.markdown("#### Final disposition of every QuickBooks row")
+        st.dataframe(
+            result.qb_dispositions.groupby("Final Disposition", as_index=False)
+            .agg(Rows=("QBO Row ID", "count"), Amount=("Amount", "sum")),
+            use_container_width=True, hide_index=True,
+        )
 
     with analytics_tab:
         left, right = st.columns(2)

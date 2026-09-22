@@ -14,15 +14,24 @@ from duplicates import (
     AMOUNT_CENTS,
     NORM_INV,
     NORM_PO,
+    LINE_ID,
     SOURCE_POS,
+    TXN_ID,
     DISPOSITION_REVIEW,
     DISPOSITION_REVIEW_HOLD,
     DISPOSITION_REVIEW_RESOLVED,
     DuplicateScreeningError,
     cents_to_float,
     finalize_review_dispositions,
-    screen_duplicates,
 )
+from duplicates import screen_duplicates as _screen_duplicates
+
+
+def screen_duplicates(*args, **kwargs):
+    """These fixtures fingerprint copies on "Raw Note" -- the one stable field
+    they carry. Screening never looks at any other column."""
+    kwargs.setdefault("fingerprint_columns", ("Raw Note",))
+    return _screen_duplicates(*args, **kwargs)
 
 
 def make_frame(rows, *, index=None, prefix="ROW", notes=None):
@@ -141,6 +150,115 @@ class DuplicateScreeningTests(unittest.TestCase):
         )
         self.assertEqual(result.duplicate_rows, [])
         self.assertEqual(result.suspected_rows, [0])
+
+    def test_only_the_explicit_stable_fields_form_the_fingerprint(self):
+        """Report/export metadata -- row numbers, sequences, timestamps, generated
+        IDs, or any column added later -- neither blocks nor creates a confirmation."""
+        frame = make_frame([("100", "A", 10000)] * 2)
+        frame["Export Row #"] = [7, 8]
+        frame["Import Timestamp"] = ["2026-09-01 10:00", "2026-09-02 11:30"]
+        frame["Generated ID"] = ["g-1", "g-2"]
+        result = self.screen(frame)
+        self.assertEqual(result.duplicate_rows, [1])
+        self.assertEqual(result.report.iloc[0]["Confirmation Basis"], "Stable-field fingerprint (Raw Note)")
+
+    def test_a_real_difference_in_a_stable_field_prevents_confirmation(self):
+        result = self.screen(make_frame([("100", "A", 10000)] * 2, notes=["Acme", "Beta"]))
+        self.assertEqual(result.duplicate_rows, [])
+        self.assertEqual(result.suspected_rows, [0, 1])
+
+    def test_formatting_only_differences_do_not_prevent_confirmation(self):
+        result = self.screen(make_frame([("100", "A", 10000)] * 2, notes=["Acme  Corp", "ACME CORP"]))
+        self.assertEqual(result.duplicate_rows, [1])
+        dates = self.screen(make_frame([("100", "A", 10000)] * 2, notes=["1/5/2026", "2026-01-05"]))
+        self.assertEqual(dates.duplicate_rows, [1])
+        numbers = self.screen(make_frame([("100", "A", 10000)] * 2, notes=[1, 1.0]))
+        self.assertEqual(numbers.duplicate_rows, [1])
+
+    def test_without_enough_identity_evidence_nothing_is_confirmed(self):
+        # Quantity-like context alone is not identity: with a requirement of two
+        # identity-grade fields and none supplied, the rows stay potential duplicates.
+        frame = make_frame([("100", "A", 10000)] * 2)
+        result = self.screen(frame, fingerprint_columns=("Raw Note",), min_identity_fields=2)
+        self.assertEqual(result.duplicate_rows, [])
+        self.assertEqual(result.suspected_rows, [0, 1])
+        self.assertIn("not sufficient", result.report.iloc[0]["Potential Duplicate Reason"])
+
+    def test_two_identity_grade_fields_are_enough_and_weak_fields_are_not(self):
+        frame = make_frame([("100", "A", 10000)] * 2)
+        frame["Customer"] = ["Acme", "Acme"]
+        frame["Date"] = ["2026-01-05", "2026-01-05"]
+        frame["Qty"] = [1, 1]
+        strong = self.screen(
+            frame, fingerprint_columns=("Customer", "Date", "Qty"),
+            identity_columns=("Customer", "Date"), min_identity_fields=2,
+        )
+        self.assertEqual(strong.duplicate_rows, [1])
+        weak = self.screen(
+            frame, fingerprint_columns=("Qty",), identity_columns=(), min_identity_fields=2,
+        )
+        self.assertEqual(weak.duplicate_rows, [])
+        one_field = self.screen(
+            frame, fingerprint_columns=("Customer", "Qty"),
+            identity_columns=("Customer",), min_identity_fields=2,
+        )
+        self.assertEqual(one_field.duplicate_rows, [])
+
+    def test_a_line_level_id_confirms_a_copy_on_its_own_when_nothing_contradicts_it(self):
+        frame = make_frame([("100", "A", 10000)] * 2)
+        frame[LINE_ID] = ["L-1", "L-1"]
+        result = self.screen(frame, fingerprint_columns=(), min_identity_fields=2)
+        self.assertEqual(result.duplicate_rows, [1])
+        self.assertEqual(result.report.iloc[0]["Confirmation Basis"], "Line-level source ID")
+
+    def test_an_id_shared_by_rows_that_differ_is_not_line_level_and_never_confirms(self):
+        # Two different sales lines (different item) share one invoice-level ID.
+        frame = make_frame([("100", "A", 10000)] * 2, notes=["Item X", "Item Y"])
+        frame[LINE_ID] = ["INV-1", "INV-1"]
+        result = self.screen(frame, fingerprint_columns=("Raw Note",))
+        self.assertEqual(result.duplicate_rows, [])
+        self.assertEqual(result.suspected_rows, [0, 1])
+
+    def test_one_contradiction_demotes_the_whole_column(self):
+        frame = make_frame(
+            [("100", "A", 10000), ("100", "A", 10000), ("200", "B", 500), ("200", "B", 500)],
+            notes=["same", "same", "Item X", "Item Y"],
+        )
+        frame[LINE_ID] = ["L-1", "L-1", "INV-9", "INV-9"]
+        result = self.screen(frame, fingerprint_columns=("Raw Note",), min_identity_fields=2)
+        # The second pair shares an ID across different lines, so the column is not
+        # line-level; the first pair's ID therefore cannot confirm it either.
+        self.assertEqual(result.duplicate_rows, [])
+
+    def test_a_transaction_level_id_only_supports_a_fingerprint_match(self):
+        base = make_frame([("100", "A", 10000)] * 2)
+        base["Customer"] = ["Acme", "Acme"]
+        base["Date"] = ["2026-01-05", "2026-01-05"]
+        kwargs = dict(
+            fingerprint_columns=("Customer", "Date"), identity_columns=("Customer", "Date"),
+            min_identity_fields=2,
+        )
+        # Same transaction ID + identical line fingerprint => confirmed.
+        same = base.copy()
+        same[TXN_ID] = ["T-1", "T-1"]
+        result = self.screen(same, **kwargs)
+        self.assertEqual(result.duplicate_rows, [1])
+        self.assertTrue(result.report.iloc[0]["Confirmation Basis"].endswith("+ transaction ID"))
+        # Different transaction IDs => different transactions, however alike.
+        different = base.copy()
+        different[TXN_ID] = ["T-1", "T-2"]
+        self.assertEqual(self.screen(different, **kwargs).duplicate_rows, [])
+        # The same transaction ID with NO line-level evidence is not enough.
+        alone = make_frame([("100", "A", 10000)] * 2)
+        alone[TXN_ID] = ["T-1", "T-1"]
+        self.assertEqual(
+            self.screen(alone, fingerprint_columns=(), min_identity_fields=2).duplicate_rows, [],
+        )
+        # ...and a shared transaction ID never overrides a line-level difference.
+        lines = base.copy()
+        lines[TXN_ID] = ["T-1", "T-1"]
+        lines["Customer"] = ["Acme", "Beta"]
+        self.assertEqual(self.screen(lines, **kwargs).duplicate_rows, [])
 
     def test_screening_does_not_mutate_input(self):
         frame = make_frame([("100", "A", 10000)] * 2)

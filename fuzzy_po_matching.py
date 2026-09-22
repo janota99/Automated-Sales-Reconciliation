@@ -8,9 +8,16 @@ equality (e.g., "DAVID HOPPER LLC" vs. "HOPPER").
 Safeguards applied to circumstantial text matches:
   * The aggregate signed-cent amounts of the matched cluster must agree exactly.
   * Tokens must be alphanumeric. Pure numbers and financial stop-words are ignored.
-  * Intersection ratio: Shared words must account for >= 60% of the shorter string.
-    A word counts as shared if it matches exactly, or is a near-miss typo of a
-    word on the other side (e.g. "ELIOT" vs "ELLIOT") -- see is_fuzzy_po_match.
+  * Whole-word containment: EVERY significant word of the shorter reference must
+    appear, exactly, in the longer one, in either direction (QuickBooks contained
+    in Infinium or the reverse) -- e.g. {TIM, FERRIS} inside {PRIME, STAINLESS,
+    TIM, FERRIS}. Always held for review.
+  * Controlled typo (a SEPARATE, explicitly labeled method -- see
+    find_controlled_typo_matches): exactly one word may differ by exactly one
+    character inserted, deleted, or substituted (e.g. "ELIOT" vs "ELLIOT"),
+    everything else must match exactly, and the match is accepted only when the
+    exact signed amount agrees and there is exactly one qualifying candidate on
+    each side. No similarity percentage or "closest match" is ever used.
   * Temporal anchor: If transaction dates are available, candidates must be
     within 30 days of each other.
   * Isolated clusters: Bipartite graph components are evaluated as a whole. If
@@ -34,7 +41,6 @@ Safeguards applied to circumstantial text matches:
 
 from __future__ import annotations
 
-import difflib
 import re
 from collections import defaultdict
 from typing import Any, Callable, Optional
@@ -48,6 +54,10 @@ __all__ = [
     "FUZZY_PO_EXPLANATION",
     "FUZZY_PO_METHOD",
     "PO_TOKENS",
+    "TYPO_PO_CONFIDENCE",
+    "TYPO_PO_METHOD",
+    "controlled_typo_pair",
+    "find_controlled_typo_matches",
     "find_fuzzy_po_matches",
     "is_fuzzy_po_match",
     "significant_po_tokens",
@@ -60,21 +70,21 @@ FUZZY_PO_METHOD = "Fuzzy PO + Amount (Token Intersection & Aggregate)"
 FUZZY_PO_CONFIDENCE = "Fuzzy"
 FUZZY_PO_EXPLANATION = (
     "Applied only after exact passes left these rows unresolved. The aggregate signed "
-    "amounts agree exactly; the PO comparison requires a strong intersection of significant, "
-    "alphanumeric tokens (excluding stop-words and pure numbers). Matches require temporal "
-    "proximity and avoid single-word generic false positives."
+    "amounts agree exactly; the PO comparison requires every significant whole word of the "
+    "shorter reference to appear in the longer one (either direction; stop-words and pure "
+    "numbers ignored). Matches require temporal proximity, a unique candidate, and avoid "
+    "single-word generic false positives. Always held for review -- never posted automatically."
 )
+
+TYPO_PO_METHOD = "Controlled PO Typo + Exact Amount"
+TYPO_PO_CONFIDENCE = "Typo"
 
 _RE_WORD = re.compile(r"[A-Z]+|[0-9]+")
 _MIN_TOKEN_LENGTH = 3
 _MAX_GROUP_SIZE = 8
 
-# A near-miss token pair must clear this similarity ratio to count as a typo
-# of the same word rather than a different word. Calibrated so a one-character
-# insertion/substitution in a 5-7 letter word matches (e.g. HOPER/HOPPER,
-# ELIOT/ELLIOT both score ~0.91) while distinct-but-similar-looking words stay
-# separate (HOPPER/HOOPER scores 0.833; STONE/STORE and SMITH/SMYTH score 0.80).
-_TYPO_SIMILARITY_THRESHOLD = 0.84
+# A controlled typo needs a meaningful word: both spellings at least this long.
+_MIN_TYPO_TOKEN_LENGTH = 5
 
 # Globally filter lazy data entry and generic corporate entity markers
 _STOP_WORDS = frozenset([
@@ -108,83 +118,81 @@ def significant_po_tokens(value: Any) -> frozenset[str]:
     return frozenset(tokens)
 
 
-def _near_miss_pairs(remaining_a: set[str], remaining_b: set[str]) -> list[tuple[str, str]]:
-    """Greedily pair leftover tokens that are typo-level similar (not exact).
+def _typo_kind(a: str, b: str) -> Optional[str]:
+    """"insertion" / "deletion" / "substitution" if the two words differ by exactly
+    one character, else None. Deterministic edit-distance-one only -- no
+    similarity ratio. Both words must be meaningful (>= 5 letters) and share
+    their first letter: a typo rarely changes it, and requiring it rejects an
+    unrelated word that merely adds a leading letter (SHOPPER vs HOPPER)."""
+    if len(a) < _MIN_TYPO_TOKEN_LENGTH or len(b) < _MIN_TYPO_TOKEN_LENGTH or a == b or a[0] != b[0]:
+        return None
+    if len(a) == len(b):
+        return "substitution" if sum(x != y for x, y in zip(a, b)) == 1 else None
+    longer, shorter = (a, b) if len(a) > len(b) else (b, a)
+    if len(longer) - len(shorter) != 1:
+        return None
+    for position in range(len(longer)):
+        if longer[:position] + longer[position + 1:] == shorter:
+            return "deletion" if longer is a else "insertion"
+    return None
 
-    Candidate pairs are consumed highest-similarity-first so a marginal
-    near-miss never "steals" a token that had a better match available on
-    either side. Pairs must also share a leading character -- a typo rarely
-    changes the first letter, and requiring it excludes an unrelated real
-    word that merely happens to contain the target word (e.g. "SHOPPER" or
-    "CHOPPER" vs "HOPPER" both score ~0.92 on ratio() alone, well past the
-    threshold, despite being different words rather than a misspelling).
-    """
-    candidates = sorted(
-        (
-            (difflib.SequenceMatcher(None, a, b).ratio(), a, b)
-            for a in remaining_a if len(a) >= _MIN_TOKEN_LENGTH
-            for b in remaining_b if len(b) >= _MIN_TOKEN_LENGTH
-            if a[0] == b[0]
-        ),
-        key=lambda item: item[0],
-        reverse=True,
-    )
-    used_a: set[str] = set()
-    used_b: set[str] = set()
-    pairs: list[tuple[str, str]] = []
-    for ratio, a, b in candidates:
-        if ratio < _TYPO_SIMILARITY_THRESHOLD:
-            break
-        if a in used_a or b in used_b:
-            continue
-        used_a.add(a)
-        used_b.add(b)
-        pairs.append((a, b))
-    return pairs
+
+def controlled_typo_pair(
+    tokens_a: frozenset[str], tokens_b: frozenset[str],
+) -> Optional[tuple[str, str]]:
+    """The one (word_a, word_b) pair by which two references differ, if -- and
+    only if -- they are otherwise strongly consistent:
+
+      * the shorter reference is contained in the longer EXCEPT for exactly one
+        word, and exactly one word on the longer side is a one-character typo of
+        it (two possible typo readings means no controlled typo);
+      * a substitution (one letter swapped for another) additionally needs at
+        least one other word that matches exactly, since a lone substituted
+        word is as likely to be a different name (HOPPER vs HOOPER) as a typo;
+      * a lone typo word must be at least six letters in one of its spellings.
+
+    Returns None otherwise. Never a percentage, never "closest wins"."""
+    if not tokens_a or not tokens_b:
+        return None
+    a_is_shorter = len(tokens_a) <= len(tokens_b)
+    shorter, longer = (tokens_a, tokens_b) if a_is_shorter else (tokens_b, tokens_a)
+    exact = shorter & longer
+    unmatched_shorter = shorter - exact
+    if len(unmatched_shorter) != 1:
+        return None
+    (short_word,) = unmatched_shorter
+    readings = [word for word in longer - exact if _typo_kind(short_word, word)]
+    if len(readings) != 1:
+        return None
+    long_word = readings[0]
+    if _typo_kind(short_word, long_word) == "substitution" and not exact:
+        return None
+    if not exact and max(len(short_word), len(long_word)) < 6:
+        return None
+    return (short_word, long_word) if a_is_shorter else (long_word, short_word)
 
 
 def is_fuzzy_po_match(
     tokens_a: frozenset[str], tokens_b: frozenset[str], *, allow_near_miss: bool = True
 ) -> bool:
-    """True if the token sets intersect (exactly, or by typo) with a strong
-    operational ratio.
+    """True if the shorter reference is completely contained, word for word, in
+    the longer -- or, with ``allow_near_miss``, is contained except for one
+    controlled typo (see controlled_typo_pair).
 
-    ``allow_near_miss=False`` restricts the comparison to exact token
-    overlap only -- used to resolve the clean, unambiguous matches in a
-    population before typo-level near-misses are considered at all (see
-    ``find_fuzzy_po_matches``).
-    """
+    ``allow_near_miss=False`` restricts the comparison to exact whole-word
+    containment -- the only rule the (held-for-review) fuzzy pass uses; the typo
+    rule has its own explicitly-labeled pass."""
     if not tokens_a or not tokens_b:
         return False
 
     exact = tokens_a & tokens_b
-    near_misses = _near_miss_pairs(tokens_a - exact, tokens_b - exact) if allow_near_miss else []
-    matched_count = len(exact) + len(near_misses)
-    if not matched_count:
-        return False
-
-    # Prevent single-word generic false positives unless highly specific.
-    if matched_count == 1:
-        if exact:
-            match_word = next(iter(exact))
-            if len(match_word) < 6:
-                return False
-        else:
-            word_a, word_b = near_misses[0]
-            if max(len(word_a), len(word_b)) < 6:
-                return False
-
-    # Require the intersection to cover the majority of the shorter side, so a
-    # short buyer-name note (e.g. "HOPPER") can still match a longer PO field
-    # that fully contains it (e.g. "DAVID HOPPER LLC") -- this is the primary
-    # case this module exists to catch. Matching against the longer side
-    # instead would demand the short side subsume most of the long side too,
-    # which no genuine buyer-name-vs-PO-field pair ever does.
-    # e.g., {"DAVID", "SMITH", "LLC"} vs {"DAVID", "HOPPER"} still fails the ratio
     shorter_len = min(len(tokens_a), len(tokens_b))
-    ratio = matched_count / shorter_len
-
-    return ratio >= 0.60
+    if exact and len(exact) >= shorter_len:
+        # Prevent single-word generic false positives unless highly specific.
+        if len(exact) == 1 and len(next(iter(exact))) < 6:
+            return False
+        return True
+    return allow_near_miss and controlled_typo_pair(tokens_a, tokens_b) is not None
 
 
 def _build_candidate_edges(
@@ -334,13 +342,10 @@ def find_fuzzy_po_matches(
     Isolates connected components and clears them if the component's aggregate
     QuickBooks sum exactly equals its Infinium sum.
 
-    Resolved in two tiers so a typo-level near-miss can never contaminate a
-    clean exact match: an unrelated row elsewhere in the population that
-    merely *resembles* a real token (e.g. "SHOPPER" near-missing "HOPPER")
-    would otherwise pull a valid, self-contained 1:1 pair into a larger,
-    unbounded or non-tying component and void the whole cluster. Exact-token
-    components are found and accepted first; only the rows still unclaimed
-    afterward are considered for near-miss (typo-level) matching.
+    Only exact whole-word containment is used here; a typo-level difference
+    is handled by find_controlled_typo_matches, a separate, explicitly labeled
+    pass, so a near-miss can never pull a self-contained exact pair into a
+    larger cluster and void it.
     """
     q_rows = sorted(remaining_q, key=lambda idx: qb.at[idx, SOURCE_POS])
     i_rows = sorted(remaining_i, key=lambda idx: inf.at[idx, SOURCE_POS])
@@ -351,15 +356,48 @@ def find_fuzzy_po_matches(
     )
     accepted_groups = _resolve_components(qb, inf, exact_edges)
 
-    claimed_q = {q for q_group, _ in accepted_groups for q in q_group}
-    claimed_i = {i for _, i_group in accepted_groups for i in i_group}
-    leftover_q = [qidx for qidx in q_rows if qidx not in claimed_q]
-    leftover_i = [iidx for iidx in i_rows if iidx not in claimed_i]
-
-    near_miss_edges = _build_candidate_edges(
-        qb, inf, leftover_q, leftover_i, qb_date_col, inf_date_col, max_days_variance,
-        match_fn=lambda a, b: is_fuzzy_po_match(a, b, allow_near_miss=True),
-    )
-    accepted_groups.extend(_resolve_components(qb, inf, near_miss_edges))
-
     return accepted_groups
+
+def find_controlled_typo_matches(
+    qb: pd.DataFrame,
+    inf: pd.DataFrame,
+    remaining_q: set[int],
+    remaining_i: set[int],
+) -> tuple[list[tuple[int, int, tuple[str, str]]], dict[int, list[int]]]:
+    """Controlled PO-typo matches within the remaining unmatched population.
+
+    A (QuickBooks, Infinium) pair qualifies only if the signed amounts agree
+    EXACTLY row for row and the two PO references differ by exactly one
+    controlled typo (see controlled_typo_pair). A pair is accepted only when each
+    side has exactly one qualifying candidate; a row with more than one -- or
+    whose single candidate is also claimed by another row -- is NOT matched, and
+    is returned in the review mapping (QuickBooks index -> candidate Infinium
+    indexes) so it can be sent to a reviewer instead of guessed.
+    """
+    q_candidates: dict[int, list[int]] = defaultdict(list)
+    i_candidates: dict[int, list[int]] = defaultdict(list)
+    typo_words: dict[tuple[int, int], tuple[str, str]] = {}
+    q_rows = sorted(remaining_q, key=lambda idx: qb.at[idx, SOURCE_POS])
+    i_rows = sorted(remaining_i, key=lambda idx: inf.at[idx, SOURCE_POS])
+    for qidx in q_rows:
+        q_amount, q_tokens = qb.at[qidx, AMOUNT_CENTS], qb.at[qidx, PO_TOKENS]
+        if pd.isna(q_amount) or not q_tokens:
+            continue
+        for iidx in i_rows:
+            i_amount, i_tokens = inf.at[iidx, AMOUNT_CENTS], inf.at[iidx, PO_TOKENS]
+            if pd.isna(i_amount) or not i_tokens or int(q_amount) != int(i_amount):
+                continue
+            pair = controlled_typo_pair(q_tokens, i_tokens)
+            if pair is not None:
+                q_candidates[qidx].append(iidx)
+                i_candidates[iidx].append(qidx)
+                typo_words[(qidx, iidx)] = pair
+
+    accepted: list[tuple[int, int, tuple[str, str]]] = []
+    review: dict[int, list[int]] = {}
+    for qidx, candidates in q_candidates.items():
+        if len(candidates) == 1 and len(i_candidates[candidates[0]]) == 1:
+            accepted.append((qidx, candidates[0], typo_words[(qidx, candidates[0])]))
+        else:
+            review[qidx] = list(candidates)
+    return accepted, review

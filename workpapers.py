@@ -94,6 +94,7 @@ from matching import (
     INF_ID,
     PRIOR_PERIOD_URGENT_THRESHOLD,
     QB_ID,
+    REFERENCE_HOLD_SECTION,
     ReconciliationResult,
     build_fiscal_exception_summary,
     cents_or_zero,
@@ -613,13 +614,24 @@ _MATCHED_SECTIONS = frozenset({"01 Matched", "01 Matched - Historical Clearance"
 _QB_DUPLICATE_EXCLUDED_SECTION = "04 Duplicate QuickBooks"
 
 
+_QB_REVIEW_HOLD_SECTIONS = frozenset({
+    "06 Duplicate Review Hold QuickBooks",
+    "08 Reference-Matched Amount Variance Review Hold",
+    "09 Fuzzy Match Review Hold",
+    "10 Ambiguous Duplicate QuickBooks",
+    REFERENCE_HOLD_SECTION,
+})
+
+
 def qb_record_outcomes(result: ReconciliationResult) -> dict[str, int]:
-    """Every primary QuickBooks record falls into exactly one outcome:
-    reconciled (an accepted match, including a prior-period clearance), an
-    excluded duplicate copy, or unresolved (everything else, all of which
-    needs a reviewer). Counted from the same paired rows the sheet lists, so
-    the control strip can never disagree with the rows beneath it."""
-    records = reconciled = excluded = 0
+    """Every primary QuickBooks record falls into exactly one outcome -- the
+    same four final dispositions the disposition ledger records: reconciled
+    (an accepted match, including a prior-period clearance), an excluded
+    exact duplicate, a review hold (withheld from the journal entry pending a
+    decision), or a true unmatched transaction (the only kind that feeds the
+    JE). Counted from the same paired rows the sheet lists, so the control
+    strip can never disagree with the rows beneath it."""
+    records = reconciled = excluded = review_hold = 0
     for row in result.paired_rows:
         if row.get("QB Index") is None or row.get("QB Record Scope") != "Primary":
             continue
@@ -629,18 +641,21 @@ def qb_record_outcomes(result: ReconciliationResult) -> dict[str, int]:
             reconciled += 1
         elif section == _QB_DUPLICATE_EXCLUDED_SECTION:
             excluded += 1
+        elif section in _QB_REVIEW_HOLD_SECTIONS:
+            review_hold += 1
     return {
         "records": records,
         "reconciled": reconciled,
         "excluded": excluded,
-        "unresolved": records - reconciled - excluded,
+        "review_hold": review_hold,
+        "unmatched": records - reconciled - excluded - review_hold,
     }
 
 
 def _control_strip_text(result: ReconciliationResult) -> str:
-    """"661 QuickBooks records | 449 reconciled | 67.9% | 208 unresolved |
-    4 duplicates excluded | JE support: $747,822.02" -- the run's outcome in
-    one line, above the detail it summarizes."""
+    """"661 QuickBooks records | 449 reconciled | 67.9% | 30 review hold |
+    178 unmatched | 4 duplicates excluded | JE support: $747,822.02" -- the
+    run's outcome in one line, above the detail it summarizes."""
     outcomes = qb_record_outcomes(result)
     rate = outcomes["reconciled"] / outcomes["records"] * 100 if outcomes["records"] else 0.0
     noun = "record" if outcomes["records"] == 1 else "records"
@@ -649,7 +664,8 @@ def _control_strip_text(result: ReconciliationResult) -> str:
         f"{outcomes['records']:,} QuickBooks {noun}",
         f"{outcomes['reconciled']:,} reconciled",
         f"{rate:.1f}%",
-        f"{outcomes['unresolved']:,} unresolved",
+        f"{outcomes['review_hold']:,} review hold",
+        f"{outcomes['unmatched']:,} unmatched",
         f"{outcomes['excluded']:,} {duplicates} excluded",
         f"JE support: {format_currency(result.metrics['Unresolved QuickBooks Amount'])}",
     ))
@@ -1001,6 +1017,36 @@ def _simplify_ambiguous_duplicate_display(frame: pd.DataFrame) -> pd.DataFrame:
     return simplified
 
 
+def _simplify_reference_hold_display(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce a reference_hold_analysis-shaped frame (see
+    build_reference_evidence_review_holds in matching.py) to the reviewer-
+    facing columns: what was held and why, the match it points at, and the
+    amounts. The full record stays on result.reference_hold_analysis."""
+    columns = [
+        "Hold ID", "QuickBooks Row ID", "Why Held", "PO / Invoice", "Referenced Match Ref.",
+        "Related Infinium Row IDs", "QuickBooks Amount", "Infinium Amount", "Difference",
+        "Reviewer Note",
+    ]
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    simplified = pd.DataFrame({
+        "Hold ID": frame["Hold ID"].values,
+        "QuickBooks Row ID": frame["QuickBooks Row ID"].values,
+        "Why Held": frame["Classification"].values,
+        "PO / Invoice": [
+            f"{po or '(blank)'} / {invoice or '(blank)'}"
+            for po, invoice in zip(frame["Normalized PO"], frame["Normalized Invoice"])
+        ],
+        "Referenced Match Ref.": frame["Related Match Ref."].values,
+        "Related Infinium Row IDs": frame["Related Infinium Row IDs"].values,
+        "QuickBooks Amount": frame["QuickBooks Amount"].values,
+        "Infinium Amount": frame["Infinium Amount"].values,
+        "Difference": frame["Amount Difference"].values,
+    })
+    simplified["Reviewer Note"] = ""
+    return simplified
+
+
 def _simplify_po_reuse_display(frame: pd.DataFrame) -> pd.DataFrame:
     """Reduce a po_reuse_errors-shaped frame (see build_po_reuse_errors in
     matching.py) to the reviewer-facing grouped detail columns -- plain-
@@ -1218,6 +1264,16 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ambiguous_count = result.metrics["Ambiguous Duplicate QuickBooks Rows"]
     ambiguous_qb_amount = result.metrics["Ambiguous Duplicate QuickBooks Amount"]
 
+    # Reference-evidence review holds (see build_reference_evidence_review_holds
+    # in matching.py): unmatched rows that nevertheless have reference evidence
+    # in Infinium -- a PO/invoice an accepted match already represents, an
+    # amount conflict, a non-unique candidate. Withheld from the proposed JE.
+    reference_frame = _simplify_reference_hold_display(result.reference_hold_analysis)
+    reference_headers = list(reference_frame.columns)
+    reference_end_col = len(reference_headers)
+    reference_hold_count = result.metrics["Reference Review Hold QuickBooks Rows"]
+    reference_hold_amount = result.metrics["Reference Review Hold QuickBooks Amount"]
+
     # PO Re-use Error (see build_po_reuse_errors in matching.py): a
     # normalized PO reused across 2+ still-unresolved QuickBooks rows whose
     # grouped total does not tie exactly to the grouped Infinium total for
@@ -1243,14 +1299,11 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws, 1, 1, end_col,
         f"{_fiscal_period_prefix(result)} | QUICKBOOKS EXCEPTIONS | JOURNAL ENTRY SUPPORT", NAVY,
     )
-    invalid_unresolved = sum(
-        1 for idx in result.unmatched_qb if not valid_cents(result.qb_work.at[idx, AMOUNT_CENTS])
-    )
     _write_caption_band(
         ws, 2, 1, end_col,
-        f"QuickBooks is the sole accrual and proposed-journal-entry basis. Net signed support excludes "
-        f"{invalid_unresolved} row(s) with invalid or missing amounts. Review every exception before posting. "
-        f"Generated {format_central_timestamp(result.run_timestamp)}.",
+        f"Only TRUE UNMATCHED QuickBooks transactions -- no Infinium support after every matching pass -- feed the "
+        f"proposed journal entry. Duplicates and review holds are excluded and itemized below. "
+        f"Review every exception before posting. Generated {format_central_timestamp(result.run_timestamp)}.",
         NAVY,
     )
     duplicate_caption = (
@@ -1460,6 +1513,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     dup_data_row = dup_header_row + 1
     section_end_col = max(
         end_col, dup_end_col, review_end_col, variance_end_col, ambiguous_end_col, po_reuse_end_col,
+        reference_end_col,
     )
 
     _write_title_band(
@@ -1535,18 +1589,19 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     review_section_end_col = section_end_col
 
     review_caption = (
-        f"{review_hold_count:,} weak-basis duplicate candidate(s) (sharing only a PO or only an "
-        "invoice with another QuickBooks row at the same signed amount) remained unresolved after "
-        "every matching pass. Rather than silently inflating the accrual, each is excluded from the "
-        "JE support total above and held here pending a documented human decision -- confirm as a "
-        "genuine duplicate, confirm as legitimate and add to the JE manually, or escalate for "
-        "investigation -- before this journal entry is posted."
+        f"{review_hold_count:,} potential duplicate(s): each shares its duplicate key (PO, invoice, and "
+        "signed amount -- or only a PO or only an invoice) with another QuickBooks row, but nothing "
+        "establishes that it is a copy of the same underlying transaction, so it was never discarded. "
+        "It is excluded from the JE support total above and held here, with the row it may duplicate, "
+        "pending a documented human decision -- confirm as a genuine duplicate, confirm as a legitimate "
+        "repeated sale and add to the JE manually, or escalate for investigation -- before this "
+        "journal entry is posted."
         if review_hold_count
-        else "No QuickBooks weak-basis duplicate candidates remain unresolved."
+        else "No QuickBooks potential duplicates remain unresolved."
     )
     _write_title_band(
         ws, review_title_row, 1, review_section_end_col,
-        "DUPLICATE REVIEW HOLD | REQUIRES DOCUMENTED DISPOSITION BEFORE POSTING", SLATE,
+        "POTENTIAL DUPLICATE REVIEW HOLD | REQUIRES DOCUMENTED DISPOSITION BEFORE POSTING", SLATE,
     )
     _write_caption_band(ws, review_caption_row, 1, review_section_end_col, review_caption, SLATE)
 
@@ -1801,13 +1856,87 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
                 f"{ambiguous_note_letter}{ambiguous_data_row}:{ambiguous_note_letter}{ambiguous_last_row}"
             )
 
+    # Reference-evidence review hold: an unmatched QuickBooks row that has
+    # reference evidence in Infinium is "cannot safely match", which is not
+    # "does not exist in Infinium" -- so it is itemized here, out of the
+    # proposed journal entry, with the match it points at (a live link).
+    reference_title_row = ambiguous_last_row + 3
+    reference_caption_row = reference_title_row + 1
+    reference_kpi_label_row = reference_title_row + 2
+    reference_kpi_value_row = reference_title_row + 3
+    reference_header_row = reference_title_row + 5
+    reference_data_row = reference_header_row + 1
+    reference_caption = (
+        f"{reference_hold_count:,} row(s) could not be matched but DO have reference evidence in Infinium: "
+        "a PO or invoice an accepted match already represents, a single candidate whose amount differs, "
+        "or a candidate that is not uniquely available. That is not proof the transaction is missing, so "
+        "each is withheld from the proposed JE until a reviewer documents a decision."
+        if reference_hold_count
+        else "No unmatched QuickBooks row has reference evidence in Infinium; nothing is held here."
+    )
+    _write_title_band(
+        ws, reference_title_row, 1, section_end_col,
+        "REVIEW HOLD | REFERENCE EVIDENCE IN INFINIUM - NOT ACCRUED", SLATE,
+    )
+    _write_caption_band(ws, reference_caption_row, 1, section_end_col, reference_caption, SLATE)
+    reference_kpis = [
+        ("Items held for review", reference_hold_count, ACCOUNTING_COUNT_FORMAT),
+        ("QuickBooks amount withheld", reference_hold_amount, ACCOUNTING_CURRENCY_FORMAT),
+        ("JE inclusion", "Excluded - not accrued", 'General'),
+    ]
+    _write_kpi_band(ws, reference_kpi_label_row, reference_kpi_value_row, reference_kpis, reference_end_col)
+    _write_dataframe_values(ws, reference_frame, reference_header_row, 1)
+    _format_header(
+        ws, reference_header_row, 1, reference_end_col, SLATE,
+        headers=reference_headers,
+        amount_columns={"QuickBooks Amount", "Infinium Amount", "Difference"},
+    )
+    referenced_header_col = reference_headers.index("Referenced Match Ref.") + 1
+    ws.cell(reference_header_row, referenced_header_col).alignment = Alignment(
+        horizontal="center", vertical="center", wrap_text=True,
+    )
+    if len(reference_frame):
+        reference_last_row = reference_data_row + len(reference_frame) - 1
+        _format_body_block(ws, reference_data_row, reference_last_row, 1, reference_end_col, SLATE_LIGHT)
+        _apply_number_formats(
+            ws, reference_headers, reference_data_row, reference_last_row, 1,
+            {"QuickBooks Amount", "Infinium Amount", "Difference"}, set(),
+        )
+        why_col = reference_headers.index("Why Held") + 1
+        row_id_col = reference_headers.index("QuickBooks Row ID") + 1
+        note_col = reference_headers.index("Reviewer Note") + 1
+        for offset, record in enumerate(reference_frame.to_dict("records")):
+            row = reference_data_row + offset
+            ws.cell(row, why_col).fill = PatternFill("solid", fgColor=AMBER)
+            ws.cell(row, why_col).alignment = Alignment(wrap_text=True, vertical="center")
+            _apply_row_id_hyperlink(ws, row, row_id_col, qb_id_row_map.get(str(record["QuickBooks Row ID"])))
+            pointer = record["Referenced Match Ref."]
+            if pointer and detail_ref_letter:
+                _style_match_ref_link(ws.cell(row, referenced_header_col), pointer, detail_ref_letter)
+            else:
+                ws.cell(row, referenced_header_col).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row, note_col).protection = Protection(locked=False)
+        reference_validation = DataValidation(
+            type="textLength", operator="lessThanOrEqual", formula1="1000", allow_blank=True
+        )
+        reference_validation.error = "Reviewer notes are limited to 1,000 characters."
+        reference_validation.errorTitle = "Note too long"
+        ws.add_data_validation(reference_validation)
+        note_letter = get_column_letter(note_col)
+        reference_validation.add(f"{note_letter}{reference_data_row}:{note_letter}{reference_last_row}")
+    else:
+        reference_last_row = reference_header_row
+    _set_widths(ws, 1, reference_end_col, reference_header_row, reference_last_row)
+    ws.column_dimensions[get_column_letter(reference_headers.index("Why Held") + 1)].width = 52
+    ws.column_dimensions[get_column_letter(reference_headers.index("Reviewer Note") + 1)].width = 36
+
     # PO Re-use Error: unlike every section above, these rows are NOT
     # withheld from the accrual -- they already appear, and are already
     # counted, in the QuickBooks exceptions table at the top of this
     # sheet. This section is purely supplementary grouped detail (PO,
     # QuickBooks total, Infinium total, difference, row counts) so a
     # reused PO doesn't read as several unrelated individual exceptions.
-    po_reuse_title_row = ambiguous_last_row + 3
+    po_reuse_title_row = reference_last_row + 3
     po_reuse_caption_row = po_reuse_title_row + 1
     po_reuse_kpi_label_row = po_reuse_title_row + 2
     po_reuse_kpi_value_row = po_reuse_title_row + 3
@@ -1818,16 +1947,16 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     po_reuse_caption = (
         f"{po_reuse_group_count:,} PO(s) appear more than once in the unresolved QuickBooks pool "
         "with a grouped total that does not tie exactly to the grouped Infinium total for the same "
-        "PO. These rows are already included in the QuickBooks exceptions table and accrual total "
-        "above -- this section only shows the grouped PO detail so the pattern is traceable instead "
-        "of reading as several unrelated individual exceptions."
+        "PO. A row with Infinium evidence for its PO is held (see the Review Hold section) and is not "
+        "accrued; a row with none remains in the exceptions table. This section shows the grouped PO "
+        "detail so the pattern is traceable instead of reading as several unrelated exceptions."
         if po_reuse_group_count
         else "No PO Re-use Errors were identified (every PO repeated in the unresolved QuickBooks "
         "pool either ties exactly to Infinium -- and was already matched -- or appears only once)."
     )
     _write_title_band(
         ws, po_reuse_title_row, 1, po_reuse_section_end_col,
-        "PO RE-USE ERROR | GROUPED DETAIL - ALREADY INCLUDED IN ACCRUAL ABOVE", SLATE,
+        "PO RE-USE ERROR | GROUPED DETAIL - HELD WHEN INFINIUM HAS EVIDENCE", SLATE,
     )
     _write_caption_band(ws, po_reuse_caption_row, 1, po_reuse_section_end_col, po_reuse_caption, SLATE)
 
@@ -2048,11 +2177,23 @@ def _legacy_reference_label(record: dict) -> Optional[str]:
         return f"Review: {basis} Already Used by {describe_match_references(references)}"
     if basis == "Record":
         return f"Infinium Record Already Assigned to {describe_match_references(references)}"
+    if record.get("Section") in _LEGACY_DUPLICATE_SECTIONS:
+        return f"Exact Duplicate of {describe_match_references(references)} - Excluded"
     return f"Potential Duplicate of {describe_match_references(references)}"
 
 
 def _split_cell_references(text: Any) -> list[str]:
     return [piece.strip() for piece in str(text or "").split(";") if piece.strip()]
+
+
+_LEGACY_REFERENCE_HOLD_LABELS = {
+    "REVIEW_HOLD_AMOUNT_VARIANCE": "Amount Differs: Same PO/Invoice",
+    "REVIEW_HOLD_EXACT_CANDIDATE_NOT_UNIQUE": "Review: Exact Candidate Not Unique",
+    "REVIEW_HOLD_MULTIPLE_CANDIDATES": "Potential Duplicate: Multiple Infinium Candidates",
+    "REVIEW_HOLD_INVALID_AMOUNT": "Review: Invalid Amount",
+    "REVIEW_HOLD_CANDIDATE_INVALID_AMOUNT": "Review: Candidate Amount Invalid",
+    "REVIEW_HOLD_PO_ALREADY_REPRESENTED": "Review: PO Already Represented",
+}
 
 
 def _legacy_match_method_label(record: dict) -> str:
@@ -2086,6 +2227,8 @@ def _legacy_match_method_label(record: dict) -> str:
         return "Amount Differs: Same PO/Invoice"
     if section == "10 Ambiguous Duplicate QuickBooks":
         return "Potential Duplicate: Multiple Infinium Candidates"
+    if section == REFERENCE_HOLD_SECTION:
+        return _LEGACY_REFERENCE_HOLD_LABELS.get(str(record.get("Reason Code")), match_result)
     return match_result
 
 
@@ -2897,6 +3040,7 @@ _DATA_SEARCH_STATUS_BY_SECTION = {
     "07 Duplicate Review Hold Infinium": "Duplicate",
     "08 Reference-Matched Amount Variance Review Hold": "Error",
     "09 Fuzzy Match Review Hold": "Fuzzy Match",
+    REFERENCE_HOLD_SECTION: "Review Hold",
 }
 
 _DATA_SEARCH_MATCH_TYPE_SECTIONS = {
@@ -3216,7 +3360,7 @@ def build_analytics_summary_sheet(wb: Workbook, result: ReconciliationResult) ->
         ("QuickBooks rows", result.metrics["QuickBooks Rows"], '#,##0'),
         ("Infinium rows", result.metrics["Infinium Rows"], '#,##0'),
         ("QB match rate", result.metrics["QuickBooks Match Rate by Row"], '0.0%'),
-        ("Unresolved QB amount", result.metrics["Unresolved QuickBooks Amount"], '$#,##0.00;[Red]($#,##0.00);-'),
+        ("Proposed JE (true unmatched)", result.metrics["Proposed JE Amount"], '$#,##0.00;[Red]($#,##0.00);-'),
         ("QB source total", result.metrics["QuickBooks Source Total"], '$#,##0.00;[Red]($#,##0.00);-'),
         ("Infinium source total", result.metrics["Infinium Source Total"], '$#,##0.00;[Red]($#,##0.00);-'),
         ("Matched amount difference", result.metrics["Matched Amount Difference"], '$#,##0.00;[Red]($#,##0.00);-'),
@@ -3297,6 +3441,14 @@ def build_analytics_workbook(result: ReconciliationResult) -> bytes:
         "amounts. Every Match Ref. and Referenced Match Ref. shown anywhere in the generated workbooks "
         "is listed here.",
         result.match_register, SLATE,
+    )
+    _add_standard_data_sheet(
+        wb, "QB Disposition Ledger", "QUICKBOOKS DISPOSITION LEDGER",
+        "Every QuickBooks source row appears exactly once with one final disposition -- MATCHED, "
+        "EXACT_QBO_DUPLICATE_EXCLUDED, REVIEW_HOLD, or TRUE_UNMATCHED -- and the precise reason. Only "
+        "TRUE_UNMATCHED rows feed the proposed journal entry; the row and dollar totals of these "
+        "dispositions are proven equal to the source in the Executive Summary controls.",
+        result.qb_dispositions, SLATE,
     )
     _add_standard_data_sheet(
         wb, "Detailed Match Ledger", "DETAILED MATCH Ledger",

@@ -32,11 +32,12 @@ def _reconcile(qb_rows, inf_rows, qb_mapping, inf_mapping, make_metadata, **kwar
 
 
 def _qb(po, invoice, amount, period="1"):
-    return {"PO": po, "Invoice": invoice, "Amount": amount, "Qty": 1, "Period": period}
+    return {"PO": po, "Invoice": invoice, "Amount": amount, "Qty": 1, "Period": period, "Customer": "Acme", "Date": "2026-01-05"}
 
 
 def _inf(po, invoice, amount, period="1"):
-    return {"PO": po, "Invoice": invoice, "Amount": amount, "Period": period}
+    return {"PO": po, "Invoice": invoice, "Amount": amount, "Period": period,
+            "Customer": "Acme", "Date": "2026-01-05"}
 
 
 def _rows(result, section):
@@ -135,7 +136,7 @@ def test_grouped_and_one_to_one_matches_are_numbered_in_separate_series(
 
 
 def test_match_reference_padding_widens_past_999(qb_mapping, inf_mapping):
-    rows = [{"PO": f"PO{i}", "Invoice": f"INV{i}", "Amount": float(i), "Qty": 1, "Period": "1"}
+    rows = [{"PO": f"PO{i}", "Invoice": f"INV{i}", "Amount": float(i), "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}
             for i in range(1, 1002)]
     qb = prepare_working_frame(pd.DataFrame(rows), qb_mapping, "QB", 2026)
     inf = prepare_working_frame(pd.DataFrame(rows).drop(columns=["Qty"]), inf_mapping, "INF", 2026)
@@ -238,15 +239,18 @@ def test_exception_with_a_consumed_po_names_the_exact_match(qb_mapping, inf_mapp
         [_inf("PO-USED", "INV-A", 100.00)],
         qb_mapping, inf_mapping, make_metadata,
     )
-    (row,) = _rows(result, "02 Unmatched QuickBooks")
+    # "PO already used" is not a missing transaction: the row is held out of the
+    # proposed JE, and says exactly which match already represents it.
+    assert _rows(result, "02 Unmatched QuickBooks") == []
+    (row,) = _rows(result, "11 Review Hold QuickBooks")
     assert row["Match Ref."] == ""
     assert row["Referenced Match Ref."] == "M-001"
-    assert row["Match Result"] == "Review: PO already used by Match M-001."
+    assert row["Match Result"] == "Review Hold — PO Already Represented by Match M-001"
     assert row["Reference Basis"] == "PO"
-    # Still an unresolved exception, with its existing cause and accrual treatment.
     assert "Potential Duplicate - Reference already used by another match" in row["Exception Cause"]
-    assert row["Financial Treatment"] == "Included in provisional QuickBooks accrual support"
-    assert result.unmatched_qb == [1]
+    assert row["Financial Treatment"] == "Excluded from automatic JE pending documented disposition"
+    assert result.unmatched_qb == [] and result.reference_hold_qb_rows == [1]
+    assert result.metrics["Proposed JE Amount"] == pytest.approx(0.0)
     (candidate,) = result.candidates.to_dict("records")
     assert candidate["Disposition"] == "Review: PO already used by Match M-001."
 
@@ -259,9 +263,9 @@ def test_exception_pointing_at_a_grouped_match_cites_the_group_reference(
         [_inf("PO-G", "", 150.00)],
         qb_mapping, inf_mapping, make_metadata,
     )
-    (row,) = _rows(result, "02 Unmatched QuickBooks")
+    (row,) = _rows(result, "11 Review Hold QuickBooks")
     assert row["Referenced Match Ref."] == "G-001"
-    assert row["Match Result"] == "Review: Candidate belongs to Group Match G-001."
+    assert row["Match Result"] == "Review Hold — Group Candidate Already Represented by Group Match G-001"
     assert row["Match Ref."] == ""
 
 
@@ -273,13 +277,14 @@ def test_duplicate_of_a_matched_record_cites_the_original_match(qb_mapping, inf_
     )
     matched = _rows(result, "01 Matched")
     assert len(matched) == 1 and matched[0]["Match Ref."] == "M-001"
-    (other,) = _rows(result, "02 Unmatched QuickBooks")
+    # An exact duplicate is excluded before matching -- never left as a fresh exception.
+    assert _rows(result, "02 Unmatched QuickBooks") == []
+    (other,) = _rows(result, "04 Duplicate QuickBooks")
     assert other["Match Ref."] == ""                      # not a new accepted match
     assert other["Referenced Match Ref."] == "M-001"
     # The reference names the original match and keeps the duplicate basis.
-    message = "Potential duplicate of Match M-001 (same PO, Invoice, and Amount)."
-    assert message in other["Explanation"]
-    assert other["Match Result"] == message
+    assert "Exact duplicate of Match M-001 (same PO, Invoice, and Amount)." in other["Explanation"]
+    assert other["Match Result"] == "Excluded excess QuickBooks copy"
     assert other["Reference Basis"] == "Duplicate"
     # The duplicate audit report points at the same match.
     referenced = result.duplicate_analysis.set_index("Source Row ID")["Referenced Match Ref."]
@@ -297,7 +302,7 @@ def test_excluded_infinium_duplicate_cites_the_match_of_its_retained_copy(
     (excess,) = _rows(result, "05 Duplicate Infinium")
     assert excess["Match Ref."] == ""
     assert excess["Referenced Match Ref."] == "M-001"
-    assert "Potential duplicate of Match M-001 (same PO, Invoice, and Amount)." in excess["Explanation"]
+    assert "Exact duplicate of Match M-001 (same PO, Invoice, and Amount)." in excess["Explanation"]
 
 
 def test_unrelated_exceptions_carry_no_referenced_match(qb_mapping, inf_mapping, make_metadata):
@@ -368,7 +373,7 @@ def test_control_rejects_different_references_within_one_grouped_relationship(re
 
 def test_control_rejects_a_reference_on_an_unmatched_record(referenced_result):
     def leak(result):
-        next(r for r in result.paired_rows if r["Section"] == "02 Unmatched QuickBooks")["Match Ref."] = "M-001"
+        next(r for r in result.paired_rows if r["Section"] == "11 Review Hold QuickBooks")["Match Ref."] = "M-001"
     _expect_failure(referenced_result, leak, "is not an accepted match but shows reference M-001")
 
 
@@ -440,9 +445,11 @@ def test_references_do_not_change_any_matching_decision_or_total(referenced_resu
         ((3,), (2,), "PO + Invoice + Amount"),
     ] or len(matched_pairs) == 3
     assert result.metrics["Control Status"] == "PASS"
-    # Two QuickBooks rows stay unresolved exceptions: the duplicate of a
-    # matched row and the row whose PO a match already used -- both still accrued.
-    assert sorted(result.unmatched_qb) == [4, 5]
-    assert result.metrics["Unresolved QuickBooks Rows"] == 2
-    assert result.metrics["Unresolved QuickBooks Amount"] == pytest.approx(25.00)
+    # The exact duplicate of a matched row is excluded, and the row whose PO a
+    # match already used is held -- neither feeds the proposed JE.
+    assert result.duplicate_qb_rows == [4] and result.reference_hold_qb_rows == [5]
+    assert result.unmatched_qb == []
+    assert result.metrics["Duplicate QuickBooks Amount"] == pytest.approx(20.00)
+    assert result.metrics["Reference Review Hold QuickBooks Amount"] == pytest.approx(5.00)
+    assert result.metrics["Proposed JE Amount"] == pytest.approx(0.00)
     assert len(result.matches) == len(result.match_register) == 3

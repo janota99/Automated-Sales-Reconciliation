@@ -35,6 +35,11 @@ from duplicates import (
     NORM_INV,
     NORM_PO,
     SOURCE_POS,
+    IDENTITY_GRADE_ROLES,
+    LINE_ID,
+    MIN_IDENTITY_FIELDS,
+    STABLE_FINGERPRINT_ROLES,
+    TXN_ID,
     combine_duplicate_reports,
     finalize_review_dispositions,
     screen_duplicates,
@@ -44,6 +49,9 @@ from fuzzy_po_matching import (
     FUZZY_PO_EXPLANATION,
     FUZZY_PO_METHOD,
     PO_TOKENS,
+    TYPO_PO_CONFIDENCE,
+    TYPO_PO_METHOD,
+    find_controlled_typo_matches,
     find_fuzzy_po_matches,
     significant_po_tokens,
 )
@@ -66,7 +74,15 @@ __all__ = [
     "MATCHING_RULE_VERSION",
     "PO_REUSE_ERROR_COLUMNS",
     "QB_ID",
+    "DISPOSITION_DUPLICATE_EXCLUDED",
+    "DISPOSITION_MATCHED",
+    "DISPOSITION_REVIEW_HOLD",
+    "DISPOSITION_TRUE_UNMATCHED",
+    "FINAL_DISPOSITIONS",
+    "QB_DISPOSITION_COLUMNS",
     "REFERENCED_MATCH_REF_COLUMN",
+    "REFERENCE_HOLD_COLUMNS",
+    "REFERENCE_HOLD_SECTION",
     "ReconciliationResult",
     "add_duplicate_report_references",
     "apply_referenced_match_references",
@@ -74,6 +90,8 @@ __all__ = [
     "describe_match_references",
     "build_ambiguous_duplicate_candidates",
     "build_fiscal_exception_summary",
+    "build_qb_dispositions",
+    "build_reference_evidence_review_holds",
     "build_po_reuse_errors",
     "build_reference_amount_variances",
     "build_reconciliation",
@@ -226,6 +244,9 @@ class ReconciliationResult:
     fuzzy_match_review_hold_analysis: pd.DataFrame = field(default_factory=pd.DataFrame)
     fuzzy_match_review_hold_qb_rows: list[int] = field(default_factory=list)
     fuzzy_match_review_hold_inf_rows: list[int] = field(default_factory=list)
+    reference_hold_analysis: pd.DataFrame = field(default_factory=pd.DataFrame)
+    reference_hold_qb_rows: list[int] = field(default_factory=list)
+    qb_dispositions: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @lru_cache(maxsize=4096)
@@ -401,6 +422,24 @@ def fiscal_label(value: Any, default_year: int) -> str:
     return f"P{period:02d}-{year}" if period is not None else "Unspecified"
 
 
+def _fingerprint_columns(mapping: Optional[dict[str, Optional[str]]]) -> tuple[str, ...]:
+    """The source columns that form the duplicate fingerprint: only the mapped
+    stable line-level transaction attributes (customer, date, item, quantity,
+    rate) -- an explicit, fixed set, never "all the other columns", and never
+    the fiscal period."""
+    if not mapping:
+        return ()
+    return tuple(mapping[role] for role in STABLE_FINGERPRINT_ROLES if mapping.get(role))
+
+
+def _identity_columns(mapping: Optional[dict[str, Optional[str]]]) -> tuple[str, ...]:
+    """The mapped subset of the fingerprint that distinguishes one line from
+    another (customer, date, item, rate); quantity alone never counts."""
+    if not mapping:
+        return ()
+    return tuple(mapping[role] for role in IDENTITY_GRADE_ROLES if mapping.get(role))
+
+
 def prepare_working_frame(
     raw: pd.DataFrame,
     mapping: dict[str, Optional[str]],
@@ -417,6 +456,14 @@ def prepare_working_frame(
     frame[NORM_INV] = frame[mapping["invoice"]].map(clean_alphanumeric)
     frame[AMOUNT_CENTS] = frame[mapping["amount"]].map(parse_amount_cents)
     frame[PO_TOKENS] = frame[mapping["po"]].map(significant_po_tokens)
+    # Optional source IDs (see duplicates._decisions): a LINE-level ID (one per
+    # source row) can independently confirm a copied row -- if the data does not
+    # contradict that it is line-level; a transaction/invoice-level ID only
+    # supports a fingerprint match.
+    for role, target in (("line_id", LINE_ID), ("transaction_id", TXN_ID)):
+        id_column = mapping.get(role)
+        if id_column and id_column in frame.columns:
+            frame[target] = frame[id_column].map(lambda value: "" if pd.isna(value) else str(value).strip())
     if source == "QB":
         product_col = mapping.get("product")
         period_col = mapping.get("period")
@@ -781,6 +828,28 @@ def perform_matching(
             remaining_q.difference_update(q_group)
             remaining_i.difference_update(i_group)
 
+    # Controlled PO typo (see fuzzy_po_matching.controlled_typo_pair): a separate,
+    # explicitly labeled rule for a one-character misspelling inside an otherwise
+    # identical reference, e.g. ELIOT / ELLIOT. Exact signed amount, only within
+    # what is still unmatched, exactly one qualifying candidate on each side. A row
+    # with more than one candidate is NOT matched; it is recorded for review.
+    typo_review: dict[int, list[int]] = {}
+    if enable_fuzzy:
+        typo_pairs, typo_review = find_controlled_typo_matches(qb, inf, remaining_q, remaining_i)
+        for qidx, iidx, (word_q, word_i) in typo_pairs:
+            matches.append(
+                MatchGroup(
+                    [qidx], [iidx], TYPO_PO_METHOD, TYPO_PO_CONFIDENCE,
+                    f"Controlled typo: the signed amount agrees exactly, each row is the only "
+                    f"qualifying candidate for the other, and the PO references match word for word "
+                    f"except '{word_q}' (QuickBooks) vs '{word_i}' (Infinium) -- a one-character "
+                    "difference. Accepted under an explicitly labeled rule; this is not an exact match.",
+                )
+            )
+            remaining_q.discard(qidx)
+            remaining_i.discard(iidx)
+        typo_review = {q: cands for q, cands in typo_review.items() if q in remaining_q}
+
     matches.sort(
         key=lambda group: min(
             qb.at[idx, SOURCE_POS] for idx in group.qb_rows
@@ -793,7 +862,7 @@ def perform_matching(
         "QuickBooks Row ID", "Exception Cause", "Cause Confidence",
         "Disposition", "Total Candidate Count",
         "Available Candidate Count", "Available Infinium Candidate IDs",
-        "Already-Matched Candidate IDs", "Minimum Amount Difference",
+        "Already-Matched Candidate IDs", "Minimum Amount Difference", "Typo Candidate IDs",
     ]
     q_rows = sorted(remaining_q)
     if not q_rows:
@@ -833,9 +902,13 @@ def perform_matching(
             if valid_cents(qamount) and valid_cents(inf.at[iidx, AMOUNT_CENTS])
         ]
         minimum_difference = min(differences) if differences else None
+        typo_candidates = typo_review.get(qidx, [])
         if not valid_cents(qamount):
             reason = "Invalid or missing QuickBooks amount"
             exception_cause, cause_confidence = "Invalid QuickBooks amount", "High"
+        elif typo_candidates:
+            reason = "Review: more than one controlled-typo candidate"
+            exception_cause, cause_confidence = "Potential Match - Multiple controlled-typo candidates", "Review"
         elif len(available) > 1:
             reason = "Duplicate or ambiguous Infinium values - multiple candidates"
             exception_cause, cause_confidence = "Potential Duplicate - Multiple records share the PO and/or Invoice", "Review"
@@ -866,6 +939,7 @@ def perform_matching(
                 "Already-Matched Candidate IDs": format_candidate_ids(used),
                 "Minimum Amount Difference": cents_to_float(minimum_difference)
                 if minimum_difference is not None else None,
+                "Typo Candidate IDs": format_candidate_ids(typo_candidates),
             }
         )
     candidates = pd.DataFrame(candidate_records, columns=candidate_columns)
@@ -1136,11 +1210,11 @@ def build_po_reuse_errors(
     whose grouped totals DO tie exactly was already accepted as a real
     match by the grouped-aggregate pass in perform_matching (see
     _group_candidates) and never reaches here unresolved. Rows flagged
-    here are NOT removed from unmatched_qb -- unlike a duplicate, an
-    amount variance, or an ambiguous-candidate row, a PO Re-use Error stays
-    in the ordinary QuickBooks accrual population; this function only
-    gives it its own traceable classification and grouped detail instead
-    of leaving it as several undifferentiated individual exceptions.
+    here are not removed from unmatched_qb by this function; it gives them a
+    traceable classification and grouped detail. build_reference_evidence_
+    review_holds then decides each row's fate: a row with Infinium evidence
+    for the PO is held (REVIEW_HOLD_PO_REUSE) and kept out of the proposed
+    JE; a row with none stays a true unmatched transaction.
 
     Zero tolerance is applied (a difference of even one cent is flagged),
     consistent with this application's established "no tolerance" amount
@@ -1196,8 +1270,9 @@ def build_po_reuse_errors(
                 f"PO {po} appears {len(q_rows)} times in the unresolved QuickBooks pool with a "
                 f"grouped total of {cents_to_float(q_total)}. The corresponding Infinium total for "
                 f"this PO among unresolved Infinium rows is {cents_to_float(i_total)} -- a difference "
-                f"of {cents_to_float(difference)}. No tolerance is applied. These rows remain in the "
-                "QuickBooks accrual pending investigation."
+                f"of {cents_to_float(difference)}. No tolerance is applied. Rows with Infinium evidence for "
+                "this PO are held for review (REVIEW_HOLD_PO_REUSE) and not accrued; a row with none "
+                "remains a true unmatched transaction."
             ),
         })
     return pd.DataFrame(records, columns=PO_REUSE_ERROR_COLUMNS)
@@ -1216,6 +1291,408 @@ def po_reuse_error_qb_index_map(po_reuse_errors: pd.DataFrame) -> dict[int, str]
             if token:
                 mapping[int(token)] = str(record["PO Reuse ID"])
     return mapping
+
+
+# ---------------------------------------------------------------------------
+# Reference-evidence review holds and final QuickBooks dispositions
+# ---------------------------------------------------------------------------
+
+REFERENCE_HOLD_SECTION = "11 Review Hold QuickBooks"
+
+HOLD_PO_ALREADY_REPRESENTED = "REVIEW_HOLD_PO_ALREADY_REPRESENTED"
+HOLD_AMOUNT_VARIANCE = "REVIEW_HOLD_AMOUNT_VARIANCE"
+HOLD_EXACT_CANDIDATE_NOT_UNIQUE = "REVIEW_HOLD_EXACT_CANDIDATE_NOT_UNIQUE"
+HOLD_MULTIPLE_CANDIDATES = "REVIEW_HOLD_MULTIPLE_CANDIDATES"
+HOLD_PO_REUSE = "REVIEW_HOLD_PO_REUSE"
+HOLD_TYPO_CANDIDATES = "REVIEW_HOLD_TYPO_CANDIDATES"
+HOLD_HISTORICAL_CLEARANCE = "REVIEW_HOLD_HISTORICAL_CLEARANCE"
+HOLD_POTENTIAL_DUPLICATE = "REVIEW_HOLD_POTENTIAL_DUPLICATE"
+HOLD_INVALID_AMOUNT = "REVIEW_HOLD_INVALID_AMOUNT"
+HOLD_CANDIDATE_INVALID_AMOUNT = "REVIEW_HOLD_CANDIDATE_INVALID_AMOUNT"
+
+REFERENCE_HOLD_COLUMNS = [
+    "Hold ID", "Reason Code", "Classification", "Confidence",
+    "QuickBooks Row ID", "QuickBooks Row Index", "Normalized PO", "Normalized Invoice",
+    "QuickBooks Amount", "Infinium Amount", "Amount Difference",
+    "Related Match Ref.", "Related QuickBooks Row IDs", "Related Infinium Row IDs",
+    "Accrual Treatment", "Posting Disposition", "Explanation",
+    "Manual Decision", "Reviewed By", "Review Timestamp", "Review Rationale",
+]
+
+DISPOSITION_MATCHED = "MATCHED"
+DISPOSITION_DUPLICATE_EXCLUDED = "EXACT_QBO_DUPLICATE_EXCLUDED"
+DISPOSITION_REVIEW_HOLD = "REVIEW_HOLD"
+DISPOSITION_TRUE_UNMATCHED = "TRUE_UNMATCHED"
+FINAL_DISPOSITIONS = (
+    DISPOSITION_MATCHED,
+    DISPOSITION_DUPLICATE_EXCLUDED,
+    DISPOSITION_REVIEW_HOLD,
+    DISPOSITION_TRUE_UNMATCHED,
+)
+
+QB_DISPOSITION_COLUMNS = [
+    "QBO Row ID", "Normalized PO", "Normalized Invoice", "Amount",
+    "Final Disposition", "Reason Code", "Final Reason",
+    "Match Ref.", "Aggregate Group ID", "Duplicate Group ID", "Canonical QBO Row ID",
+    "Review ID", "Related Match Ref.", "Related Infinium Row IDs",
+    "In Proposed JE",
+]
+
+
+def build_reference_evidence_review_holds(
+    qb: pd.DataFrame,
+    inf: pd.DataFrame,
+    candidates: pd.DataFrame,
+    unmatched_qb: list[int],
+    register: pd.DataFrame,
+    po_reuse_errors: Optional[pd.DataFrame] = None,
+    withheld_historical: Optional[pd.DataFrame] = None,
+    withheld_group_by_id: Optional[dict[str, str]] = None,
+) -> tuple[pd.DataFrame, list[int]]:
+    """Hold every still-unmatched QuickBooks row that has evidence of a possible
+    Infinium counterpart, instead of accruing it.
+
+    The matching passes decide what CAN be matched; this decides what an
+    unmatched row MEANS. A row is a genuine missing transaction (and may feed
+    the proposed JE) only when NO Infinium record -- current or withheld
+    historical -- supports it. "Unable to establish another match" is never
+    "no evidence exists in Infinium". The hold codes are:
+
+      * REVIEW_HOLD_PO_ALREADY_REPRESENTED -- every Infinium record sharing its
+        PO/invoice was consumed by an accepted match;
+      * REVIEW_HOLD_PO_REUSE -- its PO is reused across several unresolved
+        QuickBooks rows and the grouped total does not tie to Infinium;
+      * REVIEW_HOLD_AMOUNT_VARIANCE -- one reference candidate remains but its
+        signed amount differs;
+      * REVIEW_HOLD_EXACT_CANDIDATE_NOT_UNIQUE -- a candidate agrees on amount
+        but is not uniquely one-to-one;
+      * REVIEW_HOLD_TYPO_CANDIDATES -- more than one candidate satisfies the
+        controlled-typo rule, so none is matched automatically;
+      * REVIEW_HOLD_HISTORICAL_CLEARANCE -- its only apparent support is a
+        historical Infinium record that is withheld by an unresolved
+        historical-duplicate issue and so cannot yet be consumed;
+      * REVIEW_HOLD_MULTIPLE_CANDIDATES / _CANDIDATE_INVALID_AMOUNT /
+        _INVALID_AMOUNT -- correspondence cannot be determined or an amount is
+        unreadable.
+    """
+    empty = pd.DataFrame(columns=REFERENCE_HOLD_COLUMNS)
+    if candidates.empty or not unmatched_qb:
+        return empty, []
+    candidate_by_qb = candidates.set_index("QuickBooks Row ID").to_dict("index")
+    inf_amount_by_id = dict(zip(inf[INF_ID], inf[AMOUNT_CENTS]))
+    members_by_ref: dict[str, str] = {}
+    if register is not None and not register.empty:
+        members_by_ref = dict(zip(register[MATCH_REF_COLUMN], register["QuickBooks Row IDs"]))
+    po_reuse_id_by_index = po_reuse_error_qb_index_map(po_reuse_errors) if po_reuse_errors is not None else {}
+    po_reuse_detail = (
+        po_reuse_errors.set_index("PO Reuse ID").to_dict("index")
+        if po_reuse_errors is not None and not po_reuse_errors.empty else {}
+    )
+    withheld_records = (
+        withheld_historical[[INF_ID, NORM_PO, NORM_INV, AMOUNT_CENTS]].to_dict("records")
+        if withheld_historical is not None and not withheld_historical.empty else []
+    )
+    withheld_group_by_id = withheld_group_by_id or {}
+
+    def historical_hits(qidx: int) -> list[str]:
+        cents, po, invoice = qb.at[qidx, AMOUNT_CENTS], qb.at[qidx, NORM_PO], qb.at[qidx, NORM_INV]
+        if not valid_cents(cents):
+            return []
+        return [
+            str(record[INF_ID]) for record in withheld_records
+            if valid_cents(record[AMOUNT_CENTS]) and int(record[AMOUNT_CENTS]) == int(cents)
+            and ((po and record[NORM_PO] == po) or (invoice and record[NORM_INV] == invoice))
+        ]
+
+    records: list[dict[str, Any]] = []
+    held: list[int] = []
+    for qidx in sorted((int(i) for i in unmatched_qb), key=lambda i: qb.at[i, SOURCE_POS]):
+        candidate = candidate_by_qb.get(qb.at[qidx, QB_ID])
+        if candidate is None:
+            continue
+        amount = qb.at[qidx, AMOUNT_CENTS]
+        total = int(candidate["Total Candidate Count"])
+        available = int(candidate["Available Candidate Count"])
+        difference = candidate["Minimum Amount Difference"]
+        available_ids = str(candidate["Available Infinium Candidate IDs"] or "")
+        used_ids = str(candidate["Already-Matched Candidate IDs"] or "")
+        typo_ids = str(candidate.get("Typo Candidate IDs") or "")
+        references = _split_reference_ids(candidate.get(REFERENCED_MATCH_REF_COLUMN))
+        basis = str(candidate.get("Reference Basis") or "")
+        related_inf = available_ids
+        inf_amount: Optional[float] = None
+        related_qb = ""
+        reuse_id = po_reuse_id_by_index.get(qidx)
+        hits = historical_hits(qidx)
+        if not valid_cents(amount):
+            code = HOLD_INVALID_AMOUNT
+            classification = "Review Hold — Invalid or Missing QuickBooks Amount"
+            explanation = "The QuickBooks amount cannot be read as signed cents, so the row cannot be matched or accrued."
+        elif typo_ids:
+            code = HOLD_TYPO_CANDIDATES
+            related_inf = typo_ids
+            classification = "Review Hold — Multiple Controlled-Typo Candidates"
+            explanation = (
+                "More than one Infinium record matches this row's exact amount and differs from its PO "
+                "only by a one-character typo, so none is matched automatically. A reviewer must choose."
+            )
+        elif reuse_id and total > 0:
+            code = HOLD_PO_REUSE
+            related_inf = used_ids or available_ids
+            related_qb = "; ".join(members_by_ref[r] for r in references if r in members_by_ref)
+            classification = "Review Hold — PO Re-use Error (repeated PO; grouped total does not tie to Infinium)"
+            explanation = (
+                f"{po_reuse_detail.get(reuse_id, {}).get('Explanation', 'This PO is reused across unresolved QuickBooks rows.')} "
+                "Because Infinium holds evidence for this PO, the row may already be represented and is "
+                "not accrued until a reviewer documents a disposition."
+            )
+        elif total == 0:
+            if not hits:
+                continue            # no support anywhere: a genuine unmatched transaction
+            code = HOLD_HISTORICAL_CLEARANCE
+            related_inf = "; ".join(hits)
+            blockers = sorted({withheld_group_by_id.get(h, "") for h in hits} - {""})
+            classification = "Review Hold — Historical Clearance Blocked (Withheld Historical Record)"
+            explanation = (
+                f"The only apparent Infinium support ({related_inf}) is a historical record withheld by an "
+                f"unresolved historical duplicate issue{' (' + '; '.join(blockers) + ')' if blockers else ''}, "
+                "so it cannot yet be used to clear this row. The row is not accrued until that "
+                "relationship is resolved."
+            )
+        elif available == 0:
+            code = HOLD_PO_ALREADY_REPRESENTED
+            related_inf = used_ids
+            related_qb = "; ".join(members_by_ref[r] for r in references if r in members_by_ref)
+            if references:
+                label = {"PO": "PO", "Invoice": "Invoice", "Group": "Group Candidate"}.get(basis, "Reference")
+                cited = describe_match_references(references, group=basis == "Group")
+                classification = f"Review Hold — {label} Already Represented by {cited}"
+                explanation = (
+                    f"Every Infinium record sharing this row's {label.lower()} was already consumed by "
+                    f"{cited}. The transaction may already be represented, so "
+                    "it is not accrued until a reviewer decides."
+                )
+            else:
+                classification = "Review Hold — Reference Already Consumed by Another Match Candidate"
+                explanation = (
+                    "Every Infinium record sharing this row's PO/invoice was consumed by another "
+                    "match candidate, so the row is not accrued until a reviewer decides."
+                )
+        elif available > 1:
+            code = HOLD_MULTIPLE_CANDIDATES
+            classification = "Review Hold — Multiple Infinium Candidates"
+            explanation = (
+                f"{available} Infinium records share this row's PO/invoice; the program will not guess "
+                "which one, if any, corresponds to it."
+            )
+        elif difference is None:
+            code = HOLD_CANDIDATE_INVALID_AMOUNT
+            classification = "Review Hold — Reference Candidate Has an Invalid Amount"
+            explanation = "The only Infinium record sharing this row's reference has an unreadable amount."
+        elif float(difference) == 0:
+            code = HOLD_EXACT_CANDIDATE_NOT_UNIQUE
+            classification = "Review Hold — Exact Candidate Not Uniquely Available"
+            explanation = (
+                "An Infinium record agrees on reference and amount, but the pairing is not uniquely "
+                "one-to-one, so it is not matched automatically and the row is not accrued."
+            )
+        else:
+            code = HOLD_AMOUNT_VARIANCE
+            classification = "Review Hold — Amount Variance"
+            explanation = (
+                "An Infinium record shares this row's PO/invoice but its signed amount differs; the "
+                "QuickBooks amount is not accrued until the difference is explained."
+            )
+        if available == 1 and code in (HOLD_AMOUNT_VARIANCE, HOLD_EXACT_CANDIDATE_NOT_UNIQUE, HOLD_PO_REUSE):
+            cents = inf_amount_by_id.get(available_ids)
+            inf_amount = cents_to_float(cents) if valid_cents(cents) else None
+        q_amount = cents_to_float(amount) if valid_cents(amount) else None
+        records.append({
+            "Hold ID": f"RHOLD-{len(records) + 1:06d}",
+            "Reason Code": code,
+            "Classification": classification,
+            "Confidence": "Review",
+            "QuickBooks Row ID": qb.at[qidx, QB_ID],
+            "QuickBooks Row Index": qidx,
+            "Normalized PO": qb.at[qidx, NORM_PO],
+            "Normalized Invoice": qb.at[qidx, NORM_INV],
+            "QuickBooks Amount": q_amount,
+            "Infinium Amount": inf_amount,
+            "Amount Difference": (
+                round(q_amount - inf_amount, 2) if q_amount is not None and inf_amount is not None else None
+            ),
+            "Related Match Ref.": "; ".join(references),
+            "Related QuickBooks Row IDs": related_qb,
+            "Related Infinium Row IDs": related_inf,
+            "Accrual Treatment": "Excluded from automatic JE pending documented disposition",
+            "Posting Disposition": "REVIEW REQUIRED - DO NOT POST",
+            "Explanation": explanation,
+            "Manual Decision": None,
+            "Reviewed By": None,
+            "Review Timestamp": None,
+            "Review Rationale": None,
+        })
+        held.append(qidx)
+    return pd.DataFrame(records, columns=REFERENCE_HOLD_COLUMNS), sorted(held)
+
+
+_MATCH_REASONS = {
+    "PO + Invoice + Amount": ("MATCH_EXACT_PO_INVOICE_AMOUNT", "Exact PO + Invoice + Amount"),
+    "PO + Amount": ("MATCH_EXACT_PO_AMOUNT", "Exact PO + Amount"),
+    "Invoice + Amount": ("MATCH_EXACT_INVOICE_AMOUNT", "Exact Invoice + Amount"),
+    "PO + Invoice + Aggregate Amount (Grouped)": (
+        "MATCH_AGGREGATE_PO_INVOICE_AMOUNT", "Aggregate PO + Invoice + Exact Amount",
+    ),
+    "PO + Aggregate Amount (Grouped)": ("MATCH_AGGREGATE_PO_AMOUNT", "Aggregate PO + Exact Amount"),
+    "Invoice + Aggregate Amount (Grouped)": (
+        "MATCH_AGGREGATE_INVOICE_AMOUNT", "Aggregate Invoice + Exact Amount",
+    ),
+    TYPO_PO_METHOD: ("MATCH_CONTROLLED_PO_TYPO", TYPO_PO_METHOD),
+}
+
+_SECTION_HOLDS = {
+    "06 Duplicate Review Hold QuickBooks": (
+        "REVIEW_HOLD_POTENTIAL_DUPLICATE", "Review Hold — Potential Duplicate (Insufficient Evidence)",
+    ),
+    "08 Reference-Matched Amount Variance Review Hold": (
+        HOLD_AMOUNT_VARIANCE, "Review Hold — Amount Variance",
+    ),
+    "09 Fuzzy Match Review Hold": (
+        "REVIEW_HOLD_FUZZY_MATCH", "Review Hold — Fuzzy PO Whole-Word Containment + Exact Amount",
+    ),
+    "10 Ambiguous Duplicate QuickBooks": (
+        "REVIEW_HOLD_AMBIGUOUS_CANDIDATES", "Review Hold — Ambiguous Candidates (Multiple Infinium Records)",
+    ),
+}
+
+
+def build_qb_dispositions(
+    paired_rows: list[dict[str, Any]],
+    qb: pd.DataFrame,
+    po_reuse_qb_indexes: set[int],
+    register: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """One row per QuickBooks source row -- every one, in source order -- with
+    exactly one of four final dispositions and the precise reason for it:
+
+        MATCHED | EXACT_QBO_DUPLICATE_EXCLUDED | REVIEW_HOLD | TRUE_UNMATCHED
+
+    Built from the same paired rows every workbook reads, so this ledger and
+    the reconciliation can never disagree. Only TRUE_UNMATCHED rows feed the
+    proposed journal entry."""
+    matched_sections = {"01 Matched", "01 Matched - Historical Clearance"}
+    rows = [
+        row for row in paired_rows
+        if row.get("QB Index") is not None and row.get("QB Record Scope") == "Primary"
+    ]
+    rows.sort(key=lambda row: qb.at[row["QB Index"], SOURCE_POS])
+    records: list[dict[str, Any]] = []
+    review_number = 0
+    for row in rows:
+        qidx = int(row["QB Index"])
+        section = str(row.get("Section"))
+        result_text = str(row.get("Match Result") or "")
+        match_ref = str(row.get(MATCH_REF_COLUMN) or "")
+        related_ref = str(row.get(REFERENCED_MATCH_REF_COLUMN) or "")
+        duplicate_group = ""
+        canonical = ""
+        if section in matched_sections:
+            disposition = DISPOSITION_MATCHED
+            method = result_text.split("|")[-1].strip().replace(" [group-level; no line allocation]", "")
+            code, reason = _MATCH_REASONS.get(method, ("MATCH_" + re.sub(r"[^A-Z0-9]+", "_", method.upper()).strip("_"), method))
+            if section == "01 Matched - Historical Clearance":
+                code, reason = "PRIOR_PERIOD_" + code, f"Prior-Period Clearance — {reason}"
+        elif section == "04 Duplicate QuickBooks":
+            disposition = DISPOSITION_DUPLICATE_EXCLUDED
+            code = "EXACT_QBO_DUPLICATE_EXCESS_COPY"
+            reason = "Confirmed Exact QBO Duplicate — Excess Copy Excluded"
+            duplicate_group = str(row.get("Duplicate Group ID") or "")
+            canonical = str(row.get("Canonical Source Row ID") or "")
+            basis = str(row.get("Confirmation Basis") or "")
+            detail_bits = [
+                f"canonical row {canonical} retained" if canonical else "",
+                f"confirmed by {basis.lower()}" if basis else "",
+            ]
+            detail_text = "; ".join(bit for bit in detail_bits if bit)
+            if detail_text:
+                reason += f" ({detail_text})"
+        elif section == REFERENCE_HOLD_SECTION:
+            disposition = DISPOSITION_REVIEW_HOLD
+            code = str(row.get("Reason Code") or "REVIEW_HOLD_REFERENCE_EVIDENCE")
+            reason = result_text
+        elif section in _SECTION_HOLDS:
+            disposition = DISPOSITION_REVIEW_HOLD
+            code, reason = _SECTION_HOLDS[section]
+            if section == "06 Duplicate Review Hold QuickBooks":
+                duplicate_group = str(row.get("Duplicate Group ID") or "")
+                canonical = str(row.get("Canonical Source Row ID") or "")
+                code = HOLD_POTENTIAL_DUPLICATE
+                if related_ref:
+                    reason = (
+                        "Review Hold — Potential Duplicate of "
+                        f"{describe_match_references(_split_reference_ids(related_ref))}"
+                        + (f" (matched sibling {canonical})" if canonical else "")
+                    )
+                elif canonical:
+                    reason = f"Review Hold — Potential Duplicate of {canonical} (suspected canonical row)"
+                else:
+                    reason = "Review Hold — Potential Duplicate (Insufficient Evidence)"
+        elif section == "02 Unmatched QuickBooks":
+            disposition = DISPOSITION_TRUE_UNMATCHED
+            if qidx in po_reuse_qb_indexes:
+                code = "TRUE_UNMATCHED_PO_REUSE"
+                reason = "True Unmatched — Repeated PO with no Infinium support"
+            else:
+                code = "TRUE_UNMATCHED_NO_INFINIUM_CANDIDATE"
+                reason = "True Unmatched — No Remaining Infinium Candidate"
+        else:
+            raise ValueError(f"QuickBooks disposition control failure: unclassified section {section!r}.")
+        review_id = ""
+        if disposition == DISPOSITION_REVIEW_HOLD:
+            review_number += 1
+            review_id = f"REV-{review_number:03d}" if review_number < 1000 else f"REV-{review_number}"
+        cents = qb.at[qidx, AMOUNT_CENTS]
+        records.append({
+            "QBO Row ID": qb.at[qidx, QB_ID],
+            "Normalized PO": qb.at[qidx, NORM_PO],
+            "Normalized Invoice": qb.at[qidx, NORM_INV],
+            "Amount": cents_to_float(cents) if valid_cents(cents) else None,
+            "Final Disposition": disposition,
+            "Reason Code": code,
+            "Final Reason": reason,
+            "Match Ref.": match_ref,
+            "Aggregate Group ID": match_ref if match_ref.startswith("G-") else "",
+            "Duplicate Group ID": duplicate_group,
+            "Canonical QBO Row ID": canonical,
+            "Review ID": review_id,
+            "Related Match Ref.": related_ref,
+            "Related Infinium Row IDs": (
+                str(row.get("Related Source Row IDs") or "")
+                if disposition == DISPOSITION_REVIEW_HOLD and section != "06 Duplicate Review Hold QuickBooks"
+                else ""
+            ),
+            "In Proposed JE": "Yes" if disposition == DISPOSITION_TRUE_UNMATCHED else "No",
+        })
+    return pd.DataFrame(records, columns=QB_DISPOSITION_COLUMNS)
+
+
+def _final_disposition_metrics(dispositions: pd.DataFrame) -> dict[str, Any]:
+    """Row counts and signed dollars per final disposition, straight from the
+    disposition ledger -- and the proposed JE, which is by definition the sum
+    of the TRUE_UNMATCHED rows and nothing else."""
+    labels = {
+        DISPOSITION_MATCHED: "Matched",
+        DISPOSITION_DUPLICATE_EXCLUDED: "Duplicate Excluded",
+        DISPOSITION_REVIEW_HOLD: "Review Hold",
+        DISPOSITION_TRUE_UNMATCHED: "True Unmatched",
+    }
+    metrics: dict[str, Any] = {}
+    for disposition, label in labels.items():
+        subset = dispositions.loc[dispositions["Final Disposition"] == disposition]
+        metrics[f"Final Disposition - {label} Rows"] = len(subset)
+        metrics[f"Final Disposition - {label} Amount"] = round(float(subset["Amount"].fillna(0).sum()), 2)
+    metrics["Proposed JE Amount"] = metrics["Final Disposition - True Unmatched Amount"]
+    return metrics
 
 
 FUZZY_MATCH_REVIEW_COLUMNS = [
@@ -1689,10 +2166,12 @@ _DUPLICATE_BASIS_PHRASES = {
 }
 
 
-def _duplicate_message(references: list[str], basis: str) -> str:
+def _duplicate_message(references: list[str], basis: str, exact: bool = False) -> str:
+    """An exact (excluded) duplicate is stated as a fact; anything weaker stays
+    a "potential" duplicate."""
     phrase = _DUPLICATE_BASIS_PHRASES.get(basis)
     suffix = f" (same {phrase})" if phrase else ""
-    return f"Potential duplicate of {_match_phrase(references)}{suffix}."
+    return f"{'Exact' if exact else 'Potential'} duplicate of {_match_phrase(references)}{suffix}."
 
 
 def refine_candidates_with_match_references(
@@ -1795,7 +2274,10 @@ def apply_referenced_match_references(
             continue
         evidence: list[str] = []
         candidate_basis = ""
-        if row.get("Section") == "02 Unmatched QuickBooks" and row.get("QB Index") is not None:
+        if (
+            row.get("Section") in ("02 Unmatched QuickBooks", REFERENCE_HOLD_SECTION)
+            and row.get("QB Index") is not None
+        ):
             candidate = candidate_by_qb.get(qb.at[row["QB Index"], QB_ID], {})
             candidate_basis = str(candidate.get("Reference Basis") or "")
             if candidate.get(REFERENCED_MATCH_REF_COLUMN) and candidate_basis != "Duplicate":
@@ -1818,8 +2300,10 @@ def apply_referenced_match_references(
         row["Referenced Record IDs"] = "; ".join(evidence)
         row["Reference Basis"] = candidate_basis or "Duplicate"
         if row["Reference Basis"] == "Duplicate":
+            exact = row.get("Section") in {"04 Duplicate QuickBooks", "05 Duplicate Infinium"}
             row["Explanation"] = (
-                f"{row['Explanation']} {_duplicate_message(references, str(row.get('Duplicate Basis') or ''))}"
+                f"{row['Explanation']} "
+                f"{_duplicate_message(references, str(row.get('Duplicate Basis') or ''), exact)}"
             )
 
 
@@ -2005,6 +2489,7 @@ def validate_match_references(result: "ReconciliationResult") -> None:
     withheld_qb = set(result.unmatched_qb) | set(result.duplicate_qb_rows)
     withheld_qb |= set(result.duplicate_review_hold_qb_rows) | set(result.amount_variance_review_hold_qb_rows)
     withheld_qb |= set(result.ambiguous_duplicate_qb_rows) | set(result.fuzzy_match_review_hold_qb_rows)
+    withheld_qb |= set(result.reference_hold_qb_rows)
     withheld_ids = {str(result.qb_work.at[idx, QB_ID]) for idx in withheld_qb}
     for reference, relationship in relationships.items():
         overlap = relationship["qb"] & withheld_ids
@@ -2052,6 +2537,7 @@ def build_paired_rows(
     qb_duplicate_report: Optional[pd.DataFrame] = None,
     inf_duplicate_report: Optional[pd.DataFrame] = None,
     match_register: Optional[pd.DataFrame] = None,
+    reference_hold_analysis: Optional[pd.DataFrame] = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     candidate_reason = (
@@ -2186,7 +2672,7 @@ def build_paired_rows(
             {
                 "Section": "06 Duplicate Review Hold QuickBooks",
                 "Match ID": "",
-                "Match Result": "Weak-basis duplicate candidate - unresolved",
+                "Match Result": "Review Hold — Potential Duplicate (not confirmed as a copy)",
                 "QB Index": qidx,
                 "Infinium Index": None,
                 "QB Record Scope": "Primary",
@@ -2194,11 +2680,12 @@ def build_paired_rows(
                 "Group Sequence": None,
                 "Confidence": "Hold",
                 "Explanation": (
-                    "This row shares only a PO or only an invoice (never both) with another "
-                    "QuickBooks row at the same signed amount, so it was never excluded "
-                    "outright -- it remained active and eligible to match normally. It did "
-                    "not match anything, so it is excluded from the proposed JE support total "
-                    "and held here pending a documented human disposition."
+                    "This row shares its duplicate key (PO, invoice, and signed amount -- or only "
+                    "a PO or only an invoice) with another QuickBooks row, but nothing establishes "
+                    "that it is a copy of the same underlying transaction, so it was never "
+                    "discarded: it stayed active and eligible to match normally. It did not "
+                    "match, so it is excluded from the proposed JE support total and held here "
+                    "pending a documented human disposition. It may be a legitimate repeated sale."
                 ),
             }
         )
@@ -2265,6 +2752,23 @@ def build_paired_rows(
                     ),
                 }
             )
+    if reference_hold_analysis is not None and not reference_hold_analysis.empty:
+        for hold in reference_hold_analysis.to_dict("records"):
+            rows.append(
+                {
+                    "Section": REFERENCE_HOLD_SECTION,
+                    "Match ID": hold["Hold ID"],
+                    "Match Result": hold["Classification"],
+                    "Reason Code": hold["Reason Code"],
+                    "QB Index": int(hold["QuickBooks Row Index"]),
+                    "Infinium Index": None,
+                    "QB Record Scope": "Primary",
+                    "Infinium Record Scope": None,
+                    "Group Sequence": 1,
+                    "Confidence": hold["Confidence"],
+                    "Explanation": hold["Explanation"],
+                }
+            )
     for group in fuzzy_review_hold_groups:
         ordered_q = sorted(group.qb_rows, key=lambda idx: qb.at[idx, SOURCE_POS])
         ordered_i = sorted(group.inf_rows, key=lambda idx: inf.at[idx, SOURCE_POS])
@@ -2323,6 +2827,10 @@ def build_paired_rows(
         po_reuse_errors.set_index("PO Reuse ID").to_dict("index")
         if not po_reuse_errors.empty else {}
     )
+    reference_hold_detail = (
+        reference_hold_analysis.set_index("Hold ID").to_dict("index")
+        if reference_hold_analysis is not None and not reference_hold_analysis.empty else {}
+    )
     unresolved_q_indexes = [
         int(row["QB Index"])
         for row in rows
@@ -2362,6 +2870,7 @@ def build_paired_rows(
             "Duplicate Group ID": "",
             "Confirmed Copy Set ID": "",
             "Canonical Source Row ID": "",
+            "Confirmation Basis": "",
             "Potential Amount Difference": None,
         })
         if section == "02 Unmatched QuickBooks":
@@ -2377,8 +2886,8 @@ def build_paired_rows(
                 )
             ):
                 row["Exception Cause"] = (
-                    "Potential Duplicate - Repeated Invoice numbers do not net to a "
-                    "matching Infinium value"
+                    "True Unmatched - Repeated Invoice numbers with no supporting "
+                    "Infinium record"
                 )
             elif po_reuse_id:
                 # A normalized PO reused across 2+ still-unresolved QuickBooks
@@ -2431,6 +2940,30 @@ def build_paired_rows(
                 ])
             )
             row["Potential Amount Difference"] = detail.get("Potential Difference")
+        elif section == REFERENCE_HOLD_SECTION:
+            hold_detail = reference_hold_detail.get(str(row.get("Match ID", "")), {})
+            hold_code = str(hold_detail.get("Reason Code", ""))
+            if hold_code == HOLD_PO_REUSE:
+                row["Exception Cause"] = (
+                    "PO Re-use Error - Repeated PO values do not net to a matching Infinium total"
+                )
+            elif hold_code == HOLD_HISTORICAL_CLEARANCE:
+                row["Exception Cause"] = "Potential Match - Supporting historical Infinium record is withheld"
+            else:
+                row["Exception Cause"] = str(
+                    candidate_cause.get(
+                        qb.at[int(row["QB Index"]), QB_ID], hold_detail.get("Classification", "Review hold"),
+                    )
+                )
+            row["Cause Confidence"] = "Review"
+            row["Financial Treatment"] = str(hold_detail.get("Accrual Treatment", "Review hold"))
+            row["Related Source Row IDs"] = "; ".join(
+                filter(None, [
+                    str(hold_detail.get("Related QuickBooks Row IDs") or ""),
+                    str(hold_detail.get("Related Infinium Row IDs") or ""),
+                ])
+            )
+            row["Potential Amount Difference"] = hold_detail.get("Amount Difference")
         elif section == "09 Fuzzy Match Review Hold":
             row["Exception Cause"] = "Potential Match - Pending Manual Confirmation"
             row["Cause Confidence"] = FUZZY_MATCH_CONFIDENCE
@@ -2472,6 +3005,7 @@ def build_paired_rows(
             row["Canonical Source Row ID"] = clean_detail_value(
                 detail.get("Canonical Source Row ID")
             )
+            row["Confirmation Basis"] = clean_detail_value(detail.get("Confirmation Basis"))
             if section in {
                 "06 Duplicate Review Hold QuickBooks",
                 "07 Duplicate Review Hold Infinium",
@@ -2546,6 +3080,7 @@ def build_match_assessments(
     candidates: pd.DataFrame,
     amount_variance_analysis: Optional[pd.DataFrame] = None,
     ambiguous_duplicate_analysis: Optional[pd.DataFrame] = None,
+    reference_hold_analysis: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     candidate_map = candidates.set_index("QuickBooks Row ID").to_dict("index") if not candidates.empty else {}
@@ -2644,9 +3179,37 @@ def build_match_assessments(
                 "Infinium Amount": None,
                 "Amount Difference": candidate.get("Minimum Amount Difference"),
                 "Group-Level Match": False,
-                "Assessment Explanation": "No unique automatic match was found.",
+                "Assessment Explanation": "No reference evidence in Infinium supports this row.",
             }
         )
+    if reference_hold_analysis is not None and not reference_hold_analysis.empty:
+        for hold in reference_hold_analysis.to_dict("records"):
+            candidate = candidate_map.get(hold["QuickBooks Row ID"], {})
+            records.append(
+                {
+                    "Match ID": hold["Hold ID"],
+                    "Decision": "Review Hold - Reference Evidence",
+                    "Match Ref.": "",
+                    "Match Method": hold["Classification"],
+                    "Referenced Match Ref.": hold["Related Match Ref."],
+                    "Confidence": hold["Confidence"],
+                    "QuickBooks Row Count": 1,
+                    "Infinium Row Count": candidate.get("Total Candidate Count", 0),
+                    "QuickBooks Row IDs": hold["QuickBooks Row ID"],
+                    "Infinium Row IDs": hold["Related Infinium Row IDs"],
+                    "PO Criterion": "Candidate search performed" if hold["Normalized PO"] else "Missing",
+                    "Invoice Criterion": "Candidate search performed" if hold["Normalized Invoice"] else "Missing",
+                    "Signed Amount Criterion": (
+                        "Differs - review required" if hold["Reason Code"] == HOLD_AMOUNT_VARIANCE
+                        else "Not evaluated - correspondence cannot be safely determined"
+                    ),
+                    "QuickBooks Amount": hold["QuickBooks Amount"],
+                    "Infinium Amount": hold["Infinium Amount"],
+                    "Amount Difference": hold["Amount Difference"],
+                    "Group-Level Match": False,
+                    "Assessment Explanation": hold["Explanation"],
+                }
+            )
     if amount_variance_analysis is not None and not amount_variance_analysis.empty:
         for variance in amount_variance_analysis.to_dict("records"):
             records.append(
@@ -2718,6 +3281,7 @@ def build_method_summary(
     ambiguous_duplicate_qb_rows: list[int],
     fuzzy_match_review_hold_qb_rows: list[int],
     fuzzy_match_review_hold_inf_rows: list[int],
+    reference_hold_qb_rows: Optional[list[int]] = None,
 ) -> pd.DataFrame:
     buckets: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"QB Rows": 0, "Infinium Rows": 0, "QB Cents": 0, "Infinium Cents": 0}
@@ -2776,6 +3340,10 @@ def build_method_summary(
         bucket = buckets["Ambiguous Duplicate QuickBooks (excluded from JE, pending research)"]
         bucket["QB Rows"] = len(ambiguous_duplicate_qb_rows)
         bucket["QB Cents"] = _amount_total(qb, ambiguous_duplicate_qb_rows)
+    if reference_hold_qb_rows:
+        bucket = buckets["Reference-Evidence Review Hold (excluded from JE, pending disposition)"]
+        bucket["QB Rows"] = len(reference_hold_qb_rows)
+        bucket["QB Cents"] = _amount_total(qb, reference_hold_qb_rows)
     if fuzzy_match_review_hold_qb_rows or fuzzy_match_review_hold_inf_rows:
         bucket = buckets["Fuzzy Match Review Hold (excluded from JE, pending confirmation)"]
         bucket["QB Rows"] = len(fuzzy_match_review_hold_qb_rows)
@@ -2844,6 +3412,7 @@ def build_exception_analysis(
     paired_rows: Optional[list[dict[str, Any]]] = None,
     fuzzy_match_review_hold_analysis: Optional[pd.DataFrame] = None,
     ambiguous_duplicate_analysis: Optional[pd.DataFrame] = None,
+    reference_hold_analysis: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     candidate_reason = candidates.set_index("QuickBooks Row ID")["Exception Cause"].to_dict() if not candidates.empty else {}
@@ -2919,6 +3488,16 @@ def build_exception_analysis(
                     "Amount": float(group["QuickBooks Amount"].sum()),
                 }
             )
+    if reference_hold_analysis is not None and not reference_hold_analysis.empty:
+        for classification, group in reference_hold_analysis.groupby("Reason Code", sort=True):
+            records.append(
+                {
+                    "Analysis Type": "Reference-evidence review holds (excluded from JE)",
+                    "Dimension": str(group["Classification"].iloc[0]).split(" by ")[0],
+                    "Transaction Count": len(group),
+                    "Amount": float(group["QuickBooks Amount"].fillna(0).sum()),
+                }
+            )
     if ambiguous_duplicate_analysis is not None and not ambiguous_duplicate_analysis.empty:
         records.append(
             {
@@ -2989,22 +3568,27 @@ def build_rules_and_config(
              "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence, including the fuzzy PO pass (Priority 8). The vendor alias pass (Priority 7) is not applied here -- see build_historical_clearances."},
             {"Priority": 13, "Rule": "Unused secondary rows", "Automatic": "Excluded",
              "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
-            {"Priority": 14, "Rule": "QuickBooks duplicate-key groups: matched normally, evidence-based accrual (see duplicates.py)", "Automatic": "Conditional",
+            {"Priority": 14, "Rule": "QuickBooks exact duplicates: excluded before matching; weaker groups decided after (see duplicates.py)", "Automatic": "Yes",
              "Requirement": (
-                 "QuickBooks is the sole accrual basis, so a same-file group sharing PO+invoice+amount, "
-                 "or PO+amount with invoice blank on every member, or invoice+amount with PO blank on "
-                 "every member, is never pre-collapsed before matching -- every member stays fully active "
-                 "and eligible to match through every pass above -- including the duplicate-cluster pairing "
-                 "that runs immediately after Priorities 1-3 (see _duplicate_cluster_pairs in matching.py), "
-                 "which lets one member pair with a genuine Infinium counterpart even though the group "
-                 "isn't globally unique on its own. Once matching and historical clearance complete, the "
-                 "group is decided as a whole: if ANY member matched, every unmatched member is included "
-                 "in the accrual as its own ordinary exception -- real evidence the pattern recurs, not a "
-                 "data-entry duplicate. If NO member matched at all, only the earliest-listed member is "
-                 "kept as an exception and every other member is excluded, exactly as a confirmed "
-                 "duplicate has always been treated. Automatic exclusion in the zero-evidence case still "
-                 "assumes the source report grain does not permit legitimate repeated identical lines; "
-                 "that report-grain assertion must be documented by the process owner."
+                 "A shared normalized PO + normalized invoice + signed-integer-cents key (all present) only "
+                 "IDENTIFIES a duplicate relationship. An excess row is excluded as a CONFIRMED exact duplicate -- "
+                 "BEFORE any matching pass, keeping the earliest source-position row as canonical -- only when it "
+                 "is shown to be a copy of the same underlying LINE: (1) a mapped line-level source ID is shared "
+                 "(trusted only if no shared ID spans rows that differ, otherwise it is treated as invoice/"
+                 "transaction-level and demoted to supporting evidence); or (2) the explicit stable line-level "
+                 "fingerprint (customer, transaction date, item, quantity, rate -- never the fiscal period or any "
+                 "other report/export column) is identical, with at least two identity-grade fields (customer, date, "
+                 "item, rate) present, and any mapped transaction-level ID agreeing. Quantity alone is never "
+                 "enough. Amounts are compared as signed cents, so a reversal is never a duplicate. Rows that "
+                 "share the key without that confirmation -- and weaker PO+amount / invoice+amount groups -- stay "
+                 "active through every matching pass (including the duplicate-cluster pairing after Priorities 1-3). "
+                 "Once matching and historical clearance complete, such a group is decided as a whole: if ANY member "
+                 "matched, every unmatched member is a potential duplicate of it and is HELD FOR REVIEW "
+                 "(REVIEW_HOLD_POTENTIAL_DUPLICATE), out of the proposed JE; if NO member matched, the earliest-listed "
+                 "member stays an exception and every other member is held against it. Insufficient evidence creates "
+                 "a review hold -- never an automatic exclusion and never an automatic additional accrual. The "
+                 "identical standard of evidence applies to every dataset -- QuickBooks primary, Infinium primary, "
+                 "and both historical files -- because any exclusion changes the candidate pool the matching passes see."
              )},
             {"Priority": 15, "Rule": "Infinium duplicate-key groups: matched normally, held if unresolved",
              "Automatic": "Conditional",
@@ -3057,8 +3641,9 @@ def build_rules_and_config(
                  "population is grouped and its total compared, exactly (no tolerance), to the grouped Infinium "
                  "total for the same PO among the rows still unresolved there. A PO whose grouped totals already "
                  "tie exactly was already accepted as a real match by Priority 5 and never reaches this "
-                 "classification. Unlike Priority 18 and 20, these rows are NOT withheld -- they remain in the "
-                 "accrual exactly as an ordinary exception would, labeled 'PO Re-use Error' with a grouped "
+                 "classification. A flagged row with Infinium evidence for its PO is HELD for review "
+                 "(REVIEW_HOLD_PO_REUSE) and kept out of the proposed JE; a flagged row with none remains a "
+                 "true unmatched transaction. Either way it is labeled 'PO Re-use Error' with a grouped "
                  "PO/QuickBooks-total/Infinium-total/difference/row-count detail for review."
              )},
             {"Priority": 22, "Rule": "Match references (see assign_match_references)", "Automatic": "Labeling only",
@@ -3071,6 +3656,19 @@ def build_rules_and_config(
                  "that match in 'Referenced Match Ref.'. validate_match_references proves each reference is unique, "
                  "correctly typed, shared by all of its records, and that every cited match exists and contains "
                  "the record cited. No matching decision, amount, or journal-entry input depends on a reference."
+             )},
+            {"Priority": 23, "Rule": "Final QuickBooks disposition and JE population", "Automatic": "Yes",
+             "Requirement": (
+                 "Exact QuickBooks duplicates (normalized PO + invoice + signed cents, all present) keep one "
+                 "canonical row and exclude every excess copy BEFORE matching. After all matching passes, every "
+                 "QuickBooks source row receives exactly one final disposition: MATCHED, "
+                 "EXACT_QBO_DUPLICATE_EXCLUDED, REVIEW_HOLD, or TRUE_UNMATCHED. A row with reference evidence in "
+                 "Infinium that could not be matched (PO/invoice already represented by a match, amount variance, "
+                 "non-unique exact candidate, ambiguous candidates, unreadable amount) is a REVIEW_HOLD, never a "
+                 "genuine missing transaction. Only TRUE_UNMATCHED rows -- plus the separately documented PO Re-use "
+                 "Error groups -- feed the proposed JE, which is computed from that ledger, never from a generic "
+                 "exception table. Infinium-only exceptions are informational and never offset the QuickBooks JE. "
+                 "Controls prove source rows and dollars tie to their final dispositions."
              )},
         ]
     )
@@ -3253,7 +3851,10 @@ def build_controls(
     ambiguous_duplicate_qb_rows: list[int],
     fuzzy_match_review_hold_qb_rows: list[int],
     fuzzy_match_review_hold_inf_rows: list[int],
+    reference_hold_qb_rows: Optional[list[int]] = None,
+    qb_dispositions: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
+    reference_hold_qb_rows = reference_hold_qb_rows or []
     matched_q = _matched_row_indexes(matches, "QB")
     matched_i = _matched_row_indexes(matches, "INF")
     historical_q = _historical_row_indexes(
@@ -3283,6 +3884,7 @@ def build_controls(
     ambiguous_q_total = _amount_total(qb, ambiguous_duplicate_qb_rows)
     fuzzy_hold_q_total = _amount_total(qb, fuzzy_match_review_hold_qb_rows)
     fuzzy_hold_i_total = _amount_total(inf, fuzzy_match_review_hold_inf_rows)
+    reference_hold_q_total = _amount_total(qb, reference_hold_qb_rows)
     historical_difference = (
         round(float(historical_clearances["Amount Difference"].sum()), 2)
         if not historical_clearances.empty else 0.0
@@ -3291,7 +3893,8 @@ def build_controls(
         ("QuickBooks row completeness", len(qb),
          len(matched_q) + len(historical_q) + len(unmatched_qb) + len(duplicate_qb_rows)
          + len(duplicate_review_hold_qb_rows) + len(amount_variance_review_hold_qb_rows)
-         + len(ambiguous_duplicate_qb_rows) + len(fuzzy_match_review_hold_qb_rows)),
+         + len(ambiguous_duplicate_qb_rows) + len(fuzzy_match_review_hold_qb_rows)
+         + len(reference_hold_qb_rows)),
         ("Infinium row completeness", len(inf),
          len(matched_i) + len(historical_i) + len(unmatched_inf) + len(duplicate_inf_rows)
          + len(duplicate_review_hold_inf_rows) + len(amount_variance_review_hold_inf_rows)
@@ -3300,7 +3903,7 @@ def build_controls(
          cents_to_float(
              matched_q_total + historical_q_total + unresolved_q_total
              + duplicate_q_total + review_hold_q_total + variance_hold_q_total
-             + ambiguous_q_total + fuzzy_hold_q_total
+             + ambiguous_q_total + fuzzy_hold_q_total + reference_hold_q_total
          )),
         ("Infinium amount roll-forward", cents_to_float(inf_total),
          cents_to_float(
@@ -3314,7 +3917,7 @@ def build_controls(
          cents_to_float(
              qb_total - matched_q_total - historical_q_total
              - duplicate_q_total - review_hold_q_total - variance_hold_q_total
-             - ambiguous_q_total - fuzzy_hold_q_total
+             - ambiguous_q_total - fuzzy_hold_q_total - reference_hold_q_total
          )),
         ("Excess QuickBooks copies excluded from JE", cents_to_float(duplicate_q_total),
          cents_to_float(duplicate_q_total)),
@@ -3326,7 +3929,28 @@ def build_controls(
          cents_to_float(ambiguous_q_total), cents_to_float(ambiguous_q_total)),
         ("Fuzzy match review hold QuickBooks items excluded from automatic JE",
          cents_to_float(fuzzy_hold_q_total), cents_to_float(fuzzy_hold_q_total)),
+        ("Reference-evidence review hold QuickBooks items excluded from automatic JE",
+         cents_to_float(reference_hold_q_total), cents_to_float(reference_hold_q_total)),
+        # Informational: Infinium-only exceptions are reported in their own total and
+        # can never offset the QuickBooks-based journal entry.
+        ("Infinium-only exceptions reported separately (no QuickBooks JE effect)",
+         cents_to_float(unresolved_i_total), cents_to_float(unresolved_i_total)),
     ]
+    if qb_dispositions is not None:
+        # Source rows must tie to their final dispositions in count AND dollars,
+        # and the proposed JE is by definition the TRUE_UNMATCHED rows alone.
+        ledger_amounts = qb_dispositions["Amount"].fillna(0.0)
+        true_unmatched = qb_dispositions["Final Disposition"].eq(DISPOSITION_TRUE_UNMATCHED)
+        records.extend([
+            ("Source QuickBooks rows = Matched + Confirmed Duplicate Excluded + Review-Hold + True-Unmatched rows",
+             len(qb), int(qb_dispositions["Final Disposition"].isin(FINAL_DISPOSITIONS).sum())),
+            ("Every QuickBooks source row has exactly one final disposition",
+             len(qb), int(qb_dispositions["QBO Row ID"].nunique())),
+            ("Source QuickBooks amount = Matched + Confirmed Duplicate Excluded + Review-Hold + True-Unmatched amounts",
+             round(cents_to_float(qb_total), 2), round(float(ledger_amounts.sum()), 2)),
+            ("Proposed JE = sum of TRUE_UNMATCHED QuickBooks amounts",
+             round(cents_to_float(unresolved_q_total), 2), round(float(ledger_amounts[true_unmatched].sum()), 2)),
+        ])
     output = []
     for check, expected, actual in records:
         difference = float(expected) - float(actual)
@@ -3385,29 +4009,47 @@ def build_reconciliation(
     # are reported for review without automatic exclusion. Historical frames
     # are additionally compared with their own primary population so an
     # overlapping historical row cannot clear an opposing primary exception.
-    # QuickBooks is the sole accrual basis, so a same-key group here is never
-    # pre-collapsed before matching is attempted -- every member stays active
-    # and eligible to match normally (see _duplicate_cluster_pairs), and the
-    # post-matching accounting below decides how many of them really belong
-    # in the accrual based on how many the group actually ties out against
-    # Infinium. Infinium duplicates keep the original pre-matching collapse
-    # since Infinium carries no accrual effect of its own.
+    # A CONFIRMED QuickBooks exact duplicate -- identical normalized PO, invoice,
+    # and signed cents, plus a shared line-level source ID or a sufficient
+    # identical fingerprint of the explicit stable line-level fields (customer,
+    # date, item, quantity, rate) -- is decided BEFORE any matching: the earliest row
+    # is the canonical one and every excess copy is excluded from matching and
+    # from the proposed JE. Rows that share the key but are not confirmed copies
+    # (e.g. two real sales with different customers or dates), and the weaker
+    # PO-only / invoice-only groups, stay fully active through matching; the
+    # post-matching accounting below decides what happens to them.
     qb_screen = screen_duplicates(
         qb, QB_ID, "QuickBooks", "Primary",
-        "Every group member stays active for matching; see the post-matching duplicate "
-        "accounting for how many of an unresolved group end up in the accrual.",
-        auto_exclude_strict=False,
+        "A confirmed exact QuickBooks duplicate (same PO, invoice, and signed cents AND a shared "
+        "line-level source ID or a sufficient identical stable-field fingerprint) keeps one canonical row; every excess "
+        "copy is excluded before matching and from the proposed JE. A row that shares only the "
+        "key is a potential duplicate: it stays active for matching and, if it does not match, "
+        "is held for review -- see the post-matching duplicate accounting.",
+        auto_exclude_strict=True,
+        fingerprint_columns=_fingerprint_columns(qb_mapping),
+        # The same standard of evidence applies to EVERY dataset: an exclusion
+        # needs a trusted line-level ID or sufficient line-identity evidence --
+        # never quantity alone -- or the sibling is held for review. (Even a
+        # non-JE exclusion changes the candidate pool the QuickBooks passes see.)
+        identity_columns=_identity_columns(qb_mapping),
+        min_identity_fields=MIN_IDENTITY_FIELDS,
     )
     inf_screen = screen_duplicates(
         inf, INF_ID, "Infinium", "Primary",
         "Strong groups retain one canonical row; only excess copies are excluded from matching.",
         auto_exclude_strict=True,
+        fingerprint_columns=_fingerprint_columns(inf_mapping),
+        identity_columns=_identity_columns(inf_mapping),
+        min_identity_fields=MIN_IDENTITY_FIELDS,
     )
     qb_secondary_screen = (
         screen_duplicates(
             qb_secondary, QB_ID, "QuickBooks", "Historical (Secondary)",
             "Excess copies and rows overlapping QuickBooks primary are excluded from clearance.",
             auto_exclude_strict=True,
+            fingerprint_columns=_fingerprint_columns(qb_secondary_mapping),
+            identity_columns=_identity_columns(qb_secondary_mapping),
+            min_identity_fields=MIN_IDENTITY_FIELDS,
             reference_frame=qb_screen.active_frame,
             reference_id_column=QB_ID,
         )
@@ -3418,6 +4060,9 @@ def build_reconciliation(
             inf_secondary, INF_ID, "Infinium", "Historical (Secondary)",
             "Excess copies and rows overlapping Infinium primary are excluded from clearance.",
             auto_exclude_strict=True,
+            fingerprint_columns=_fingerprint_columns(inf_secondary_mapping),
+            identity_columns=_identity_columns(inf_secondary_mapping),
+            min_identity_fields=MIN_IDENTITY_FIELDS,
             reference_frame=inf_screen.active_frame,
             reference_id_column=INF_ID,
         )
@@ -3486,18 +4131,18 @@ def build_reconciliation(
         candidates, match_register, qb, inf, qb_screen.report,
     )
 
-    # QuickBooks duplicate-key groups stayed fully active through matching
-    # instead of being pre-collapsed (see the QB screen_duplicates call
-    # above). Now that matching and historical clearance are both final,
-    # decide -- per group -- how many of them really belong in the accrual:
-    #   * If ANY member of the group matched, every member that didn't is
-    #     an ordinary accrual exception in its own right. A real match
-    #     elsewhere in the group is evidence the pattern genuinely recurs,
-    #     not a data-entry duplicate, so it must never be quietly dropped.
-    #   * If NO member of the group matched at all, there is zero evidence
-    #     more than one real transaction exists -- only the earliest-listed
-    #     member is kept as an exception and the rest are excluded, exactly
-    #     as a confirmed duplicate has always been treated.
+    # Rows that share a duplicate key but are NOT confirmed copies of one
+    # transaction (different customer/date/native ID, or a weaker PO-only /
+    # invoice-only key) stayed fully active through matching. Now that matching
+    # and historical clearance are both final, decide -- per group -- what is
+    # safe. A potential duplicate is never discarded on the key alone:
+    #   * If ANY member matched, every member that did not is a potential
+    #     duplicate of that matched sibling -- it may already be represented, so
+    #     it is HELD for review, out of the proposed JE, not accrued.
+    #   * If NO member matched, the earliest-listed member is the group's
+    #     representative and stays an ordinary exception; every other member is
+    #     held as a potential duplicate of it. Nothing is excluded or accrued on
+    #     the strength of the key alone.
     qb_group_id_by_index: dict[int, str] = {}
     if not qb_screen.report.empty:
         qb_report_group_by_id = (
@@ -3512,36 +4157,38 @@ def build_reconciliation(
     for idx, group_id in qb_group_id_by_index.items():
         qb_duplicate_groups[group_id].append(idx)
 
-    qb_zero_evidence_excess: list[int] = []
     resolved_suspected_qb_ids: set[Any] = set()
     canonical_survivor_qb_ids: set[Any] = set()
-    excess_canonical_qb_ids: dict[Any, Any] = {}
-    for members in qb_duplicate_groups.values():
-        matched_members = [idx for idx in members if idx not in unmatched_qb]
-        unmatched_members = [idx for idx in members if idx in unmatched_qb]
-        if matched_members:
-            resolved_suspected_qb_ids.update(qb.at[idx, QB_ID] for idx in members)
-        elif unmatched_members:
-            # Nothing in this group matched at all, so the survivor is not
-            # "resolved via a match" -- it is retained as the group's sole
-            # canonical representative, same as a pre-matching canonical row.
-            ordered = sorted(unmatched_members, key=lambda idx: qb.at[idx, SOURCE_POS])
-            survivor_id = qb.at[ordered[0], QB_ID]
-            canonical_survivor_qb_ids.add(survivor_id)
-            qb_zero_evidence_excess.extend(ordered[1:])
-            for idx in ordered[1:]:
-                excess_canonical_qb_ids[qb.at[idx, QB_ID]] = survivor_id
-    # The QB exclusion set now includes both any pre-matching exclusions
-    # (there are none while auto_exclude_strict=False, but this stays
-    # correct if that ever changes) and the post-matching zero-evidence
-    # excess rows decided above -- every downstream consumer of "which QB
-    # rows are excluded duplicates" must use this, not qb_screen.duplicate_rows
-    # directly, or it will silently see the pre-matching-only, now-stale view.
-    duplicate_qb_rows_final = sorted(set(qb_screen.duplicate_rows) | set(qb_zero_evidence_excess))
-
+    held_canonical_qb_ids: dict[Any, Any] = {}
     duplicate_review_hold_qb: list[int] = []
     held_suspected_qb_ids: set[Any] = set()
-    unmatched_qb = sorted(set(unmatched_qb) - set(qb_zero_evidence_excess))
+    for members in qb_duplicate_groups.values():
+        matched_members = sorted(
+            (idx for idx in members if idx not in unmatched_qb), key=lambda idx: qb.at[idx, SOURCE_POS],
+        )
+        unmatched_members = sorted(
+            (idx for idx in members if idx in unmatched_qb), key=lambda idx: qb.at[idx, SOURCE_POS],
+        )
+        if matched_members:
+            representative_id = qb.at[matched_members[0], QB_ID]
+            resolved_suspected_qb_ids.update(qb.at[idx, QB_ID] for idx in matched_members)
+            held = unmatched_members
+        elif unmatched_members:
+            representative_id = qb.at[unmatched_members[0], QB_ID]
+            canonical_survivor_qb_ids.add(representative_id)
+            held = unmatched_members[1:]
+        else:
+            continue
+        duplicate_review_hold_qb.extend(held)
+        for idx in held:
+            held_suspected_qb_ids.add(qb.at[idx, QB_ID])
+            held_canonical_qb_ids[qb.at[idx, QB_ID]] = representative_id
+    # Only CONFIRMED exact duplicates are excluded, and all of them were
+    # excluded before matching -- this is the only source of excluded QB rows.
+    duplicate_qb_rows_final = sorted(set(qb_screen.duplicate_rows))
+
+    duplicate_review_hold_qb = sorted(set(duplicate_review_hold_qb))
+    unmatched_qb = sorted(set(unmatched_qb) - set(duplicate_review_hold_qb))
 
     # Infinium carries no accrual effect of its own, so its weak-basis
     # duplicate candidates keep the original policy: stay active through
@@ -3592,6 +4239,29 @@ def build_reconciliation(
     # traceable classification and grouped detail.
     po_reuse_errors = build_po_reuse_errors(qb, inf, unmatched_qb, unmatched_inf)
 
+    # Anything still "unmatched" that nevertheless has evidence of an Infinium
+    # counterpart -- a PO/invoice an accepted match already consumed, a reused PO,
+    # a single reference candidate whose amount differs, an exact candidate that is
+    # not uniquely available, several controlled-typo candidates, a historical
+    # record withheld by an unresolved duplicate, an unreadable amount -- cannot
+    # be called a genuine missing transaction: "I cannot safely match this" is not
+    # "this does not exist in Infinium". Those rows are held out of the proposed JE.
+    # Only a row with NO support anywhere stays in the JE population.
+    withheld_inf_secondary = (
+        inf_secondary.loc[inf_secondary_screen.suspected_rows]
+        if inf_secondary is not None and inf_secondary_screen is not None
+        and inf_secondary_screen.suspected_rows else None
+    )
+    withheld_group_by_id = (
+        dict(zip(inf_secondary_screen.report["Source Row ID"], inf_secondary_screen.report["Duplicate Group ID"]))
+        if inf_secondary_screen is not None and not inf_secondary_screen.report.empty else {}
+    )
+    reference_hold_analysis, reference_hold_qb = build_reference_evidence_review_holds(
+        qb, inf, candidates, unmatched_qb, match_register,
+        po_reuse_errors, withheld_inf_secondary, withheld_group_by_id,
+    )
+    unmatched_qb = sorted(set(unmatched_qb).difference(reference_hold_qb))
+
     # Finalized (post-matching) duplicate reports are computed here, before
     # build_paired_rows, because the QuickBooks accounting above now makes a
     # genuinely post-matching decision (excess vs. ordinary exception) that
@@ -3602,8 +4272,8 @@ def build_reconciliation(
         qb_screen.report,
         resolved_ids=resolved_suspected_qb_ids,
         held_ids=held_suspected_qb_ids,
-        excess_ids=excess_canonical_qb_ids,
         canonical_survivor_ids=canonical_survivor_qb_ids,
+        held_canonical_ids=held_canonical_qb_ids,
     )
     inf_primary_duplicate_report = finalize_review_dispositions(
         inf_screen.report,
@@ -3622,12 +4292,17 @@ def build_reconciliation(
         qb_primary_duplicate_report,
         inf_primary_duplicate_report,
         match_register,
+        reference_hold_analysis,
+    )
+    qb_dispositions = build_qb_dispositions(
+        paired_rows, qb, set(po_reuse_error_qb_index_map(po_reuse_errors)), match_register,
     )
     normalization = build_normalization_detail(qb, inf, qb_mapping, inf_mapping)
     assessments = build_match_assessments(
         matches, historical_clearances, unmatched_qb, qb, inf, candidates,
         amount_variance_analysis,
         ambiguous_duplicate_analysis,
+        reference_hold_analysis,
     )
     method_summary = build_method_summary(
         matches, historical_clearances, unmatched_qb, unmatched_inf, qb, inf,
@@ -3636,12 +4311,14 @@ def build_reconciliation(
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
         ambiguous_duplicate_qb,
         fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
+        reference_hold_qb,
     )
     exception_analysis = build_exception_analysis(
         qb, inf, unmatched_qb, unmatched_inf, candidates,
         amount_variance_analysis, paired_rows,
         fuzzy_match_review_hold_analysis,
         ambiguous_duplicate_analysis,
+        reference_hold_analysis,
     )
     qb_secondary_duplicate_report = (
         finalize_review_dispositions(
@@ -3684,6 +4361,8 @@ def build_reconciliation(
         amount_variance_review_hold_qb, amount_variance_review_hold_inf,
         ambiguous_duplicate_qb,
         fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
+        reference_hold_qb,
+        qb_dispositions,
     )
     rules, config = build_rules_and_config(
         qb_mapping,
@@ -3739,6 +4418,8 @@ def build_reconciliation(
         posting_blockers.append("unresolved ambiguous duplicate candidates")
     if not fuzzy_match_review_hold_analysis.empty:
         posting_blockers.append("unresolved fuzzy PO match review holds")
+    if not reference_hold_analysis.empty:
+        posting_blockers.append("unresolved reference-evidence review holds")
     if qb[AMOUNT_CENTS].isna().any():
         posting_blockers.append("invalid QuickBooks amounts")
     if inf[AMOUNT_CENTS].isna().any():
@@ -3851,6 +4532,9 @@ def build_reconciliation(
         "Fuzzy Match Review Hold Infinium Amount": cents_to_float(
             _amount_total(inf, fuzzy_match_review_hold_inf)
         ),
+        "Reference Review Hold QuickBooks Rows": len(reference_hold_analysis),
+        "Reference Review Hold QuickBooks Amount": cents_to_float(_amount_total(qb, reference_hold_qb)),
+        **_final_disposition_metrics(qb_dispositions),
         "Posting Blockers": "; ".join(posting_blockers) if posting_blockers else "None",
         "Posting Status": "REVIEW REQUIRED" if posting_blockers else "READY TO POST",
         "Posting Authorization": "DO NOT POST" if posting_blockers else "AUTHORIZED BY AUTOMATED CONTROLS",
@@ -3920,7 +4604,7 @@ def build_reconciliation(
         duplicate_inf_rows=inf_screen.duplicate_rows,
         duplicate_qb_secondary_rows=qb_secondary_screen.duplicate_rows if qb_secondary_screen else [],
         duplicate_inf_secondary_rows=inf_secondary_screen.duplicate_rows if inf_secondary_screen else [],
-        suspected_qb_rows=sorted(set(qb_screen.suspected_rows) - set(qb_zero_evidence_excess)),
+        suspected_qb_rows=sorted(set(qb_screen.suspected_rows)),
         suspected_inf_rows=inf_screen.suspected_rows,
         suspected_qb_secondary_rows=qb_secondary_screen.suspected_rows if qb_secondary_screen else [],
         suspected_inf_secondary_rows=inf_secondary_screen.suspected_rows if inf_secondary_screen else [],
@@ -3935,9 +4619,78 @@ def build_reconciliation(
         fuzzy_match_review_hold_analysis=fuzzy_match_review_hold_analysis,
         fuzzy_match_review_hold_qb_rows=fuzzy_match_review_hold_qb,
         fuzzy_match_review_hold_inf_rows=fuzzy_match_review_hold_inf,
+        reference_hold_analysis=reference_hold_analysis,
+        reference_hold_qb_rows=reference_hold_qb,
+        qb_dispositions=qb_dispositions,
     )
     validate_reconciliation(result)
     return result
+
+
+def _validate_reference_holds_and_dispositions(
+    result: "ReconciliationResult", reference_hold_qb: set[int],
+) -> None:
+    """The reference-evidence hold population and the final-disposition ledger
+    must agree exactly with every other population, and the proposed JE must
+    be built from TRUE_UNMATCHED rows only."""
+    unmatched = set(result.unmatched_qb)
+    duplicates = set(result.duplicate_qb_rows)
+    other_holds = (
+        set(result.duplicate_review_hold_qb_rows)
+        | set(result.amount_variance_review_hold_qb_rows)
+        | set(result.ambiguous_duplicate_qb_rows)
+        | set(result.fuzzy_match_review_hold_qb_rows)
+    )
+    matched: set[int] = set()
+    for group in result.matches:
+        matched.update(group.qb_rows)
+    if not result.historical_clearances.empty:
+        matched.update(_historical_row_indexes(result.historical_clearances, "QuickBooks Primary", "Primary Row Index"))
+    if reference_hold_qb & (unmatched | duplicates | other_holds | matched):
+        raise ValueError(
+            "Reference-evidence review hold control failure: a held row also appears in another "
+            "financial disposition population."
+        )
+    report = result.reference_hold_analysis
+    if len(report) != len(reference_hold_qb) or (
+        not report.empty and set(report["QuickBooks Row Index"].astype(int)) != reference_hold_qb
+    ):
+        raise ValueError(
+            "Reference-evidence review hold audit control failure: report and held-row populations do not agree."
+        )
+
+    ledger = result.qb_dispositions
+    if ledger is None or ledger.empty and len(result.qb_work):
+        raise ValueError("QuickBooks disposition control failure: the final-disposition ledger is missing.")
+    if ledger["QBO Row ID"].duplicated().any() or len(ledger) != len(result.qb_work):
+        raise ValueError(
+            "QuickBooks disposition control failure: every source row must have exactly one final disposition."
+        )
+    if set(ledger["Final Disposition"]) - set(FINAL_DISPOSITIONS):
+        raise ValueError("QuickBooks disposition control failure: unknown final disposition.")
+    id_by_index = result.qb_work[QB_ID].to_dict()
+    expected = {
+        DISPOSITION_MATCHED: {id_by_index[i] for i in matched},
+        DISPOSITION_DUPLICATE_EXCLUDED: {id_by_index[i] for i in duplicates},
+        DISPOSITION_REVIEW_HOLD: {id_by_index[i] for i in other_holds | reference_hold_qb},
+        DISPOSITION_TRUE_UNMATCHED: {id_by_index[i] for i in unmatched},
+    }
+    for disposition, ids in expected.items():
+        found = set(ledger.loc[ledger["Final Disposition"] == disposition, "QBO Row ID"])
+        if found != ids:
+            raise ValueError(
+                f"QuickBooks disposition control failure: {disposition} rows in the ledger do not "
+                "agree with the reconciliation populations."
+            )
+    # Nothing recognised as a duplicate, a possible duplicate, an amount conflict,
+    # or an already-represented record may reach the automatic journal entry.
+    journal = ledger.loc[ledger["In Proposed JE"] == "Yes"]
+    if set(journal["Final Disposition"]) - {DISPOSITION_TRUE_UNMATCHED}:
+        raise ValueError(
+            "Proposed JE control failure: a row that is not TRUE_UNMATCHED feeds the journal entry."
+        )
+    if not journal.empty and journal["Reason Code"].str.startswith("REVIEW_HOLD").any():
+        raise ValueError("Proposed JE control failure: a review-hold row feeds the journal entry.")
 
 
 def validate_reconciliation(result: ReconciliationResult) -> None:
@@ -3953,6 +4706,7 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
     ambiguous_qb = set(result.ambiguous_duplicate_qb_rows)
     fuzzy_hold_qb = set(result.fuzzy_match_review_hold_qb_rows)
     fuzzy_hold_inf = set(result.fuzzy_match_review_hold_inf_rows)
+    reference_hold_qb = set(result.reference_hold_qb_rows)
     if duplicate_qb.intersection(result.suspected_qb_rows):
         raise ValueError(
             "Duplicate disposition control failure: a QuickBooks row was both "
@@ -4018,17 +4772,18 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
                 )
     po_reuse_report = result.po_reuse_errors
     if not po_reuse_report.empty:
-        # PO Re-use Error rows are the one population that stays IN the
-        # accrual (unlike every review-hold population above), so the
-        # relevant control is that they were never *also* pulled into an
-        # excluding population, not that they're disjoint from unmatched_qb.
+        # A PO Re-use Error row with Infinium evidence is held; one with none
+        # stays a true unmatched row. Either way it must sit in exactly one of
+        # those two populations and never in another excluding one.
         po_reuse_qb_indexes = set(po_reuse_error_qb_index_map(po_reuse_report))
-        if not po_reuse_qb_indexes.issubset(set(result.unmatched_qb)):
+        if not po_reuse_qb_indexes.issubset(set(result.unmatched_qb) | reference_hold_qb):
             raise ValueError(
-                "PO Re-use Error audit control failure: a flagged row is no longer in the "
-                "unresolved QuickBooks accrual population."
+                "PO Re-use Error audit control failure: a flagged row is in neither the true "
+                "unmatched population nor the review hold."
             )
-        if po_reuse_qb_indexes.intersection(duplicate_qb | review_hold_qb | variance_hold_qb | ambiguous_qb):
+        if po_reuse_qb_indexes.intersection(
+            duplicate_qb | review_hold_qb | variance_hold_qb | ambiguous_qb
+        ):
             raise ValueError(
                 "PO Re-use Error audit control failure: a flagged row also appears in another "
                 "financial disposition population."
@@ -4334,6 +5089,7 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
                     "Historical one-to-one clearance has invalid cardinality."
                 )
     exception_sections = {
+        REFERENCE_HOLD_SECTION,
         "02 Unmatched QuickBooks",
         "03 Unmatched Infinium",
         "04 Duplicate QuickBooks",
@@ -4391,5 +5147,6 @@ def validate_reconciliation(result: ReconciliationResult) -> None:
     if set(inf_occurrences) != expected_inf or any(count != 1 for count in inf_occurrences.values()):
         raise ValueError("Infinium rows were dropped or duplicated while building the reconciled output.")
     # Last, so every existing control keeps precedence (and its own message)
-    # over the match-reference control.
+    # over the disposition-ledger and match-reference controls.
+    _validate_reference_holds_and_dispositions(result, reference_hold_qb)
     validate_match_references(result)
