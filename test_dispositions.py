@@ -424,7 +424,7 @@ def test_the_exceptions_table_holds_only_true_unmatched_rows_and_holds_are_itemi
     assert statuses == ["No matching Infinium records"]
     # The held rows are itemized in their own section, with the reason for each.
     text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
-    assert "REVIEW HOLD | REFERENCE EVIDENCE IN INFINIUM - NOT ACCRUED" in text
+    assert "REVIEW HOLDS | EXCLUDED FROM PROPOSED JE - REQUIRES DOCUMENTED DISPOSITION" in text
     assert "Review Hold — PO Already Represented by Match M-001" in text
     assert "Review Hold — Amount Variance" in text
 
