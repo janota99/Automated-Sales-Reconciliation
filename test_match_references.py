@@ -421,10 +421,10 @@ def test_control_rejects_the_wrong_prefix_for_the_relationship_type(referenced_r
 
 
 def test_workbooks_refuse_to_export_a_result_that_fails_the_reference_control(referenced_result):
-    from workpapers import build_analytics_workbook, build_legacy_workbook, build_primary_workbook
+    from workpapers import build_legacy_workbook, build_primary_workbook
 
     broken = _break(referenced_result, lambda r: setattr(r.matches[0], "match_ref", ""))
-    for builder in (build_primary_workbook, build_legacy_workbook, build_analytics_workbook):
+    for builder in (build_primary_workbook, build_legacy_workbook):
         with pytest.raises(ValueError, match="Match reference control failure"):
             builder(broken)
 

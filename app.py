@@ -17,13 +17,13 @@ focused on "what happens, in what order":
     ingestion.py           Source file reading, header detection, column mapping.
     matching.py            Normalization, matching, and analytical rules.
 
-The app produces two files from one controlled reconciliation run:
+The app produces one accounting workpaper from one controlled reconciliation
+run, plus an optional simplified export:
     1. Sales_Reconciliation_<run>.xlsx
-       Raw Data, Reconciliation Detail, Unresolved Exceptions, and
-       Product Aggregate Summary.
-    2. Sales_Reconciliation_Analytics_<run>.xlsx
-       Optional technical evidence, normalization, method analytics,
-       controls, and run configuration.
+       Posting Summary, Reconciliation Detail, Unresolved Exceptions,
+       Product Aggregates, and Raw Data.
+    2. Sales_Reconciliation_Legacy_<run>.xlsx (optional)
+       A simplified accountant's legacy-format export.
 """
 
 from __future__ import annotations
@@ -398,7 +398,7 @@ def main() -> None:
     st.sidebar.markdown("## Configuration Settings")
 
     if qb_file is None or inf_file is None:
-        for state_key in ("reconciliation_result", "primary_workbook", "analytics_workbook"):
+        for state_key in ("reconciliation_result", "primary_workbook"):
             st.session_state.pop(state_key, None)
 
         with progress_container:
@@ -856,7 +856,6 @@ def main() -> None:
             # Workbook bytes are generated only from the Downloads tab. This
             # keeps the reconciliation action focused on matching and controls.
             st.session_state.pop("primary_workbook", None)
-            st.session_state.pop("analytics_workbook", None)
             st.rerun()
         except Exception as exc:
             st.error(f"Reconciliation stopped safely: {exc}")

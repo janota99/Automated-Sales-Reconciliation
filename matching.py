@@ -95,8 +95,6 @@ __all__ = [
     "build_qb_dispositions",
     "build_reference_evidence_review_holds",
     "build_po_reuse_errors",
-    "build_product_disposition_summary",
-    "PRODUCT_DISPOSITION_COLUMNS",
     "build_reference_amount_variances",
     "build_reconciliation",
     "cents_or_zero",
@@ -251,7 +249,6 @@ class ReconciliationResult:
     reference_hold_analysis: pd.DataFrame = field(default_factory=pd.DataFrame)
     reference_hold_qb_rows: list[int] = field(default_factory=list)
     qb_dispositions: pd.DataFrame = field(default_factory=pd.DataFrame)
-    product_disposition_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @lru_cache(maxsize=4096)
@@ -3488,60 +3485,6 @@ def build_product_summary(
     )
 
 
-PRODUCT_DISPOSITION_COLUMNS = [
-    "Product Name", "QuickBooks Rows", "Matched Rows", "Matched %",
-    "JE Support Rows", "JE Support Amount",
-    "Review Hold Rows", "Review Hold Amount",
-    "Duplicate Excluded Rows",
-]
-
-
-def build_product_disposition_summary(
-    qb: pd.DataFrame,
-    mapping: dict[str, Optional[str]],
-    qb_dispositions: pd.DataFrame,
-    current_fiscal_period: Optional[int] = None,
-    fiscal_year: Optional[int] = None,
-) -> pd.DataFrame:
-    """Product Aggregate Summary, made decision-oriented: for every
-    classified product, how many rows matched, how much is proposed JE
-    support (TRUE_UNMATCHED), how much is on review hold, and how many
-    copies were excluded as duplicates -- not just a quantity/value total
-    that "does not affect matching" and stops there. Same product
-    classification and period scope as build_product_summary; every QBO row
-    still appears in exactly one product row here, via qb_dispositions."""
-    if not mapping.get("quantity") or not mapping.get("amount") or qb_dispositions.empty:
-        return pd.DataFrame(columns=PRODUCT_DISPOSITION_COLUMNS)
-    work = qb[qb[PRODUCT_STANDARD].notna()].copy()
-    if current_fiscal_period is not None:
-        expected_label = f"P{int(current_fiscal_period):02d}-{int(fiscal_year or 0)}"
-        work = work.loc[work[FISCAL_LABEL].eq(expected_label)].copy()
-    if work.empty:
-        return pd.DataFrame(columns=PRODUCT_DISPOSITION_COLUMNS)
-    work = work[[PRODUCT_STANDARD, QB_ID]].merge(
-        qb_dispositions[["QBO Row ID", "Final Disposition", "Amount"]],
-        left_on=QB_ID, right_on="QBO Row ID", how="left",
-    )
-    records: list[dict[str, Any]] = []
-    for product, group in work.groupby(PRODUCT_STANDARD, sort=True):
-        matched = group.loc[group["Final Disposition"] == DISPOSITION_MATCHED]
-        je_support = group.loc[group["Final Disposition"] == DISPOSITION_TRUE_UNMATCHED]
-        review_hold = group.loc[group["Final Disposition"] == DISPOSITION_REVIEW_HOLD]
-        duplicate = group.loc[group["Final Disposition"] == DISPOSITION_DUPLICATE_EXCLUDED]
-        records.append({
-            "Product Name": product,
-            "QuickBooks Rows": len(group),
-            "Matched Rows": len(matched),
-            "Matched %": len(matched) / len(group) if len(group) else 0.0,
-            "JE Support Rows": len(je_support),
-            "JE Support Amount": round(float(je_support["Amount"].fillna(0).sum()), 2),
-            "Review Hold Rows": len(review_hold),
-            "Review Hold Amount": round(float(review_hold["Amount"].fillna(0).sum()), 2),
-            "Duplicate Excluded Rows": len(duplicate),
-        })
-    return pd.DataFrame(records, columns=PRODUCT_DISPOSITION_COLUMNS).sort_values("Product Name").reset_index(drop=True)
-
-
 def _period_sort(label: str) -> tuple[int, int, str]:
     match = re.fullmatch(r"P(\d{2})-(\d{4})", str(label))
     if not match:
@@ -4501,9 +4444,6 @@ def build_reconciliation(
         metadata.get("fiscal_period"),
         fiscal_year,
     )
-    product_disposition_summary = build_product_disposition_summary(
-        qb, qb_mapping, qb_dispositions, metadata.get("fiscal_period"), fiscal_year,
-    )
     controls = build_controls(
         qb, inf, matches, historical_clearances, unmatched_qb, unmatched_inf,
         duplicate_qb_rows_final, inf_screen.duplicate_rows,
@@ -4772,7 +4712,6 @@ def build_reconciliation(
         reference_hold_analysis=reference_hold_analysis,
         reference_hold_qb_rows=reference_hold_qb,
         qb_dispositions=qb_dispositions,
-        product_disposition_summary=product_disposition_summary,
     )
     validate_reconciliation(result)
     return result

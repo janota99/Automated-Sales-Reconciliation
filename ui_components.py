@@ -20,7 +20,6 @@ import streamlit as st
 from matching import QB_ID, ReconciliationResult, numeric_sum
 from utils import format_currency
 from workpapers import (
-    build_analytics_workbook,
     build_legacy_workbook,
     build_primary_workbook,
     paired_display_frames,
@@ -353,10 +352,9 @@ def render_result(result: ReconciliationResult) -> None:
                 f"{review_hold_qb:,} QuickBooks record(s) totaling {format_currency(review_hold_amount)} are "
                 "on review hold: they could not be safely matched but have duplicate, amount, or reference "
                 "evidence in Infinium, so they are excluded from the proposed journal entry pending a "
-                "documented human disposition -- see the Unresolved Exceptions sheet and the QB Disposition "
-                "Ledger in the downloads."
+                "documented human disposition -- see the Unresolved Exceptions sheet in the downloads."
                 if review_hold_qb
-                else "One or more posting blockers remain -- see the Executive Summary in the analytics download."
+                else "One or more posting blockers remain -- see the Posting Summary sheet in the downloads."
             ),
             tone="warning",
             icon="!",
@@ -495,7 +493,7 @@ def render_result(result: ReconciliationResult) -> None:
             st.dataframe(result.assessments, use_container_width=True, hide_index=True, height=320)
     with downloads_tab:
         st.markdown("#### Accounting workpaper")
-        st.caption("Four sheets: Raw Data, Reconciliation Detail, Unresolved Exceptions, and Product Aggregate Summary.")
+        st.caption("Five sheets: Posting Summary, Reconciliation Detail, Unresolved Exceptions, Product Aggregates, and Raw Data.")
         if "primary_workbook" not in st.session_state:
             if st.button(
                 "Prepare Sales Reconciliation",
@@ -516,28 +514,6 @@ def render_result(result: ReconciliationResult) -> None:
                 file_name=f"Sales_Reconciliation_{result.run_id}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
-                use_container_width=True,
-            )
-        st.markdown("#### Detailed analytics")
-        st.caption("Optional evidence package with normalization, assessments, controls, and exact run configuration.")
-        if "analytics_workbook" not in st.session_state:
-            if st.button(
-                "Prepare Reconciliation Analytics",
-                use_container_width=True,
-                key=f"prepare_analytics_{result.run_id}",
-            ):
-                try:
-                    with st.spinner("Preparing the detailed analytics workbook..."):
-                        st.session_state.analytics_workbook = build_analytics_workbook(result)
-                    st.toast("Analytics workbook prepared.", icon="✅")
-                except Exception as exc:
-                    _render_workbook_exception("analytics workbook", exc)
-        if "analytics_workbook" in st.session_state:
-            st.download_button(
-                "Download Reconciliation Analytics",
-                data=st.session_state.analytics_workbook,
-                file_name=f"Sales_Reconciliation_Analytics_{result.run_id}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
         st.markdown("#### Accountant's legacy format")

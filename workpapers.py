@@ -20,7 +20,6 @@ from typing import Any, Optional
 
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, Reference
 from openpyxl.comments import Comment
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
@@ -2740,86 +2739,51 @@ def build_legacy_workbook(result: ReconciliationResult) -> bytes:
 def build_product_sheet(
     wb: Workbook, result: ReconciliationResult, *, sheet_title: str = "Product Aggregate Summary",
 ) -> None:
-    """Decision-oriented, not just a quantity/value total that "does not
-    affect matching" and stops there: JE Support, Review Hold, and Matched %
-    by product, so a reviewer can see where a product's dollars actually
-    sit. Falls back to the plain quantity/value view only when no product
-    classification is possible at all (see build_product_disposition_summary
-    in matching.py).
+    """Plain quantity and value totals by product -- used for bottle-count
+    reconciliation, not a matching decision view, so it deliberately does
+    not compute match rates or JE Support/Review Hold breakdowns by
+    product (see build_product_summary in matching.py).
 
     sheet_title defaults to the Legacy workbook's tab name; the primary
     workbook passes its own shorter "Product Aggregates" tab name."""
     ws = wb.create_sheet(sheet_title)
-    frame = result.product_disposition_summary
+    frame = result.product_summary
     selected_period = result.metadata.get("fiscal_period")
     period_scope = (
         f"Only primary QuickBooks rows from Period {int(selected_period):02d} are included."
         if selected_period is not None
         else "All primary QuickBooks fiscal periods are included."
     )
-    if frame.empty and result.product_summary.empty:
-        headers = ["Product Name", "Product Quantity", "Product Value"]
-        end_col = len(headers)
-        _write_title_band(ws, 1, 1, end_col, "PRODUCT AGGREGATE SUMMARY", NAVY)
-        _write_caption_band(
-            ws, 2, 1, end_col,
-            "A QuickBooks quantity column, an amount column, and a recognizable product description "
-            f"are not all mapped, so no product breakdown is available. Generated "
-            f"{format_central_timestamp(result.run_timestamp)}.",
-            NAVY,
-        )
-        _write_dataframe_values(ws, pd.DataFrame(columns=headers), 3, 1)
-        _format_header(ws, 3, 1, end_col, NAVY, headers=headers, amount_columns={"Product Value"})
-        _write_total_row(ws, 4, 1, end_col, {}, headers)
-        for col, width in zip(range(1, end_col + 1), (34, 20, 20)):
-            ws.column_dimensions[get_column_letter(col)].width = width
-        ws.freeze_panes = "A4"
-        _prepare_sheet(ws, landscape=False)
-        return
-
     headers = list(frame.columns)
     end_col = len(headers)
-    _write_title_band(ws, 1, 1, end_col, "PRODUCT AGGREGATE SUMMARY | JE SUPPORT AND REVIEW HOLD BY PRODUCT", NAVY)
+    _write_title_band(ws, 1, 1, end_col, "PRODUCT AGGREGATE SUMMARY", NAVY)
     _write_caption_band(
         ws, 2, 1, end_col,
-        "Products are classified from the QuickBooks description column; this classification does not "
-        f"influence data matching. {period_scope} Matched % = matched rows / QuickBooks rows for that "
-        "product.",
+        (
+            f"Sum of quantity and value by product, for bottle-count reconciliation. {period_scope}"
+            if len(frame)
+            else "A QuickBooks quantity column, an amount column, and a recognizable product "
+            "description are not all mapped, so no product breakdown is available."
+        ),
         NAVY,
     )
     _write_dataframe_values(ws, frame, 3, 1)
     _format_header(
         ws, 3, 1, end_col, NAVY, headers=headers,
-        amount_columns={"JE Support Amount", "Review Hold Amount"},
-        quantity_columns={"QuickBooks Rows", "Matched Rows", "JE Support Rows", "Review Hold Rows", "Duplicate Excluded Rows"},
+        amount_columns={"Product Value"}, quantity_columns={"Product Quantity"},
     )
     last_row = 3 + len(frame)
     if len(frame):
         _format_body_block(ws, 4, last_row, 1, end_col, NAVY_LIGHT)
         _apply_number_formats(
-            ws, headers, 4, last_row, 1,
-            {"JE Support Amount", "Review Hold Amount"},
-            {"QuickBooks Rows", "Matched Rows", "JE Support Rows", "Review Hold Rows", "Duplicate Excluded Rows"},
+            ws, headers, 4, last_row, 1, {"Product Value"}, {"Product Quantity"},
         )
     total_row = last_row + 1
     totals = {
-        column: float(frame[column].sum())
-        for column in (
-            "QuickBooks Rows", "Matched Rows", "JE Support Rows", "JE Support Amount",
-            "Review Hold Rows", "Review Hold Amount", "Duplicate Excluded Rows",
-        )
+        "Product Quantity": float(frame["Product Quantity"].sum()),
+        "Product Value": float(frame["Product Value"].sum()),
     } if len(frame) else {}
     _write_total_row(ws, total_row, 1, end_col, totals, headers)
-    matched_col = headers.index("Matched %") + 1
-    matched_rows_letter = get_column_letter(headers.index("Matched Rows") + 1)
-    qb_rows_letter = get_column_letter(headers.index("QuickBooks Rows") + 1)
-    ws.cell(
-        total_row, matched_col,
-        f"=IFERROR(SUM({matched_rows_letter}4:{matched_rows_letter}{last_row})/"
-        f"SUM({qb_rows_letter}4:{qb_rows_letter}{last_row}),0)" if len(frame) else 0,
-    )
-    for row in range(4, total_row + 1):
-        ws.cell(row, matched_col).number_format = "0.0%"
     _set_widths(ws, 1, end_col, 3, total_row)
     ws.column_dimensions["A"].width = 34
     ws.freeze_panes = "A4"
@@ -3334,267 +3298,6 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     wb.active = 0
     _apply_workbook_run_metadata(wb, result)
     return _save_workbook_bytes(wb, apply_accountant_row_heights=True, suppress_text_number_warnings=True)
-
-
-def detailed_ledger_dataframe(result: ReconciliationResult) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    qb_display, inf_display, _ = _paired_display_frames(result)
-    resolved_records = _resolve_paired_records_bulk(result)
-    
-    qb_disp_dicts = qb_display.to_dict("records")
-    inf_disp_dicts = inf_display.to_dict("records")
-    
-    qb_id_map = result.qb_work[QB_ID].to_dict() if result.qb_work is not None else {}
-    inf_id_map = result.inf_work[INF_ID].to_dict() if result.inf_work is not None else {}
-    qb_sec_id_map = result.qb_secondary_work[QB_ID].to_dict() if result.qb_secondary_work is not None else {}
-    inf_sec_id_map = result.inf_secondary_work[INF_ID].to_dict() if result.inf_secondary_work is not None else {}
-
-    for position, record in enumerate(resolved_records):
-        output = {
-            "Run ID": result.run_id,
-            "Section": record["Section"],
-            "Match ID": record["Match ID"],
-            "Match Ref.": record.get("Match Ref.", ""),
-            "Match Result": record["Match Result"],
-            "Referenced Match Ref.": record.get("Referenced Match Ref.", ""),
-            "Confidence": record["Confidence"],
-            "Group Sequence": record["Group Sequence"],
-            "Assessment Explanation": record["Explanation"],
-        }
-        qidx, iidx = record["QB Index"], record["Infinium Index"]
-        qb_scope = record.get("QB Record Scope")
-        inf_scope = record.get("Infinium Record Scope")
-        
-        active_q_map = qb_sec_id_map if qb_scope == "Historical" else qb_id_map
-        output["QB | Source Row ID"] = active_q_map.get(qidx) if qidx is not None else None
-        
-        for header, value in qb_disp_dicts[position].items():
-            output[f"QB | {header}"] = value
-            
-        active_i_map = inf_sec_id_map if inf_scope == "Historical" else inf_id_map
-        output["INF | Source Row ID"] = active_i_map.get(iidx) if iidx is not None else None
-        
-        for header, value in inf_disp_dicts[position].items():
-            output[f"INF | {header}"] = value
-            
-        records.append(output)
-    return pd.DataFrame(records)
-
-
-def _add_standard_data_sheet(
-    wb: Workbook,
-    name: str,
-    title: str,
-    caption: str,
-    frame: pd.DataFrame,
-    header_color: str = NAVY,
-    chart_column: Optional[str] = None,
-) -> Any:
-    ws = wb.create_sheet(name)
-    end_col = max(len(frame.columns), 1)
-    _write_title_band(ws, 1, 1, end_col, title, header_color)
-    _write_caption_band(ws, 2, 1, end_col, caption, header_color)
-    if frame.empty and len(frame.columns) == 0:
-        frame = pd.DataFrame({"Result": ["No records"]})
-        end_col = 1
-    _write_dataframe_values(ws, frame, 3, 1)
-    _format_header(ws, 3, 1, len(frame.columns), header_color)
-    if len(frame):
-        _format_body_block(ws, 4, 3 + len(frame), 1, len(frame.columns), NAVY_LIGHT)
-        _apply_number_formats(ws, list(frame.columns), 4, 3 + len(frame), 1, set(), set())
-    _set_widths(ws, 1, len(frame.columns), 3, max(3 + len(frame), 3), maximum=48)
-    wrap_terms = ("EXPLANATION", "REQUIREMENT", "DISPOSITION", "MATCH RESULT", "CANDIDATE IDS")
-    for col, header in enumerate(frame.columns, 1):
-        if any(term in str(header).upper() for term in wrap_terms):
-            ws.column_dimensions[get_column_letter(col)].width = 42
-            for row in range(4, 4 + len(frame)):
-                ws.cell(row, col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    ws.freeze_panes = "A4"
-    if len(frame):
-        ws.auto_filter.ref = f"A3:{get_column_letter(len(frame.columns))}{3 + len(frame)}"
-    if chart_column and chart_column in frame.columns and len(frame):
-        data_col = list(frame.columns).index(chart_column) + 1
-        category_col = 1
-        chart = BarChart()
-        chart.type = "bar"
-        chart.style = 10
-        chart.title = f"{chart_column} by Match Method"
-        chart.y_axis.title = "Match Method"
-        chart.x_axis.title = chart_column
-        chart.height = 7.5
-        chart.width = 15
-        data = Reference(ws, min_col=data_col, min_row=3, max_row=3 + len(frame))
-        categories = Reference(ws, min_col=category_col, min_row=4, max_row=3 + len(frame))
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(categories)
-        chart.legend = None
-        ws.add_chart(chart, f"{get_column_letter(len(frame.columns) + 2)}3")
-    _prepare_sheet(ws)
-    return ws
-
-
-def build_analytics_summary_sheet(wb: Workbook, result: ReconciliationResult) -> None:
-    ws = wb.active
-    ws.title = "Executive Summary"
-    _write_title_band(ws, 1, 1, 8, "RECONCILIATION ANALYTICS | EXECUTIVE SUMMARY", NAVY)
-    _write_caption_band(
-        ws, 2, 1, 8,
-        f"Control status: {result.metrics['Control Status']} -- Run ID and generation time: Posting Summary and this workbook's footer.",
-        NAVY,
-    )
-    cards = [
-        ("QuickBooks rows", result.metrics["QuickBooks Rows"], '#,##0'),
-        ("Infinium rows", result.metrics["Infinium Rows"], '#,##0'),
-        ("QB match rate", result.metrics["QuickBooks Match Rate by Row"], '0.0%'),
-        ("Proposed JE (true unmatched)", result.metrics["Proposed JE Amount"], '$#,##0.00;[Red]($#,##0.00);-'),
-        ("QB source total", result.metrics["QuickBooks Source Total"], '$#,##0.00;[Red]($#,##0.00);-'),
-        ("Infinium source total", result.metrics["Infinium Source Total"], '$#,##0.00;[Red]($#,##0.00);-'),
-        ("Matched amount difference", result.metrics["Matched Amount Difference"], '$#,##0.00;[Red]($#,##0.00);-'),
-        ("Control status", result.metrics["Control Status"], '@'),
-    ]
-    for idx, (label, value, number_format) in enumerate(cards):
-        row = 4 if idx < 4 else 7
-        col = 1 + (idx % 4) * 2
-        ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + 1)
-        ws.merge_cells(start_row=row + 1, start_column=col, end_row=row + 1, end_column=col + 1)
-        ws.cell(row, col, label)
-        ws.cell(row + 1, col, excel_safe(value))
-        for r in (row, row + 1):
-            for c in (col, col + 1):
-                ws.cell(r, c).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-                ws.cell(r, c).border = _thin_border()
-        ws.cell(row, col).font = Font(name=FONT_NAME, size=9, bold=True, color=SLATE)
-        ws.cell(row + 1, col).font = Font(
-            name=FONT_NAME, size=13, bold=True,
-            color=NAVY if value != "FAIL" else "9C0006",
-        )
-        ws.cell(row + 1, col).number_format = number_format
-
-    start = 11
-    posting_status = result.metrics.get("Posting Status", "READY TO POST")
-    ws.cell(start, 1, "MODEL STATUS")
-    ws.cell(start, 2, result.metrics["Control Status"])
-    ws.cell(start, 1).font = Font(name=FONT_NAME, size=11, bold=True, color=WHITE)
-    ws.cell(start, 1).fill = PatternFill("solid", fgColor=SLATE)
-    ws.cell(start, 2).font = Font(name=FONT_NAME, size=11, bold=True, color=TEXT)
-    ws.cell(start, 2).fill = PatternFill("solid", fgColor=GREEN_LIGHT if result.metrics["Control Status"] == "PASS" else RED_LIGHT)
-    ws.cell(start, 3, "POSTING STATUS")
-    ws.cell(start, 4, posting_status)
-    ws.cell(start, 3).font = Font(name=FONT_NAME, size=11, bold=True, color=WHITE)
-    ws.cell(start, 3).fill = PatternFill("solid", fgColor=SLATE)
-    ws.cell(start, 4).font = Font(name=FONT_NAME, size=11, bold=True, color=TEXT)
-    ws.cell(start, 4).fill = PatternFill(
-        "solid", fgColor=GREEN_LIGHT if posting_status == "READY TO POST" else AMBER
-    )
-    _write_dataframe_values(ws, result.controls, start + 2, 1)
-    _format_header(ws, start + 2, 1, len(result.controls.columns), SLATE)
-    _format_body_block(ws, start + 3, start + 2 + len(result.controls), 1, len(result.controls.columns), SLATE_LIGHT)
-    _apply_number_formats(ws, list(result.controls.columns), start + 3, start + 2 + len(result.controls), 1, set(), set())
-    status_col = list(result.controls.columns).index("Status") + 1
-    if len(result.controls):
-        green = PatternFill("solid", fgColor=GREEN_LIGHT)
-        red = PatternFill("solid", fgColor=RED_LIGHT)
-        ws.conditional_formatting.add(
-            f"{get_column_letter(status_col)}{start + 3}:{get_column_letter(status_col)}{start + 2 + len(result.controls)}",
-            FormulaRule(formula=[f'{get_column_letter(status_col)}{start + 3}="PASS"'], fill=green),
-        )
-        ws.conditional_formatting.add(
-            f"{get_column_letter(status_col)}{start + 3}:{get_column_letter(status_col)}{start + 2 + len(result.controls)}",
-            FormulaRule(formula=[f'{get_column_letter(status_col)}{start + 3}="FAIL"'], fill=red),
-        )
-    for col in range(1, 9):
-        ws.column_dimensions[get_column_letter(col)].width = 18
-    ws.freeze_panes = "A3"
-    _prepare_sheet(ws)
-
-
-def build_analytics_workbook(result: ReconciliationResult) -> bytes:
-    validate_match_references(result)
-    wb = Workbook()
-    wb.properties.creator = "Sales Reconciliation Application"
-    wb.properties.title = f"Sales Reconciliation Analytics {result.run_id}"
-    wb.properties.subject = "Detailed matching evidence and reconciliation controls"
-    build_analytics_summary_sheet(wb, result)
-    _add_standard_data_sheet(
-        wb, "Match Method Summary", "MATCH METHOD SUMMARY",
-        "Distribution of matched and unresolved rows. Percentages use QuickBooks row count as the denominator.",
-        result.method_summary, NAVY, chart_column="QuickBooks Rows",
-    )
-    _add_standard_data_sheet(
-        wb, "Match Register", "MATCH REGISTER",
-        "One row per accepted match relationship -- M-### for a one-to-one match, G-### for a grouped "
-        "match accepted as a whole -- with the exact QuickBooks and Infinium records it contains and its "
-        "amounts. Every Match Ref. and Referenced Match Ref. shown anywhere in the generated workbooks "
-        "is listed here.",
-        result.match_register, SLATE,
-    )
-    _add_standard_data_sheet(
-        wb, "QB Disposition Ledger", "QUICKBOOKS DISPOSITION LEDGER",
-        "Every QuickBooks source row appears exactly once with one final disposition -- MATCHED, "
-        "EXACT_QBO_DUPLICATE_EXCLUDED, REVIEW_HOLD, or TRUE_UNMATCHED -- and the precise reason. Only "
-        "TRUE_UNMATCHED rows feed the proposed journal entry; the row and dollar totals of these "
-        "dispositions are proven equal to the source in the Executive Summary controls.",
-        result.qb_dispositions, SLATE,
-    )
-    _add_standard_data_sheet(
-        wb, "Detailed Match Ledger", "DETAILED MATCH Ledger",
-        "One record per displayed reconciliation line. Historical clearances show the specific accepted prior-period row on the opposing side; unused historical rows are excluded.",
-        detailed_ledger_dataframe(result), SLATE,
-    )
-    _add_standard_data_sheet(
-        wb, "Normalization Detail", "NORMALIZATION DETAIL",
-        "Original source values and the exact normalized references and signed amounts considered by the matching engine.",
-        result.normalization, TEAL,
-    )
-    _add_standard_data_sheet(
-        wb, "Match Assessment", "MATCH ASSESSMENT",
-        "One row per accepted match group or unresolved QuickBooks decision, including criteria and evidence.",
-        result.assessments, NAVY,
-    )
-    _add_standard_data_sheet(
-        wb, "Historical Clearances", "SECONDARY HISTORICAL CLEARANCES",
-        "Accepted strict matches between an unresolved primary row and the opposing historical source. Unused secondary rows are intentionally excluded.",
-        result.historical_clearances, TEAL,
-    )
-    _add_standard_data_sheet(
-        wb, "Exception Analysis", "EXCEPTION ANALYSIS",
-        "Unresolved population summarized by source period, reason, and source ledger. Period is reporting metadata only.",
-        result.exception_analysis, NAVY,
-    )
-    _add_standard_data_sheet(
-        wb, "QuickBooks Duplicates", "QUICKBOOKS DUPLICATES",
-        "Every QuickBooks row excluded from matching and from the accrual/journal-entry total because it "
-        "shares an identical normalized PO, invoice, and signed amount with another QuickBooks row.",
-        result.duplicate_analysis, NAVY,
-    )
-    _add_standard_data_sheet(
-        wb, "Infinium Duplicates", "INFINIUM DUPLICATES",
-        "Every Infinium row excluded from matching because it shares an identical normalized PO, invoice, "
-        "and signed amount with another Infinium row. Kept on a separate worksheet from QuickBooks "
-        "duplicates because the treatment is entirely different: Infinium duplicates are reviewed "
-        "independently and never feed the QuickBooks accrual or journal entry.",
-        result.infinium_duplicate_analysis, TEAL,
-    )
-    _add_standard_data_sheet(
-        wb, "Rules and Run Config", "RULES AND RUN CONFIGURATION",
-        "Exact rules, file fingerprints, mappings, versions, and parameters used for this run.",
-        pd.concat(
-            [
-                result.config,
-                pd.DataFrame([{"Setting": "", "Value": ""}, {"Setting": "MATCHING RULES", "Value": ""}]),
-                result.rules.rename(columns={
-                    "Priority": "Setting",
-                    "Rule": "Value",
-                    "Automatic": "Automatic",
-                    "Requirement": "Requirement",
-                }),
-            ],
-            ignore_index=True,
-        ),
-        SLATE,
-    )
-    _apply_workbook_run_metadata(wb, result)
-    return _save_workbook_bytes(wb)
 
 
 # Public alias: ui_components.py needs the paired display frames to build the

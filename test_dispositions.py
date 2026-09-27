@@ -23,7 +23,7 @@ from matching import (
     build_reconciliation,
     validate_reconciliation,
 )
-from workpapers import build_analytics_workbook, build_primary_workbook
+from workpapers import build_primary_workbook
 
 
 def _qb(po, invoice, amount, period="1", **extra):
@@ -397,19 +397,15 @@ def test_infinium_only_exceptions_never_offset_the_quickbooks_je(qb_mapping, inf
 # Exports
 # ---------------------------------------------------------------------------
 
-def test_the_analytics_workbook_lists_every_source_row_in_the_disposition_ledger(mixed_result):
-    wb = load_workbook(io.BytesIO(build_analytics_workbook(mixed_result)))
-    ws = wb["QB Disposition Ledger"]
-    header_row = next(row for row in ws.iter_rows(max_row=8) if any(c.value == "Final Disposition" for c in row))
-    headers = [c.value for c in header_row]
-    rows = [
-        dict(zip(headers, [c.value for c in row]))
-        for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value
-    ]
+def test_the_disposition_ledger_lists_every_source_row_exactly_once(mixed_result):
+    """The QB Disposition Ledger dataframe -- no longer rendered as its own
+    analytics-workbook sheet, but still computed and relied on by the
+    primary workpaper's Unresolved Exceptions/Posting Summary bridge --
+    must cover every QuickBooks source row with exactly one final
+    disposition."""
+    rows = mixed_result.qb_dispositions.to_dict("records")
     assert [r["QBO Row ID"] for r in rows] == list(mixed_result.qb_dispositions["QBO Row ID"])
     assert {r["Final Disposition"] for r in rows} <= set(FINAL_DISPOSITIONS)
-    text = " ".join(str(c.value) for row in wb["Executive Summary"].iter_rows() for c in row if c.value)
-    assert "Proposed JE = sum of TRUE_UNMATCHED QuickBooks amounts" in text
 
 
 def test_the_exceptions_table_holds_only_true_unmatched_rows_and_holds_are_itemized_below(mixed_result):

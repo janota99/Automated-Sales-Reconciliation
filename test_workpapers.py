@@ -22,7 +22,6 @@ from openpyxl.utils import get_column_letter
 from matching import QB_ID, build_reconciliation
 from workpapers import (
     _legacy_matched_label,
-    build_analytics_workbook,
     build_legacy_workbook,
     build_primary_workbook,
 )
@@ -39,21 +38,6 @@ EXPECTED_LEGACY_SHEETS = [
     "Legacy Reconciliation",
     "Exceptions",
     "Product Aggregate Summary",
-]
-
-EXPECTED_ANALYTICS_SHEETS = [
-    "Executive Summary",
-    "Match Method Summary",
-    "Match Register",
-    "QB Disposition Ledger",
-    "Detailed Match Ledger",
-    "Normalization Detail",
-    "Match Assessment",
-    "Historical Clearances",
-    "Exception Analysis",
-    "QuickBooks Duplicates",
-    "Infinium Duplicates",
-    "Rules and Run Config",
 ]
 
 
@@ -802,30 +786,15 @@ def test_duplicates_and_je_sit_ten_rows_below_the_exceptions_total(
     assert duplicates_row > exceptions_total_row
 
 
-def test_analytics_workbook_builds_with_duplicates_present(qb_mapping, inf_mapping, make_metadata):
-    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
-
-    workbook_bytes = build_analytics_workbook(result)
-    assert len(workbook_bytes) > 0
-
-    wb = load_workbook(io.BytesIO(workbook_bytes))
-    assert wb.sheetnames == EXPECTED_ANALYTICS_SHEETS
-
-    qb_dup_text = _worksheet_text(wb["QuickBooks Duplicates"])
-    assert any("QB-2" in text or "QB-3" in text for text in qb_dup_text)
-
-    inf_dup_text = _worksheet_text(wb["Infinium Duplicates"])
-    assert any("INF-2" in text or "INF-3" in text for text in inf_dup_text)
-
-
 def test_unresolved_sheet_duplicate_tables_use_simplified_reviewer_columns(
     qb_mapping, inf_mapping, make_metadata,
 ):
     """The 'Unresolved Exceptions' sheet's duplicate sub-tables show a small,
     plain-English column set for non-technical reviewers, while the full
-    technical schema stays intact on the 'QuickBooks Duplicates' audit sheet
-    -- a regression guard for the "display-only, additive" scope of that
-    simplification."""
+    technical schema stays intact on result.duplicate_analysis itself --
+    a regression guard for the "display-only, additive" scope of that
+    simplification (the analytics workbook that used to render this
+    dataframe in full was removed; the dataframe and its columns remain)."""
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
     primary_wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
     ws = primary_wb["Unresolved Exceptions"]
@@ -843,10 +812,10 @@ def test_unresolved_sheet_duplicate_tables_use_simplified_reviewer_columns(
     assert any("Same PO 200, Invoice INV200" in text for text in unresolved_text)
     assert any("Kept (Original)" in text or "Removed (Duplicate)" in text for text in unresolved_text)
 
-    analytics_wb = load_workbook(io.BytesIO(build_analytics_workbook(result)))
-    audit_text = _worksheet_text(analytics_wb["QuickBooks Duplicates"])
     for technical_header in ("Screening Stage", "Normalized PO", "Confirmed Copy Set ID", "Duplicate Rule Version"):
-        assert technical_header in audit_text, f"expected full audit column {technical_header!r} to remain"
+        assert technical_header in result.duplicate_analysis.columns, (
+            f"expected full audit column {technical_header!r} to remain"
+        )
 
 
 def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
@@ -910,21 +879,17 @@ def test_unresolved_sheet_row_id_links_to_the_correct_reconciled_data_row(
     assert round_trips_checked >= 2  # every linked row above must round-trip back
 
 
-def test_primary_and_analytics_workbooks_build_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):
+def test_primary_workbook_builds_with_no_duplicates(qb_mapping, inf_mapping, make_metadata):
     """The empty-duplicate-frame branches must render cleanly too."""
     result = _build_result_without_duplicates(qb_mapping, inf_mapping, make_metadata)
     assert result.metrics["Duplicate QuickBooks Rows"] == 0
     assert result.metrics["Duplicate Infinium Rows"] == 0
 
     primary_bytes = build_primary_workbook(result)
-    analytics_bytes = build_analytics_workbook(result)
     assert len(primary_bytes) > 0
-    assert len(analytics_bytes) > 0
 
     primary_wb = load_workbook(io.BytesIO(primary_bytes))
-    analytics_wb = load_workbook(io.BytesIO(analytics_bytes))
     assert primary_wb.sheetnames == EXPECTED_PRIMARY_SHEETS
-    assert analytics_wb.sheetnames == EXPECTED_ANALYTICS_SHEETS
 
     unresolved_text = _worksheet_text(primary_wb["Unresolved Exceptions"])
     assert any(
@@ -1217,7 +1182,7 @@ def test_every_reference_shown_in_any_workbook_exists_in_the_match_register(
     assert register == {"M-001", "M-002", "G-001"}
     pattern = re.compile(r"\b[MG]-\d{3,}\b")
     cited = set()
-    for builder in (build_primary_workbook, build_legacy_workbook, build_analytics_workbook):
+    for builder in (build_primary_workbook, build_legacy_workbook):
         wb = load_workbook(io.BytesIO(builder(result)))
         for ws in wb.worksheets:
             for row in ws.iter_rows():
@@ -1229,31 +1194,13 @@ def test_every_reference_shown_in_any_workbook_exists_in_the_match_register(
     assert cited == register
 
 
-def test_analytics_match_level_sheets_carry_references_but_summaries_do_not(
+def test_product_and_raw_data_sheets_carry_no_match_references(
     qb_mapping, inf_mapping, make_metadata,
 ):
+    """Product Aggregates and Raw Data are plain source-level views with no
+    match-level records to trace, unlike Reconciliation Detail and
+    Unresolved Exceptions."""
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
-    wb = load_workbook(io.BytesIO(build_analytics_workbook(result)))
-
-    def headers(name):
-        return next(
-            [c.value for c in row] for row in wb[name].iter_rows(min_row=1, max_row=6)
-            if sum(1 for c in row if c.value) > 3 and row[0].row >= 3
-        )
-
-    ledger = headers("Detailed Match Ledger")
-    assert ledger.index("Match Ref.") + 1 == ledger.index("Match Result")
-    assert "Referenced Match Ref." in ledger
-    assessment = headers("Match Assessment")
-    assert assessment.index("Match Ref.") + 1 == assessment.index("Match Method")
-    assert "Referenced Match Ref." in assessment
-    assert "Referenced Match Ref." in headers("QuickBooks Duplicates")
-    # High-level summaries have no match-level records to trace.
-    for name in ("Match Method Summary", "Exception Analysis", "Executive Summary"):
-        assert not any(
-            isinstance(c.value, str) and "Match Ref." in c.value
-            for row in wb[name].iter_rows() for c in row
-        ), name
     primary = load_workbook(io.BytesIO(build_primary_workbook(result)))
     for name in ("Product Aggregates", "Raw Data"):
         assert not any(
@@ -1298,18 +1245,15 @@ def test_legacy_reconciliation_can_be_sorted_and_filtered(qb_mapping, inf_mappin
 def test_analytics_match_register_lists_every_relationship_with_tying_amounts(
     qb_mapping, inf_mapping, make_metadata,
 ):
+    """The match register dataframe -- no longer rendered as its own sheet
+    now that the analytics workbook is gone, but still computed and relied
+    on by every Match Ref./Referenced Match Ref. link in the primary
+    workbook -- must list every relationship with tying amounts."""
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
-    wb = load_workbook(io.BytesIO(build_analytics_workbook(result)))
-    assert wb.sheetnames.index("Match Register") == wb.sheetnames.index("Match Method Summary") + 1
-    ws = wb["Match Register"]
-    header_row = next(row for row in ws.iter_rows(max_row=8) if any(c.value == "Match Ref." for c in row))
-    headers = [c.value for c in header_row]
+    register = result.match_register
+    headers = list(register.columns)
     assert "Relationship Key" not in headers                       # no internal run-local ids
-    records = [
-        dict(zip(headers, [c.value for c in row]))
-        for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value
-    ]
-    assert [r["Match Ref."] for r in records] == list(result.match_register["Match Ref."])
+    records = register.to_dict("records")
     assert {r["Match Ref."] for r in records} == {"M-001", "M-002", "G-001"}
     group = next(r for r in records if r["Match Ref."] == "G-001")
     assert group["Match Type"] == "Grouped"
@@ -1849,18 +1793,19 @@ def test_legacy_fuzzy_match_is_never_counted_as_reconciled(qb_mapping, inf_mappi
     assert "0 matched" in note
 
 
-def test_product_aggregate_summary_shows_disposition_breakdown_by_product(
+def test_product_aggregates_sums_quantity_and_value_by_product(
     qb_mapping, inf_mapping, make_metadata,
 ):
+    """Product Aggregates is a bottle-count sheet, not a matching decision
+    view: it must sum quantity and value per product and nothing else --
+    no match rate, no JE Support/Review Hold breakdown."""
     qb_rows = [
-        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 1, "Period": "1",
-         "Customer": "Acme", "Date": "2026-01-05", "Description": "ALLSUPS 24"},           # matches
-        {"PO": "PO2", "Invoice": "INV2", "Amount": 50.00, "Qty": 1, "Period": "1",
-         "Customer": "Acme", "Date": "2026-01-05", "Description": "ALLSUPS 24"},           # true unmatched
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 3, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05", "Description": "ALLSUPS 24"},
+        {"PO": "PO2", "Invoice": "INV2", "Amount": 50.00, "Qty": 2, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05", "Description": "ALLSUPS 24"},
         {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Qty": 1, "Period": "1",
-         "Customer": "Acme", "Date": "2026-01-05", "Description": "JUNIORS 24"},           # matches
-        {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Qty": 1, "Period": "1",
-         "Customer": "Acme", "Date": "2026-01-05", "Description": "JUNIORS 24"},           # exact duplicate, excluded
+         "Customer": "Acme", "Date": "2026-01-05", "Description": "JUNIORS 24"},
     ]
     inf_rows = [
         {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
@@ -1871,34 +1816,34 @@ def test_product_aggregate_summary_shows_disposition_breakdown_by_product(
         pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping_with_product, inf_mapping,
         make_metadata(), 2026,
     )
-    frame = result.product_disposition_summary
-    assert set(frame["Product Name"]) == {"Allsups 24 Case", "Juniors 24 Case"}
+    frame = result.product_summary
+    assert list(frame.columns) == ["Product Name", "Product Quantity", "Product Value"]
     allsups = frame.set_index("Product Name").loc["Allsups 24 Case"]
-    assert allsups["QuickBooks Rows"] == 2 and allsups["Matched Rows"] == 1
-    assert allsups["JE Support Rows"] == 1 and allsups["JE Support Amount"] == pytest.approx(50.00)
+    assert allsups["Product Quantity"] == pytest.approx(5)
+    assert allsups["Product Value"] == pytest.approx(150.00)
     juniors = frame.set_index("Product Name").loc["Juniors 24 Case"]
-    assert juniors["QuickBooks Rows"] == 2 and juniors["Matched Rows"] == 1
-    assert juniors["Duplicate Excluded Rows"] == 1
+    assert juniors["Product Quantity"] == pytest.approx(1)
+    assert juniors["Product Value"] == pytest.approx(30.00)
 
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregates"]
     text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
-    assert "JE SUPPORT AND REVIEW HOLD BY PRODUCT" in text
-    header_row = next(row for row in ws.iter_rows(max_row=5) if any(c.value == "Matched %" for c in row))
+    assert "JE SUPPORT" not in text and "REVIEW HOLD" not in text and "Matched %" not in text
+    header_row = next(row for row in ws.iter_rows(max_row=5) if any(c.value == "Product Name" for c in row))
     headers = [c.value for c in header_row]
-    assert {"JE Support Amount", "Review Hold Amount", "Duplicate Excluded Rows"} <= set(headers)
+    assert headers == ["Product Name", "Product Quantity", "Product Value"]
     data_rows = {
         row[headers.index("Product Name")].value: row
         for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value and "TOTAL" not in str(row[0].value)
     }
-    assert data_rows["Allsups 24 Case"][headers.index("Matched %")].value == pytest.approx(0.5)
+    assert data_rows["Allsups 24 Case"][headers.index("Product Quantity")].value == pytest.approx(5)
 
 
-def test_product_aggregate_summary_falls_back_cleanly_with_no_product_mapping(
+def test_product_aggregates_falls_back_cleanly_with_no_product_mapping(
     qb_mapping, inf_mapping, make_metadata,
 ):
     """No product column mapped: the plain fallback view renders without error."""
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
-    assert result.product_disposition_summary.empty
+    assert result.product_summary.empty
     ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregates"]
     text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
     assert "PRODUCT AGGREGATE SUMMARY" in text

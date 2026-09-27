@@ -77,4 +77,3 @@ def clear_results_if_signature_changed(signature: tuple[Any, ...]) -> None:
         st.session_state.input_signature = signature
         st.session_state.pop("reconciliation_result", None)
         st.session_state.pop("primary_workbook", None)
-        st.session_state.pop("analytics_workbook", None)
