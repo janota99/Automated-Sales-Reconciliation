@@ -247,6 +247,44 @@ def _add_exception_table(
     return formula_columns
 
 
+def _add_plain_data_table(
+    ws,
+    *,
+    table_name: str,
+    start_col: int,
+    end_col: int,
+    header_row: int,
+    last_data_row: int,
+    style_name: str = "TableStyleMedium2",
+) -> None:
+    """Register a read-only data block (raw source data, reconciliation
+    detail) as a genuine Excel Table (ListObject), so a screen reader
+    announces each column's header as the user navigates down through the
+    rows instead of requiring a manual title-reading command.
+
+    Deliberately excludes the sheet's own fixed control/source-total row --
+    that row is an audit control amount and must stay exactly as written,
+    never recast as Excel's native, filter-sensitive SUBTOTAL totals row.
+    """
+    if last_data_row < header_row:
+        return
+    table = Table(
+        displayName=table_name,
+        ref=(
+            f"{get_column_letter(start_col)}{header_row}:"
+            f"{get_column_letter(end_col)}{last_data_row}"
+        ),
+    )
+    table.tableStyleInfo = TableStyleInfo(
+        name=style_name,
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=False,
+        showColumnStripes=False,
+    )
+    ws.add_table(table)
+
+
 def _source_totals(frame: pd.DataFrame, mapping: dict[str, Optional[str]]) -> dict[str, float]:
     totals: dict[str, float] = {}
     amount_col = mapping.get("amount")
@@ -371,14 +409,13 @@ def build_raw_data_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     _write_caption_band(
         ws, 2, qb_start, qb_end,
         f"{len(result.qb_raw):,} rows | Source control total: ${result.metrics['QuickBooks Source Total']:,.2f} | "
-        f"{result.metrics['QuickBooks Subtotal Rows Excluded']:,} subtotal row(s) excluded before matching | "
-        f"Generated {format_central_timestamp(result.run_timestamp)}",
+        f"{result.metrics['QuickBooks Subtotal Rows Excluded']:,} subtotal row(s) excluded before matching.",
         NAVY,
     )
     _write_caption_band(
         ws, 2, inf_start, inf_end,
         f"{len(result.inf_raw):,} rows | Source control total: ${result.metrics['Infinium Source Total']:,.2f} | "
-        f"Values preserved before matching | Generated {format_central_timestamp(result.run_timestamp)}",
+        "Values preserved before matching.",
         TEAL,
     )
     _write_dataframe_values(ws, result.qb_raw, header_row, qb_start)
@@ -404,8 +441,22 @@ def build_raw_data_sheet(wb: Workbook, result: ReconciliationResult) -> None:
                           qb_amount_cols, qb_quantity_cols)
     _apply_number_formats(ws, inf_headers, data_row, inf_total_row, inf_start,
                           inf_amount_cols, set())
-    ws.column_dimensions[get_column_letter(separator_col)].width = 3.5
-    ws.column_dimensions[get_column_letter(separator_col)].fill = PatternFill("solid", fgColor=WHITE)
+    # A ColumnDimension has no renderable fill of its own -- painting every
+    # cell in the column is what actually gives the two source tables a
+    # visible dividing band, the same technique Reconciliation Detail's grey
+    # "Match Result" column already uses to separate its two ledgers.
+    separator_letter = get_column_letter(separator_col)
+    ws.column_dimensions[separator_letter].width = 3.5
+    for row in range(1, max(qb_total_row, inf_total_row) + 1):
+        ws.cell(row, separator_col).fill = PatternFill("solid", fgColor=METHOD_GREY_DARK)
+    _add_plain_data_table(
+        ws, table_name="RawDataQuickBooks", start_col=qb_start, end_col=qb_end,
+        header_row=header_row, last_data_row=qb_total_row - 1,
+    )
+    _add_plain_data_table(
+        ws, table_name="RawDataInfinium", start_col=inf_start, end_col=inf_end,
+        header_row=header_row, last_data_row=inf_total_row - 1,
+    )
     _set_widths(ws, qb_start, qb_end, header_row, qb_total_row)
     _set_widths(ws, inf_start, inf_end, header_row, inf_total_row)
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
@@ -761,7 +812,7 @@ def build_reconciliation_detail_sheet(wb: Workbook, result: ReconciliationResult
     _write_title_band(ws, 1, inf_start, inf_end, "INFINIUM | RECONCILIATION DETAIL", TEAL)
     _write_caption_band(
         ws, 2, qb_start, qb_end,
-        f"Every primary QuickBooks record appears once, reconciled or not. Any accepted QuickBooks prior-period match is displayed on this side and labeled in Record Context. Generated {format_central_timestamp(result.run_timestamp)}.",
+        "Every primary QuickBooks record appears once, reconciled or not. Any accepted QuickBooks prior-period match is displayed on this side and labeled in Record Context.",
         NAVY,
     )
     _write_caption_band(ws, 2, ref_col, referenced_col, "Matching Methodology", METHOD_GREY_DARK)
@@ -876,7 +927,23 @@ def build_reconciliation_detail_sheet(wb: Workbook, result: ReconciliationResult
     _pin_column_width(ws, ref_letter, 12)
     _pin_column_width(ws, get_column_letter(referenced_col), 22)
     ws.freeze_panes = f"{get_column_letter(inf_start)}{data_row}"
-    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(inf_end)}{final_data_row}"
+    # Three genuine Excel Tables (ListObjects) -- one per visual block --
+    # instead of one plain sheet-wide AutoFilter, so a screen reader
+    # announces each block's own column headers while navigating its rows.
+    # Each table carries its own filter dropdowns, so every column stays
+    # filterable exactly as before.
+    _add_plain_data_table(
+        ws, table_name="ReconciliationDetailQuickBooks", start_col=qb_start, end_col=qb_end,
+        header_row=header_row, last_data_row=final_data_row,
+    )
+    _add_plain_data_table(
+        ws, table_name="ReconciliationDetailMatchInfo", start_col=ref_col, end_col=referenced_col,
+        header_row=header_row, last_data_row=final_data_row,
+    )
+    _add_plain_data_table(
+        ws, table_name="ReconciliationDetailInfinium", start_col=inf_start, end_col=inf_end,
+        header_row=header_row, last_data_row=final_data_row,
+    )
     ws.print_title_rows = f"1:{header_row}"
     _prepare_sheet(ws)
 
@@ -1124,15 +1191,19 @@ def _write_kpi_band(
 
 # Status-fill meanings used across this sheet -- a swatch and a short label
 # per entry, so a reviewer opening the file cold doesn't need tribal
-# knowledge of what each color means. The first three name the period
-# classes exactly as the fiscal-period summary does. (fill, text_color_or_None, label)
+# knowledge of what each color means. Deliberately a strict traffic-light
+# palette (green/amber/red) plus one distinct duplicate-red, matching every
+# fill actually painted on this sheet -- no pastel variants that don't map
+# to a real status here. The first three name the period classes exactly as
+# the fiscal-period summary does; every one of them is also spelled out as
+# plain text in that summary's own "Period Classification" column, so a
+# reviewer never has to infer meaning from color alone.
+# (fill, text_color_or_None, label)
 _STATUS_COLOR_LEGEND: list[tuple] = [
     (GREEN_LIGHT, None, "Current Period"),
     (AMBER, None, "Prior Period / pending review"),
     (RED_LIGHT, None, "Urgent Prior Period"),
     (DUPLICATE_RED_FILL, DUPLICATE_RED_TEXT, "Confirmed duplicate - excluded from JE"),
-    (ORANGE, None, "Reference matches, amount differs - likely data entry error"),
-    (NEUTRAL_GOLD_FILL, NEUTRAL_GOLD_TEXT, "Ambiguous duplicate - multiple candidates, not accrued"),
 ]
 
 
@@ -1348,7 +1419,7 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws, 2, 1, end_col,
         f"Only TRUE UNMATCHED QuickBooks transactions -- no Infinium support after every matching pass -- feed the "
         f"proposed journal entry. Duplicates and review holds are excluded and itemized below. "
-        f"Review every exception before posting. Generated {format_central_timestamp(result.run_timestamp)}.",
+        "Review every exception before posting.",
         NAVY,
     )
     duplicate_caption = (
@@ -1921,8 +1992,9 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     )
     _format_body_block(ws, je_data_row, je_data_row + len(je_frame) - 1, 1, len(je_headers), SLATE_LIGHT)
     for row in range(je_data_row, je_data_row + len(je_frame)):
-        ws.cell(row, 4).number_format = ACCOUNTING_CURRENCY_FORMAT
-        ws.cell(row, 5).number_format = ACCOUNTING_CURRENCY_FORMAT
+        for col in (4, 5):
+            ws.cell(row, col).number_format = ACCOUNTING_CURRENCY_FORMAT
+            ws.cell(row, col).alignment = Alignment(horizontal="right", vertical="center")
     je_total_row = je_data_row + len(je_frame)
     _write_total_row(
         ws, je_total_row, 1, len(je_headers),
@@ -2586,8 +2658,12 @@ def build_legacy_exceptions_sheet(wb: Workbook, result: ReconciliationResult) ->
     )
     final_data_row = max(general_final_row, duplicate_final_row)
 
-    ws.column_dimensions[get_column_letter(separator_col)].width = 3.5
-    ws.column_dimensions[get_column_letter(separator_col)].fill = PatternFill("solid", fgColor=WHITE)
+    # See the equivalent fix in build_raw_data_sheet -- a ColumnDimension has
+    # no renderable fill; every cell in the column must be painted.
+    separator_letter = get_column_letter(separator_col)
+    ws.column_dimensions[separator_letter].width = 3.5
+    for row in range(1, final_data_row + 1):
+        ws.cell(row, separator_col).fill = PatternFill("solid", fgColor=METHOD_GREY_DARK)
     ws.freeze_panes = f"{get_column_letter(qb_start)}{data_row}"
     if general_rows:
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(left_trailer_end)}{general_final_row}"
@@ -2668,7 +2744,7 @@ def build_product_sheet(wb: Workbook, result: ReconciliationResult) -> None:
         ws, 2, 1, end_col,
         "Products are classified from the QuickBooks description column; this classification does not "
         f"influence data matching. {period_scope} Matched % = matched rows / QuickBooks rows for that "
-        f"product. Generated {format_central_timestamp(result.run_timestamp)}.",
+        "product.",
         NAVY,
     )
     _write_dataframe_values(ws, frame, 3, 1)
@@ -2885,23 +2961,28 @@ def _apply_workbook_run_metadata(wb: Workbook, result: ReconciliationResult) -> 
     central_timestamp = result.run_timestamp.astimezone(CENTRAL_TIMEZONE)
     excel_timestamp = central_timestamp.replace(tzinfo=None)
     display_timestamp = format_central_timestamp(central_timestamp)
-    # Visible report captions carry the controlled Central timestamp. Core
-    # properties use the same run time, while page headers/footers are blank so
-    # Excel cannot surface a stale or locale-generated tag on printed sheets.
+    # Core properties use the controlled Central timestamp. Run ID and the
+    # generation time live on the Posting Summary landing page and in the
+    # page footer (printed output only, never competing on-screen with the
+    # figures) -- every other sheet's caption states only its own substance.
+    # Headers stay blank so Excel cannot surface a stale or locale-generated
+    # tag on printed sheets.
     wb.properties.created = excel_timestamp
     wb.properties.modified = excel_timestamp
     existing_description = wb.properties.description or ""
     wb.properties.description = (
         f"{existing_description} Generated {display_timestamp}. Run ID: {result.run_id}."
     ).strip()
+    footer_text = f"Run ID: {result.run_id}  |  Generated {display_timestamp}"
     for ws in wb.worksheets:
-        for section in (
-            ws.oddHeader, ws.evenHeader, ws.firstHeader,
-            ws.oddFooter, ws.evenFooter, ws.firstFooter,
-        ):
+        for section in (ws.oddHeader, ws.evenHeader, ws.firstHeader):
             section.left.text = None
             section.center.text = None
             section.right.text = None
+        for section in (ws.oddFooter, ws.evenFooter, ws.firstFooter):
+            section.left.text = None
+            section.center.text = footer_text
+            section.right.text = "Page &P of &N"
 
 
 _POSTING_SUMMARY_END_COL = 8
@@ -2951,23 +3032,59 @@ def _fiscal_period_consistency_warning(result: ReconciliationResult) -> Optional
 def build_posting_summary_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     """The landing page: everything a reviewer needs before opening any other
     sheet -- the selected fiscal period (impossible to miss), a single
-    accounted-for-rows control, the posting equation, and one card per final
-    disposition. Every number here is read straight from result.metrics /
-    result.qb_dispositions, the same source every other sheet uses, so this
-    page can never disagree with the detail behind it."""
-    # Appended like every other sheet, then moved to the front by the caller
-    # (build_primary_workbook) once every sheet exists -- wb.active is still
-    # claimed by build_data_search_sheet's own "grab the default sheet" step,
-    # so this cannot itself occupy index 0 without colliding with that.
+    accounted-for-rows control, a KPI ribbon of the four final dispositions
+    against the source total, and the journal-entry bridge. Every number
+    here is read straight from result.metrics / result.qb_dispositions, the
+    same source every other sheet uses, so this page can never disagree with
+    the detail behind it.
+
+    Deliberately merge-free (aside from the one wrapped, conditional warning
+    banner): a screen reader tabbing across a merged region can get stuck or
+    skip cells entirely, so every spanning band here uses either plain left-
+    aligned overflow (a single line of unwrapped text painted across
+    identically-filled, otherwise-empty cells -- Excel renders the overflow
+    without needing the cells joined) or "center across selection"
+    (Alignment(horizontal="centerContinuous"), set on every cell in the
+    range) for banners that need to stay centered. Run ID and the generation
+    timestamp live in the page footer (see _apply_workbook_run_metadata),
+    not in the on-sheet caption, so they never compete with the figures.
+    """
     ws = wb.create_sheet("Posting Summary")
     end_col = _POSTING_SUMMARY_END_COL
     metrics = result.metrics
     control_ok = metrics["Control Status"] == "PASS"
 
-    _write_title_band(ws, 1, 1, end_col, "QBO RECONCILIATION POSTING SUMMARY", NAVY)
+    def unmerged_band(row: int, text: str, fill_color: str, font: Font, *, height: float) -> None:
+        """A single-line, left-aligned title/label spanning the row without
+        merging: text in the first cell only, matching fill on every cell in
+        the range so the overflow reads as one continuous band."""
+        for col in range(1, end_col + 1):
+            cell = ws.cell(row, col)
+            if col == 1:
+                cell.value = text
+            cell.fill = PatternFill("solid", fgColor=fill_color)
+            cell.font = font
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+        fix_row_height(ws, row, height)
+
+    def centered_band(row: int, text: str, fill_color: str, font: Font, *, height: float) -> None:
+        """A single-line banner that stays centered across the full row
+        without merging, using Excel's native "center across selection"."""
+        for col in range(1, end_col + 1):
+            cell = ws.cell(row, col)
+            if col == 1:
+                cell.value = text
+            cell.fill = PatternFill("solid", fgColor=fill_color)
+            cell.font = font
+            cell.alignment = Alignment(horizontal="centerContinuous", vertical="center")
+        fix_row_height(ws, row, height)
+
+    unmerged_band(
+        1, "QBO RECONCILIATION POSTING SUMMARY", NAVY,
+        Font(name=FONT_NAME, size=12, bold=True, color=WHITE), height=27,
+    )
     _write_caption_band(
         ws, 2, 1, end_col,
-        f"Run ID: {result.run_id} | Generated {format_central_timestamp(result.run_timestamp)}. "
         "Every figure on this page is read from the same controls shown in the Analytics workbook's "
         "Executive Summary and this workbook's Unresolved Exceptions and Reconciliation Detail sheets.",
         NAVY,
@@ -2983,14 +3100,14 @@ def build_posting_summary_sheet(wb: Workbook, result: ReconciliationResult) -> N
         if selected_period is not None
         else "CURRENT RECONCILIATION PERIOD: NOT SELECTED"
     )
-    ws.merge_cells(start_row=period_row, start_column=1, end_row=period_row, end_column=end_col)
-    period_cell = ws.cell(period_row, 1, period_text)
-    period_cell.font = Font(name=FONT_NAME, size=16, bold=True, color=WHITE)
-    period_cell.fill = PatternFill("solid", fgColor=SLATE)
-    period_cell.alignment = Alignment(horizontal="center", vertical="center")
-    fix_row_height(ws, period_row, 30)
+    centered_band(period_row, period_text, SLATE, Font(name=FONT_NAME, size=16, bold=True, color=WHITE), height=30)
     next_row = period_row + 1
 
+    # The one deliberate exception to the no-merge rule: a conditional,
+    # multi-sentence warning that must wrap, which "center across selection"
+    # does not support -- rare enough (only when the selected period looks
+    # inconsistent with the data) that a single merged band here is an
+    # acceptable, documented trade-off.
     warning = _fiscal_period_consistency_warning(result)
     if warning:
         ws.merge_cells(start_row=next_row, start_column=1, end_row=next_row, end_column=end_col)
@@ -3004,77 +3121,78 @@ def build_posting_summary_sheet(wb: Workbook, result: ReconciliationResult) -> N
 
     # The 100%-disposition control headline -- every row is accounted for by
     # construction (see build_qb_dispositions); the control fails only if the
-    # disposition ledger and the source population disagree.
+    # disposition ledger and the source population disagree. High-contrast
+    # dark text on a pale fill either way (never light text on a mid-tone
+    # fill), so the PASS/FAIL state stays legible at a glance.
     headline_row = next_row
     total_rows = int(metrics["QuickBooks Rows"])
     headline_text = f"{total_rows:,} of {total_rows:,} QBO rows accounted for — CONTROL: {metrics['Control Status']}"
-    ws.merge_cells(start_row=headline_row, start_column=1, end_row=headline_row, end_column=end_col)
-    headline_cell = ws.cell(headline_row, 1, headline_text)
-    headline_cell.font = Font(name=FONT_NAME, size=15, bold=True, color=TEXT if control_ok else "9C0006")
-    headline_cell.fill = PatternFill("solid", fgColor=GREEN_LIGHT if control_ok else RED_LIGHT)
-    headline_cell.alignment = Alignment(horizontal="center", vertical="center")
-    fix_row_height(ws, headline_row, 26)
+    centered_band(
+        headline_row, headline_text,
+        GREEN_LIGHT if control_ok else RED_LIGHT,
+        Font(name=FONT_NAME, size=15, bold=True, color=TEXT if control_ok else "9C0006"),
+        height=26,
+    )
     next_row = headline_row + 1
 
-    # Secondary: the match rate, explicitly not the headline any more.
+    # Secondary: the match rate, explicitly not the headline any more -- a
+    # short, de-emphasized single line, left-aligned in its own column so it
+    # never needs a spanning band at all.
     rate_row = next_row
     rate_cell = ws.cell(
-        rate_row, 1,
-        f"Match rate (secondary measure): {metrics['QuickBooks Match Rate by Row']:.1%}",
+        rate_row, 1, f"Match rate (secondary measure): {metrics['QuickBooks Match Rate by Row']:.1%}",
     )
-    ws.merge_cells(start_row=rate_row, start_column=1, end_row=rate_row, end_column=end_col)
     rate_cell.font = Font(name=FONT_NAME, size=9, italic=True, color=SLATE)
-    rate_cell.alignment = Alignment(horizontal="center", vertical="center")
+    rate_cell.alignment = Alignment(horizontal="left", vertical="center")
     fix_row_height(ws, rate_row, 15)
     next_row = rate_row + 2
 
-    # The posting equation, front and center: source rows/dollars equal the
-    # sum of the four final dispositions.
+    # The KPI ribbon: one column per category (source total, then each final
+    # disposition), row count directly above its dollar amount -- a
+    # structured grid instead of a single dense equation string. Column A is
+    # a row-axis label ("Rows" / "Amount") so the grid reads correctly with
+    # or without color.
     def card_value(label: str, kind: str) -> float:
         return metrics[f"Final Disposition - {label} {kind}"]
 
-    equation_row = next_row
-    equation_text = (
-        f"{total_rows:,} QBO Rows ({format_currency(metrics['QuickBooks Source Total'])})  =  "
-        + "  +  ".join(
-            f"{int(card_value(label, 'Rows')):,} {label} ({format_currency(card_value(label, 'Amount'))})"
-            for label, _ in _DISPOSITION_CARD_ORDER
-        )
-    )
-    ws.merge_cells(start_row=equation_row, start_column=1, end_row=equation_row, end_column=end_col)
-    equation_cell = ws.cell(equation_row, 1, equation_text)
-    equation_cell.font = Font(name=FONT_NAME_NUMERIC, size=10, bold=True, color=TEXT)
-    equation_cell.fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-    equation_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True, shrink_to_fit=True)
-    equation_cell.border = _thin_border()
-    fix_row_height(ws, equation_row, 24)
-    next_row = equation_row + 2
-
-    # One card per final disposition -- the same four categories, in the same
-    # order and color, as the equation above.
-    label_row, value_row = next_row, next_row + 1
-    col = 1
-    for label, fill_color in _DISPOSITION_CARD_ORDER:
-        ws.merge_cells(start_row=label_row, start_column=col, end_row=label_row, end_column=col + 1)
-        ws.merge_cells(start_row=value_row, start_column=col, end_row=value_row, end_column=col + 1)
-        display_label = "Engine Proposed JE (True Unmatched)" if label == "True Unmatched" else label.upper()
-        ws.cell(label_row, col, display_label)
-        ws.cell(
-            value_row, col,
-            f"{int(card_value(label, 'Rows')):,} rows | {format_currency(card_value(label, 'Amount'))}",
-        )
-        for row in (label_row, value_row):
-            for c in (col, col + 1):
-                ws.cell(row, c).fill = PatternFill("solid", fgColor=fill_color)
-                ws.cell(row, c).border = _thin_border()
-        ws.cell(label_row, col).font = Font(name=FONT_NAME, size=9, bold=True, color=TEXT)
-        ws.cell(value_row, col).font = Font(name=FONT_NAME, size=12, bold=True, color=TEXT)
-        for row in (label_row, value_row):
-            ws.cell(row, col).alignment = Alignment(horizontal="left", vertical="center", shrink_to_fit=True)
-        col += 2
-    fix_row_height(ws, label_row, 15)
-    fix_row_height(ws, value_row, 24)
-    next_row = value_row + 2
+    ribbon_columns = [("Total QBO Rows", None, SLATE_LIGHT)] + [
+        ("JE Support (True Unmatched)" if label == "True Unmatched" else label, label, fill)
+        for label, fill in _DISPOSITION_CARD_ORDER
+    ]
+    label_row = next_row
+    count_row = label_row + 1
+    amount_row = count_row + 1
+    ws.cell(count_row, 1, "Rows").font = Font(name=FONT_NAME, size=9, bold=True, color=SLATE)
+    ws.cell(amount_row, 1, "Amount").font = Font(name=FONT_NAME, size=9, bold=True, color=SLATE)
+    for row in (count_row, amount_row):
+        ws.cell(row, 1).alignment = Alignment(horizontal="left", vertical="center")
+        ws.cell(row, 1).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+    for offset, (display_label, disposition_label, fill) in enumerate(ribbon_columns):
+        col = offset + 2
+        header_cell = ws.cell(label_row, col, display_label)
+        header_cell.font = Font(name=FONT_NAME, size=9, bold=True, color=WHITE)
+        header_cell.fill = PatternFill("solid", fgColor=NAVY)
+        header_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        header_cell.border = _thin_border()
+        if disposition_label is None:
+            count_value, amount_value = total_rows, metrics["QuickBooks Source Total"]
+        else:
+            count_value = int(card_value(disposition_label, "Rows"))
+            amount_value = card_value(disposition_label, "Amount")
+        count_cell = ws.cell(count_row, col, count_value)
+        count_cell.number_format = ACCOUNTING_COUNT_FORMAT
+        count_cell.font = Font(name=FONT_NAME_NUMERIC, size=13, bold=True, color=TEXT)
+        amount_cell = ws.cell(amount_row, col, amount_value)
+        amount_cell.number_format = ACCOUNTING_CURRENCY_FORMAT
+        amount_cell.font = Font(name=FONT_NAME_NUMERIC, size=10, bold=True, color=TEXT)
+        for cell in (count_cell, amount_cell):
+            cell.fill = PatternFill("solid", fgColor=fill)
+            cell.alignment = Alignment(horizontal="right", vertical="center")
+            cell.border = _thin_border()
+    fix_row_height(ws, label_row, 28)
+    fix_row_height(ws, count_row, 20)
+    fix_row_height(ws, amount_row, 18)
+    next_row = amount_row + 2
 
     # Journal Entry Bridge: the engine's automated total is immutable and
     # never overwritten by a reviewer selection (see the Reviewer Disposition
@@ -3083,52 +3201,48 @@ def build_posting_summary_sheet(wb: Workbook, result: ReconciliationResult) -> N
     # overrides, both adjustments are zero and Final Approved JE = Engine
     # Proposed JE exactly.
     bridge_title_row = next_row
-    ws.merge_cells(start_row=bridge_title_row, start_column=1, end_row=bridge_title_row, end_column=end_col)
-    bridge_title_cell = ws.cell(bridge_title_row, 1, "JOURNAL ENTRY BRIDGE | ENGINE TOTAL TO FINAL APPROVED JE")
-    bridge_title_cell.font = Font(name=FONT_NAME, size=11, bold=True, color=WHITE)
-    bridge_title_cell.fill = PatternFill("solid", fgColor=SLATE)
-    bridge_title_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-    fix_row_height(ws, bridge_title_row, 20)
+    unmerged_band(
+        bridge_title_row, "JOURNAL ENTRY BRIDGE", SLATE,
+        Font(name=FONT_NAME, size=11, bold=True, color=WHITE), height=20,
+    )
 
     released_expr = _review_holds_released_expr()
     excluded_expr = _je_support_manual_exclusions_expr(result)
     bridge_rows = [
         ("Engine Proposed JE (automated TRUE_UNMATCHED total -- immutable)", metrics["Proposed JE Amount"]),
-        ("+  Review Holds Released to JE (reviewer)", f"={released_expr}"),
-        ("-  Manual JE Exclusions (reviewer, documented reason required)", f"=-({excluded_expr})"),
+        ("Plus: Review Holds Released to JE (reviewer)", f"={released_expr}"),
+        ("Less: Manual JE Exclusions (reviewer, documented reason required)", f"=-({excluded_expr})"),
     ]
+    value_col = end_col - 2
+    value_col_letter = get_column_letter(value_col)
     bridge_value_cells: list[str] = []
     row = bridge_title_row + 1
     for label, value in bridge_rows:
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=end_col - 3)
-        ws.merge_cells(start_row=row, start_column=end_col - 2, end_row=row, end_column=end_col)
+        for col in range(1, end_col + 1):
+            ws.cell(row, col).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
         label_cell = ws.cell(row, 1, label)
-        value_cell = ws.cell(row, end_col - 2, value)
+        value_cell = ws.cell(row, value_col, value)
         label_cell.font = Font(name=FONT_NAME, size=10, color=TEXT)
+        label_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
         value_cell.font = Font(name=FONT_NAME_NUMERIC, size=10, color=TEXT)
         value_cell.number_format = ACCOUNTING_CURRENCY_FORMAT
-        for col in (1, end_col - 2):
-            ws.cell(row, col).fill = PatternFill("solid", fgColor=SLATE_LIGHT)
-            ws.cell(row, col).border = _thin_border()
-        label_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        value_cell.alignment = Alignment(horizontal="right", vertical="center")
-        bridge_value_cells.append(f"{get_column_letter(end_col - 2)}{row}")
+        value_cell.alignment = Alignment(horizontal="right", vertical="center", indent=1)
+        value_cell.border = _thin_border()
+        bridge_value_cells.append(f"{value_col_letter}{row}")
         fix_row_height(ws, row, 18)
         row += 1
 
     final_row = row
-    ws.merge_cells(start_row=final_row, start_column=1, end_row=final_row, end_column=end_col - 3)
-    ws.merge_cells(start_row=final_row, start_column=end_col - 2, end_row=final_row, end_column=end_col)
-    final_label_cell = ws.cell(final_row, 1, "=  FINAL APPROVED JE")
-    final_value_cell = ws.cell(final_row, end_col - 2, "=" + "+".join(bridge_value_cells))
+    for col in range(1, end_col + 1):
+        ws.cell(final_row, col).fill = PatternFill("solid", fgColor=GREEN_LIGHT)
+    final_label_cell = ws.cell(final_row, 1, "FINAL APPROVED JE")
+    final_value_cell = ws.cell(final_row, value_col, "=" + "+".join(bridge_value_cells))
     final_label_cell.font = Font(name=FONT_NAME, size=11, bold=True, color=TEXT)
+    final_label_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
     final_value_cell.font = Font(name=FONT_NAME_NUMERIC, size=12, bold=True, color=TEXT)
     final_value_cell.number_format = ACCOUNTING_CURRENCY_FORMAT
-    for col in (1, end_col - 2):
-        ws.cell(final_row, col).fill = PatternFill("solid", fgColor=GREEN_LIGHT)
-        ws.cell(final_row, col).border = _total_border()
-    final_label_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-    final_value_cell.alignment = Alignment(horizontal="right", vertical="center")
+    final_value_cell.alignment = Alignment(horizontal="right", vertical="center", indent=1)
+    final_value_cell.border = _total_border()
     fix_row_height(ws, final_row, 22)
     next_row = final_row + 2
 
@@ -3145,6 +3259,7 @@ def build_posting_summary_sheet(wb: Workbook, result: ReconciliationResult) -> N
 
     for col in range(1, end_col + 1):
         ws.column_dimensions[get_column_letter(col)].width = 18
+    ws.column_dimensions["A"].width = 12
     ws.sheet_view.showGridLines = False
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
@@ -3596,7 +3711,7 @@ def build_analytics_summary_sheet(wb: Workbook, result: ReconciliationResult) ->
     _write_title_band(ws, 1, 1, 8, "RECONCILIATION ANALYTICS | EXECUTIVE SUMMARY", NAVY)
     _write_caption_band(
         ws, 2, 1, 8,
-        f"Run ID: {result.run_id} | Generated {format_central_timestamp(result.run_timestamp)} | Control status: {result.metrics['Control Status']}",
+        f"Control status: {result.metrics['Control Status']} -- Run ID and generation time: Posting Summary and this workbook's footer.",
         NAVY,
     )
     cards = [

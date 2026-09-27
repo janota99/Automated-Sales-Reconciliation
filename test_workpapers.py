@@ -730,7 +730,7 @@ def test_unresolved_sheet_has_a_status_color_legend(qb_mapping, inf_mapping, mak
         str(cell.value) for row in ws.iter_rows(min_row=legend_row, max_row=fiscal_row - 1)
         for cell in row if cell.value
     ]
-    assert len(legend_texts) == 6
+    assert len(legend_texts) == 4
     # Period classes are named exactly as the fiscal-period summary names them.
     for name in ("Current Period", "Prior Period / pending review", "Urgent Prior Period"):
         assert name in legend_texts
@@ -1812,11 +1812,13 @@ def test_posting_summary_is_the_first_sheet_and_states_the_equation(qb_mapping, 
     assert f"CURRENT RECONCILIATION PERIOD: PD-{int(result.metadata['fiscal_period']):02d}" in text
     assert f"{total:,} of {total:,} QBO rows accounted for" in text
     assert f"CONTROL: {metrics['Control Status']}" in text
-    # The equation names all four dispositions with their counts and dollars.
-    for label in ("Matched", "True Unmatched", "Review Hold", "Duplicate Excluded"):
-        assert f"{label} (" in text
-    assert format_currency(metrics["QuickBooks Source Total"]) in text
-    assert format_currency(metrics["Proposed JE Amount"]) in text
+    # The KPI ribbon names every category as its own column header, with row
+    # counts and dollars as plain numeric cells beneath each one.
+    for label in ("Total QBO Rows", "Matched", "Review Hold", "Duplicate Excluded", "JE Support"):
+        assert any(label in str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    row_values = [c.value for row in ws.iter_rows() for c in row if isinstance(c.value, (int, float))]
+    assert metrics["QuickBooks Source Total"] in row_values
+    assert metrics["Proposed JE Amount"] in row_values
     # Match rate is present but demoted -- after the headline, not as the title.
     assert "Match rate (secondary measure)" in text
     assert "Reason Code Glossary" in text
@@ -2211,7 +2213,8 @@ def test_posting_summary_bridge_reduces_to_engine_je_with_no_overrides(qb_mappin
     posting = wb["Posting Summary"]
     text = " ".join(str(c.value) for row in posting.iter_rows() for c in row if c.value)
     assert "Engine Proposed JE" in text and "FINAL APPROVED JE" in text
-    assert format_currency(result.metrics["Proposed JE Amount"]) in text
+    posting_numbers = [c.value for row in posting.iter_rows() for c in row if isinstance(c.value, (int, float))]
+    assert result.metrics["Proposed JE Amount"] in posting_numbers
 
 
 def test_posting_summary_bridge_formulas_reference_the_reviewer_columns(qb_mapping, inf_mapping, make_metadata):

@@ -12,11 +12,14 @@ from zoneinfo import ZoneInfo
 CENTRAL_TIMEZONE = ZoneInfo("America/Chicago")
 
 NAVY = "1B365D"
-NAVY_LIGHT = "E8EEF5"
+# Zebra-stripe / caption-band tints, lightened to a subtler ~5% shade so
+# alternating body rows read as a faint texture rather than competing with
+# the black text sitting on top of them.
+NAVY_LIGHT = "F5F7FA"
 TEAL = "27666B"
-TEAL_LIGHT = "E7F1F1"
+TEAL_LIGHT = "F4F9F9"
 SLATE = "475569"
-SLATE_LIGHT = "F2F5F8"
+SLATE_LIGHT = "F9FAFC"
 AMBER = "FFF3CD"
 ORANGE = "FCE8D5"
 # Softened from the original bright Excel "Bad" red (FFC7CE/9C0006) -- eye
@@ -28,7 +31,9 @@ DUPLICATE_RED_TEXT = "72232B"
 GOOD_GREEN_FILL = "C6EFCE"
 GOOD_GREEN_TEXT = "006100"
 NEUTRAL_GOLD_FILL = "FFEB9C"
-NEUTRAL_GOLD_TEXT = "9C6500"
+# Darkened from the original 9C6500 (4.1:1 on this fill, just under WCAG AA's
+# 4.5:1 normal-text threshold) to a shade that clears AA with real margin.
+NEUTRAL_GOLD_TEXT = "6B4400"
 METHOD_GREY_FILL = "D9D9D9"
 METHOD_GREY_TEXT = "000000"
 # A true neutral grey (no blue or teal undertone) for a column that exists
