@@ -23,21 +23,16 @@ from matching import QB_ID, build_reconciliation
 from workpapers import (
     _legacy_matched_label,
     build_analytics_workbook,
-    build_data_search_dataframe,
     build_legacy_workbook,
     build_primary_workbook,
 )
 
 EXPECTED_PRIMARY_SHEETS = [
     "Posting Summary",
-    "Data Search",
-    "Data Search QB Source",
-    "Data Search INF Source",
-    "Raw Data",
     "Reconciliation Detail",
     "Unresolved Exceptions",
-    "Product Aggregate Summary",
-    "Reason Code Glossary",
+    "Product Aggregates",
+    "Raw Data",
 ]
 
 EXPECTED_LEGACY_SHEETS = [
@@ -603,81 +598,16 @@ def test_legacy_workbook_builds_with_no_duplicates(qb_mapping, inf_mapping, make
     assert wb.sheetnames == EXPECTED_LEGACY_SHEETS
 
 
-def test_data_search_sheet_shows_duplicate_pair_and_clean_match(qb_mapping, inf_mapping, make_metadata):
-    """The Data Search sheet must let a reviewer look up any PO/Invoice and
-    see its real status -- including for a duplicate pair, where the
-    retained copy keeps its normal (accrual-relevant) status but must still
-    be identifiable as part of the same duplicate group as the excluded copy."""
-    result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
-
-    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
-    assert "Data Search" in wb.sheetnames
-
-    frame = build_data_search_dataframe(result)
-    by_qb_id = frame.set_index("QuickBooks Row ID")
-
-    # PO100/INV100 is a clean 1:1 match -- an ordinary Infinium Match with no
-    # duplicate involvement.
-    matched = by_qb_id.loc["QB-1"]
-    assert matched["Status"] == "Infinium Match"
-    assert "PO + Invoice + Amount" in matched["Match Type"]
-    assert matched["Duplicate Group ID"] == ""
-
-    # QB-2/QB-3 are the PO200/INV200 duplicate pair. QB-2 is the retained
-    # canonical row (matches nothing else, so it's Outstanding) and QB-3 is
-    # the excluded excess copy (Status = Duplicate) -- both must carry the
-    # same Duplicate Group ID.
-    canonical = by_qb_id.loc["QB-2"]
-    excess = by_qb_id.loc["QB-3"]
-    assert canonical["Status"] == "Outstanding (On Accrual List)"
-    assert excess["Status"] == "Duplicate"
-    assert canonical["Duplicate Group ID"] != ""
-    assert canonical["Duplicate Group ID"] == excess["Duplicate Group ID"]
-
-
-def test_data_search_sheet_is_first_and_live_searchable(qb_mapping, inf_mapping, make_metadata):
-    """Posting Summary is the landing page (sheet[0]); Data Search follows
-    immediately as the first working sheet, backs its two live-search panels
-    with hidden source sheets (not visible clutter), and drives its results
-    with a FILTER() formula keyed off the two input cells -- not a static
-    table requiring manual filtering."""
+def test_posting_summary_is_the_landing_page_and_reconciliation_detail_follows(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """Posting Summary is the landing page (sheet[0]); with Data Search
+    removed, Reconciliation Detail is now the first working sheet a
+    reviewer sees."""
     result = _build_result_with_duplicates(qb_mapping, inf_mapping, make_metadata)
     wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
-
     assert wb.sheetnames[0] == "Posting Summary"
-    assert wb.sheetnames[1] == "Data Search"
-    assert wb["Data Search QB Source"].sheet_state == "hidden"
-    assert wb["Data Search INF Source"].sheet_state == "hidden"
-
-    ws = wb["Data Search"]
-    search_text = _worksheet_text(ws)
-    assert "Enter Invoice #" in search_text
-    assert "Enter PO #" in search_text
-    assert "QUICKBOOKS ITEMS" in search_text
-    assert "INFINIUM ITEMS" in search_text
-
-    qb_formula = ws.cell(9, 1).value
-    assert isinstance(qb_formula, str) and qb_formula.startswith("=")
-    assert "FILTER(" in qb_formula
-    # FILTER is a post-2016 dynamic-array "future function" -- Excel always
-    # stores it internally with an _xlfn. prefix, and a file written without
-    # that prefix (openpyxl's default) is exactly what triggers Excel's "we
-    # found a problem with some content" repair prompt on open.
-    assert "_xlfn.FILTER(" in qb_formula
-    assert "Data Search QB Source" in qb_formula
-    assert "SEARCH(" in qb_formula and "ISNUMBER(" in qb_formula
-    # No stray unbalanced parens -- a direct regression guard for the class
-    # of hand-built-formula bug this codebase has hit before (#NAME?/#REF!
-    # errors from malformed table/range references).
-    assert qb_formula.count("(") == qb_formula.count(")")
-
-    # Row ID, PO, Invoice, Amount, Status, Match Ref., Match Type, Referenced Match Ref.,
-    # Duplicate Group ID, Matched * Row ID, Detail
-    inf_col_count = 11
-    inf_formula = ws.cell(9, inf_col_count + 2).value
-    assert isinstance(inf_formula, str) and inf_formula.startswith("=")
-    assert "Data Search INF Source" in inf_formula
-    assert inf_formula.count("(") == inf_formula.count(")")
+    assert wb.sheetnames[1] == "Reconciliation Detail"
 
 
 def test_fiscal_period_summary_is_promoted_above_the_exception_table(
@@ -1325,22 +1255,11 @@ def test_analytics_match_level_sheets_carry_references_but_summaries_do_not(
             for row in wb[name].iter_rows() for c in row
         ), name
     primary = load_workbook(io.BytesIO(build_primary_workbook(result)))
-    for name in ("Product Aggregate Summary", "Raw Data"):
+    for name in ("Product Aggregates", "Raw Data"):
         assert not any(
             isinstance(c.value, str) and "Match Ref." in c.value
             for row in primary[name].iter_rows() for c in row
         ), name
-
-
-def test_data_search_panels_show_references_beside_the_match_type(qb_mapping, inf_mapping, make_metadata):
-    result = _reference_result(qb_mapping, inf_mapping, make_metadata)
-    wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
-    for source in ("Data Search QB Source", "Data Search INF Source"):
-        headers = _sheet_headers(wb[source], 1)
-        assert headers.index("Match Ref.") + 1 == headers.index("Match Type")
-        assert "Referenced Match Ref." in headers
-        refs = {row[headers.index("Match Ref.")].value for row in wb[source].iter_rows(min_row=2)}
-        assert {"M-001", "M-002", "G-001"} <= {r for r in refs if r}
 
 
 def test_reference_feature_changes_no_reconciliation_total(qb_mapping, inf_mapping, make_metadata):
@@ -1821,7 +1740,6 @@ def test_posting_summary_is_the_first_sheet_and_states_the_equation(qb_mapping, 
     assert metrics["Proposed JE Amount"] in row_values
     # Match rate is present but demoted -- after the headline, not as the title.
     assert "Match rate (secondary measure)" in text
-    assert "Reason Code Glossary" in text
 
 
 def test_posting_summary_flags_an_inconsistent_fiscal_period(qb_mapping, inf_mapping, make_metadata):
@@ -1851,28 +1769,34 @@ def test_posting_summary_is_silent_when_the_period_matches(qb_mapping, inf_mappi
     assert "⚠" not in text
 
 
-def test_reason_code_glossary_covers_every_review_hold_and_duplicate_code(qb_mapping, inf_mapping, make_metadata):
+def test_unresolved_exceptions_embeds_a_run_scoped_reason_code_glossary(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """The dedicated Reason Code Glossary sheet was removed; its
+    definitions now live in Unresolved Exceptions' own frozen header,
+    scoped to only the codes this run's Review Hold table actually shows
+    -- not the full static list of every code the engine can ever
+    produce."""
     from matching import REASON_CODE_GLOSSARY
 
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
     wb = load_workbook(io.BytesIO(build_primary_workbook(result)))
-    assert "Reason Code Glossary" in wb.sheetnames
-    ws = wb["Reason Code Glossary"]
-    header_row = next(row for row in ws.iter_rows(max_row=6) if any(c.value == "Reason Code" for c in row))
-    headers = [c.value for c in header_row]
-    rows = {
-        row[headers.index("Reason Code")].value: row
-        for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value
-    }
-    assert set(REASON_CODE_GLOSSARY) <= set(rows)
-    assert rows["PO_ALREADY_REPRESENTED"][headers.index("Disposition")].value == "REVIEW HOLD"
-    assert rows["PO_ALREADY_REPRESENTED"][headers.index("Feeds Proposed JE")].value == "No"
-    assert rows["NO_INFINIUM_CANDIDATE"][headers.index("Disposition")].value == "TRUE UNMATCHED"
-    assert rows["NO_INFINIUM_CANDIDATE"][headers.index("Feeds Proposed JE")].value == "Yes"
-    assert rows["DUPLICATE_EXCLUDED"][headers.index("Disposition")].value == "DUPLICATE EXCLUDED"
-    # Every code the exceptions sheet actually shows is a real glossary entry.
-    unresolved_text = _worksheet_text(wb["Unresolved Exceptions"])
-    assert "PO_ALREADY_REPRESENTED" in unresolved_text
+    assert "Reason Code Glossary" not in wb.sheetnames
+    ws = wb["Unresolved Exceptions"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+
+    assert "REASON CODES ON THIS SHEET" in text
+    # Every code the exceptions sheet actually shows is a real glossary
+    # entry, and its full definition is embedded right there on the sheet.
+    assert "PO_ALREADY_REPRESENTED" in text
+    assert REASON_CODE_GLOSSARY["PO_ALREADY_REPRESENTED"] in text
+
+    # This run's only Review Hold reason is PO_ALREADY_REPRESENTED -- every
+    # other code's full definition must be absent, proving the legend is
+    # scoped to this run rather than the old full static glossary.
+    for code, description in REASON_CODE_GLOSSARY.items():
+        if code != "PO_ALREADY_REPRESENTED":
+            assert description not in text, code
 
 
 def test_legacy_final_disposition_column_matches_the_four_top_level_outcomes(
@@ -1956,7 +1880,7 @@ def test_product_aggregate_summary_shows_disposition_breakdown_by_product(
     assert juniors["QuickBooks Rows"] == 2 and juniors["Matched Rows"] == 1
     assert juniors["Duplicate Excluded Rows"] == 1
 
-    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregate Summary"]
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregates"]
     text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
     assert "JE SUPPORT AND REVIEW HOLD BY PRODUCT" in text
     header_row = next(row for row in ws.iter_rows(max_row=5) if any(c.value == "Matched %" for c in row))
@@ -1975,7 +1899,7 @@ def test_product_aggregate_summary_falls_back_cleanly_with_no_product_mapping(
     """No product column mapped: the plain fallback view renders without error."""
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
     assert result.product_disposition_summary.empty
-    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregate Summary"]
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregates"]
     text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
     assert "PRODUCT AGGREGATE SUMMARY" in text
     assert "not mapped" in text.lower() or "no product breakdown" in text.lower()

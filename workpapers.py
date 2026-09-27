@@ -1234,6 +1234,34 @@ def _write_color_legend(ws, first_row: int, start_col: int, end_col: int) -> int
     return last_row
 
 
+def _write_reason_code_legend(ws, first_row: int, start_col: int, end_col: int, codes: list[str]) -> int:
+    """A compact reason-code glossary, scoped to only the codes actually
+    appearing in this run's Review Hold table below -- not the full static
+    glossary of every code the engine can ever produce. Replaces the
+    dedicated Reason Code Glossary sheet: one row per code, bold code
+    followed by its plain-language definition, in the sheet's own frozen
+    top rows instead of a lookup one tab away. Returns the last row used
+    (unchanged from first_row - 1 if there are no codes to show)."""
+    if not codes:
+        return first_row - 1
+    title_row = first_row
+    ws.cell(title_row, start_col, "REASON CODES ON THIS SHEET")
+    ws.cell(title_row, start_col).font = Font(name=FONT_NAME, size=9, bold=True, color=SLATE)
+    last_row = title_row
+    for code in codes:
+        last_row += 1
+        description = REASON_CODE_GLOSSARY.get(code, "No further explanation is on file for this code.")
+        if end_col > start_col:
+            ws.merge_cells(start_row=last_row, start_column=start_col, end_row=last_row, end_column=end_col)
+        cell = ws.cell(last_row, start_col)
+        cell.value = f"{code}:  {description}"
+        cell.font = Font(name=FONT_NAME, size=8, color=TEXT)
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        cell.fill = PatternFill("solid", fgColor=SLATE_LIGHT)
+        fix_row_height(ws, last_row, 26)
+    return last_row
+
+
 def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ws = wb.create_sheet(UNRESOLVED_EXCEPTIONS_SHEET)
 
@@ -1334,7 +1362,8 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     # table, replacing what used to be four separately-labeled sections
     # (Duplicate Review Hold, Amount Variance, Ambiguous, Reference Evidence).
     # A short Reason Code plus a one-line Reason keep the sheet scannable; the
-    # full technical explanation for each code lives on Reason Code Glossary.
+    # full technical explanation for each code actually used this run is in
+    # this sheet's own embedded glossary, in the frozen rows above.
     review_ledger = result.qb_dispositions.loc[
         result.qb_dispositions["Final Disposition"] == "REVIEW_HOLD"
     ].copy()
@@ -1454,6 +1483,11 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
     ]
     _write_kpi_band(ws, 3, 4, kpis, end_col)
     legend_last_row = _write_color_legend(ws, 5, 1, end_col)
+    # Reason Code Glossary embedded here (frozen, above the data), scoped to
+    # only the codes this run's Review Hold table actually uses -- replaces
+    # the old dedicated glossary sheet with no irrelevant codes listed.
+    run_reason_codes = sorted(set(str(code) for code in review_frame["Reason Code"] if code))
+    legend_last_row = _write_reason_code_legend(ws, legend_last_row + 1, 1, end_col, run_reason_codes)
     # One slim spacer row, then the fiscal-period summary.
     fix_row_height(ws, legend_last_row + 1, 8)
 
@@ -1731,8 +1765,9 @@ def build_unresolved_sheet(wb: Workbook, result: ReconciliationResult) -> None:
 
     review_caption = (
         f"{review_hold_count:,} row(s) are held for review, out of the proposed JE, pending a "
-        "documented decision -- see Reason Code for why each was held and Reason Code Glossary for "
-        "the full explanation of every code. Suggested dispositions: Release to JE (a confirmed "
+        "documented decision -- see Reason Code for why each was held, and this sheet's embedded "
+        "glossary (frozen rows above) for the full explanation of every code. Suggested dispositions: "
+        "Release to JE (a confirmed "
         "genuine transaction), Exclude (a confirmed duplicate or already-represented transaction), "
         "Confirm Match (accept a candidate manually), or Carry Forward (needs more investigation)."
         if review_hold_count
@@ -2702,14 +2737,19 @@ def build_legacy_workbook(result: ReconciliationResult) -> bytes:
     )
 
 
-def build_product_sheet(wb: Workbook, result: ReconciliationResult) -> None:
+def build_product_sheet(
+    wb: Workbook, result: ReconciliationResult, *, sheet_title: str = "Product Aggregate Summary",
+) -> None:
     """Decision-oriented, not just a quantity/value total that "does not
     affect matching" and stops there: JE Support, Review Hold, and Matched %
     by product, so a reviewer can see where a product's dollars actually
     sit. Falls back to the plain quantity/value view only when no product
     classification is possible at all (see build_product_disposition_summary
-    in matching.py)."""
-    ws = wb.create_sheet("Product Aggregate Summary")
+    in matching.py).
+
+    sheet_title defaults to the Legacy workbook's tab name; the primary
+    workbook passes its own shorter "Product Aggregates" tab name."""
+    ws = wb.create_sheet(sheet_title)
     frame = result.product_disposition_summary
     selected_period = result.metadata.get("fiscal_period")
     period_scope = (
@@ -2891,7 +2931,7 @@ _FIXED_ROW_HEIGHTS = {
 
 def _controlled_row_two_height(sheet_title: str) -> int:
     """Fixed row-2 caption-band height per sheet, overriding autofit."""
-    if sheet_title == "Product Aggregate Summary":
+    if sheet_title in ("Product Aggregate Summary", "Product Aggregates"):
         return 60
     if sheet_title == "Legacy Reconciliation":
         return 30
@@ -3250,8 +3290,8 @@ def build_posting_summary_sheet(wb: Workbook, result: ReconciliationResult) -> N
     ws.merge_cells(start_row=nav_row, start_column=1, end_row=nav_row, end_column=end_col)
     nav_cell = ws.cell(
         nav_row, 1,
-        "Review Hold detail and reviewer actions: Unresolved Exceptions. Every source row: "
-        "Reconciliation Detail. Full explanation of every reason code above: Reason Code Glossary.",
+        "Review Hold detail and reviewer actions: Unresolved Exceptions (reason code definitions "
+        "are in that sheet's own frozen header). Every source row: Reconciliation Detail.",
     )
     nav_cell.font = Font(name="Segoe UI", size=9, italic=True, color=SLATE)
     nav_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -3267,51 +3307,6 @@ def build_posting_summary_sheet(wb: Workbook, result: ReconciliationResult) -> N
     ws.sheet_properties.pageSetUpPr.fitToPage = True
 
 
-def build_reason_code_glossary_sheet(wb: Workbook, result: ReconciliationResult) -> None:
-    """Every short reason code shown anywhere in the workbook, its full
-    audit-grade explanation, and whether the disposition it belongs to feeds
-    the proposed JE -- the one place the long technical text lives now that
-    the Unresolved Exceptions and Legacy sheets show only the short code plus
-    a concise reason (see SHORT_REASON_CODES / REASON_CODE_GLOSSARY in
-    matching.py)."""
-    ws = wb.create_sheet("Reason Code Glossary")
-    headers = ["Reason Code", "Disposition", "Feeds Proposed JE", "Full Explanation"]
-    end_col = len(headers)
-    _write_title_band(ws, 1, 1, end_col, "REASON CODE GLOSSARY", SLATE)
-    _write_caption_band(
-        ws, 2, 1, end_col,
-        "Every reason code shown on Unresolved Exceptions, Reconciliation Detail, and Legacy "
-        "Reconciliation, in full. Only TRUE_UNMATCHED rows feed the proposed journal entry.",
-        SLATE,
-    )
-    disposition_by_code = {
-        "NO_INFINIUM_CANDIDATE": "TRUE UNMATCHED", "PO_REUSE_UNSUPPORTED": "TRUE UNMATCHED",
-        "DUPLICATE_EXCLUDED": "DUPLICATE EXCLUDED",
-    }
-    header_row, data_row = 3, 4
-    records = []
-    for short_code, description in sorted(REASON_CODE_GLOSSARY.items()):
-        disposition = disposition_by_code.get(short_code, "REVIEW HOLD")
-        records.append({
-            "Reason Code": short_code,
-            "Disposition": disposition,
-            "Feeds Proposed JE": "Yes" if disposition == "TRUE UNMATCHED" else "No",
-            "Full Explanation": description,
-        })
-    frame = pd.DataFrame(records, columns=headers)
-    _write_dataframe_values(ws, frame, header_row, 1)
-    _format_header(ws, header_row, 1, end_col, SLATE, headers=headers)
-    last_row = data_row + len(frame) - 1
-    _format_body_block(ws, data_row, last_row, 1, end_col, SLATE_LIGHT)
-    for row in range(data_row, last_row + 1):
-        ws.cell(row, 4).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    _set_widths(ws, 1, end_col, header_row, last_row, maximum=30)
-    ws.column_dimensions[get_column_letter(4)].width = 90
-    ws.freeze_panes = f"A{data_row}"
-    ws.print_title_rows = f"1:{header_row}"
-    _prepare_sheet(ws, landscape=False)
-
-
 def build_primary_workbook(result: ReconciliationResult) -> bytes:
     validate_match_references(result)
     wb = Workbook()
@@ -3319,17 +3314,23 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     wb.properties.title = f"Sales Reconciliation {result.run_id}"
     wb.properties.subject = "QuickBooks to Infinium reconciliation and journal-entry support"
     wb.properties.description = "Accounting workpaper generated from one controlled reconciliation run."
-    build_data_search_sheet(wb, result)
-    build_raw_data_sheet(wb, result)
+    # Creation order doubles as the final tab order (aside from Posting
+    # Summary, moved to the front below): Reconciliation Detail, Unresolved
+    # Exceptions, Product Aggregates, Raw Data.
     build_reconciliation_detail_sheet(wb, result)
     build_unresolved_sheet(wb, result)
     _link_reconciled_data_to_unresolved_exceptions(wb, result)
-    build_product_sheet(wb, result)
-    build_reason_code_glossary_sheet(wb, result)
+    build_product_sheet(wb, result, sheet_title="Product Aggregates")
+    build_raw_data_sheet(wb, result)
     build_posting_summary_sheet(wb, result)
-    # The landing page: moved to the very front now that every other sheet
-    # (and the default sheet build_data_search_sheet claimed) exists.
+    # The landing page: moved to the very front now that every other sheet exists.
     wb.move_sheet("Posting Summary", offset=-wb.sheetnames.index("Posting Summary"))
+    # Workbook() always starts with one default "Sheet"; every real sheet
+    # above was added via create_sheet, so the stray default is still here
+    # and empty (build_data_search_sheet used to claim it by renaming it --
+    # now that it's gone, nothing does).
+    if "Sheet" in wb.sheetnames:
+        del wb["Sheet"]
     wb.active = 0
     _apply_workbook_run_metadata(wb, result)
     return _save_workbook_bytes(wb, apply_accountant_row_heights=True, suppress_text_number_warnings=True)
@@ -3378,279 +3379,6 @@ def detailed_ledger_dataframe(result: ReconciliationResult) -> pd.DataFrame:
             
         records.append(output)
     return pd.DataFrame(records)
-
-
-DATA_SEARCH_COLUMNS = [
-    "Status", "Match Ref.", "Match Type", "Referenced Match Ref.", "Duplicate Group ID",
-    "QuickBooks Row ID", "QuickBooks PO", "QuickBooks Invoice", "QuickBooks Amount",
-    "Infinium Row ID", "Infinium PO", "Infinium Invoice", "Infinium Amount",
-    "Detail",
-]
-
-_DATA_SEARCH_STATUS_BY_SECTION = {
-    "01 Matched": "Infinium Match",
-    "01 Matched - Historical Clearance": "Infinium Match",
-    "02 Unmatched QuickBooks": "Outstanding (On Accrual List)",
-    "03 Unmatched Infinium": "Error",
-    "04 Duplicate QuickBooks": "Duplicate",
-    "05 Duplicate Infinium": "Duplicate",
-    "06 Duplicate Review Hold QuickBooks": "Duplicate",
-    "07 Duplicate Review Hold Infinium": "Duplicate",
-    "08 Reference-Matched Amount Variance Review Hold": "Error",
-    "09 Fuzzy Match Review Hold": "Fuzzy Match",
-    REFERENCE_HOLD_SECTION: "Review Hold",
-}
-
-_DATA_SEARCH_MATCH_TYPE_SECTIONS = {
-    "01 Matched", "01 Matched - Historical Clearance", "09 Fuzzy Match Review Hold",
-}
-
-
-def _data_search_status(record: dict[str, Any]) -> str:
-    section = record.get("Section", "")
-    if section == "02 Unmatched QuickBooks" and "Invalid" in str(record.get("Exception Cause") or ""):
-        return "Error"
-    return _DATA_SEARCH_STATUS_BY_SECTION.get(section, "Error")
-
-
-def build_data_search_dataframe(result: ReconciliationResult) -> pd.DataFrame:
-    """One row per QuickBooks/Infinium line across every reconciliation
-    population, for a plain PO/Invoice lookup: what is this item's status,
-    and if it's a match, what kind.
-
-    Built from the same paired-row resolution used for the Detailed Match
-    Ledger, so every row appearing anywhere in the reconciliation appears
-    here exactly once (validate_reconciliation guarantees this). A row can
-    also carry a Duplicate Group ID even when its own Status is something
-    else -- the retained copy of a confirmed duplicate keeps its real
-    Outstanding/Infinium Match status (it still feeds the accrual) but is
-    still identifiable as part of that duplicate pair.
-    """
-    resolved_records = _resolve_paired_records_bulk(result)
-    qb_display, inf_display, _ = _paired_display_frames(result)
-    qb_disp_dicts = qb_display.to_dict("records")
-    inf_disp_dicts = inf_display.to_dict("records")
-
-    qb_id_map = result.qb_work[QB_ID].to_dict() if result.qb_work is not None else {}
-    inf_id_map = result.inf_work[INF_ID].to_dict() if result.inf_work is not None else {}
-    qb_sec_id_map = result.qb_secondary_work[QB_ID].to_dict() if result.qb_secondary_work is not None else {}
-    inf_sec_id_map = result.inf_secondary_work[INF_ID].to_dict() if result.inf_secondary_work is not None else {}
-
-    qb_po_header = result.qb_mapping.get("po")
-    qb_invoice_header = result.qb_mapping.get("invoice")
-    qb_amount_header = result.qb_mapping.get("amount")
-    inf_po_header = result.inf_mapping.get("po")
-    inf_invoice_header = result.inf_mapping.get("invoice")
-    inf_amount_header = result.inf_mapping.get("amount")
-
-    def duplicate_group_map(report: pd.DataFrame) -> dict[str, str]:
-        if report is None or report.empty:
-            return {}
-        return dict(zip(report["Source Row ID"].astype(str), report["Duplicate Group ID"]))
-
-    qb_dup_groups = duplicate_group_map(result.duplicate_analysis)
-    inf_dup_groups = duplicate_group_map(result.infinium_duplicate_analysis)
-
-    records: list[dict[str, Any]] = []
-    for position, record in enumerate(resolved_records):
-        qidx, iidx = record["QB Index"], record["Infinium Index"]
-        qb_scope = record.get("QB Record Scope")
-        inf_scope = record.get("Infinium Record Scope")
-        active_q_map = qb_sec_id_map if qb_scope == "Historical" else qb_id_map
-        active_i_map = inf_sec_id_map if inf_scope == "Historical" else inf_id_map
-        qb_row_id = active_q_map.get(qidx) if qidx is not None else None
-        inf_row_id = active_i_map.get(iidx) if iidx is not None else None
-        qb_values = qb_disp_dicts[position]
-        inf_values = inf_disp_dicts[position]
-
-        section = record.get("Section", "")
-        match_type = record.get("Match Result", "") if section in _DATA_SEARCH_MATCH_TYPE_SECTIONS else ""
-        duplicate_group_id = (
-            (qb_dup_groups.get(str(qb_row_id)) if qb_row_id is not None else None)
-            or (inf_dup_groups.get(str(inf_row_id)) if inf_row_id is not None else None)
-            or ""
-        )
-
-        records.append({
-            "Status": _data_search_status(record),
-            "Match Ref.": record.get("Match Ref.", ""),
-            "Match Type": match_type,
-            "Referenced Match Ref.": record.get("Referenced Match Ref.", ""),
-            "Duplicate Group ID": duplicate_group_id,
-            "QuickBooks Row ID": qb_row_id,
-            "QuickBooks PO": qb_values.get(qb_po_header) if qb_po_header else None,
-            "QuickBooks Invoice": qb_values.get(qb_invoice_header) if qb_invoice_header else None,
-            "QuickBooks Amount": qb_values.get(qb_amount_header) if qb_amount_header else None,
-            "Infinium Row ID": inf_row_id,
-            "Infinium PO": inf_values.get(inf_po_header) if inf_po_header else None,
-            "Infinium Invoice": inf_values.get(inf_invoice_header) if inf_invoice_header else None,
-            "Infinium Amount": inf_values.get(inf_amount_header) if inf_amount_header else None,
-            "Detail": record.get("Exception Cause") or record.get("Explanation") or "",
-        })
-    return pd.DataFrame(records, columns=DATA_SEARCH_COLUMNS)
-
-
-def build_data_search_indexes(result: ReconciliationResult) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split the joined Data Search table into one row-per-QuickBooks-row
-    table and one row-per-Infinium-row table, for the two live search panels.
-
-    Every QuickBooks row appears in exactly one row of the QB table, and
-    every Infinium row appears in exactly one row of the Infinium table --
-    same guarantee as the joined table, since it's just a filtered view of it.
-    """
-    joined = build_data_search_dataframe(result)
-    qb_index = joined.loc[joined["QuickBooks Row ID"].notna(), [
-        "QuickBooks Row ID", "QuickBooks PO", "QuickBooks Invoice", "QuickBooks Amount",
-        "Status", "Match Ref.", "Match Type", "Referenced Match Ref.", "Duplicate Group ID",
-        "Infinium Row ID", "Detail",
-    ]].rename(columns={
-        "QuickBooks Row ID": "Row ID", "QuickBooks PO": "PO", "QuickBooks Invoice": "Invoice",
-        "QuickBooks Amount": "Amount", "Infinium Row ID": "Matched Infinium Row ID",
-    }).reset_index(drop=True)
-    inf_index = joined.loc[joined["Infinium Row ID"].notna(), [
-        "Infinium Row ID", "Infinium PO", "Infinium Invoice", "Infinium Amount",
-        "Status", "Match Ref.", "Match Type", "Referenced Match Ref.", "Duplicate Group ID",
-        "QuickBooks Row ID", "Detail",
-    ]].rename(columns={
-        "Infinium Row ID": "Row ID", "Infinium PO": "PO", "Infinium Invoice": "Invoice",
-        "Infinium Amount": "Amount", "QuickBooks Row ID": "Matched QuickBooks Row ID",
-    }).reset_index(drop=True)
-    return qb_index, inf_index
-
-
-def _search_criteria_formula(search_cell_ref: str, column_range: str) -> str:
-    """Boolean array: TRUE for every row when the search cell is blank
-    (no filter applied), else TRUE only where that row contains the typed
-    text (case-insensitive substring match)."""
-    return f'(({search_cell_ref}="")+(({search_cell_ref}<>"")*ISNUMBER(SEARCH({search_cell_ref},{column_range}))))'
-
-
-def _write_search_input(ws, label: str, label_row: int, input_row: int, start_col: int) -> str:
-    ws.cell(label_row, start_col, label)
-    ws.cell(label_row, start_col).font = Font(name=FONT_NAME, size=11, bold=True, color=TEXT)
-    ws.merge_cells(start_row=label_row, start_column=start_col, end_row=label_row, end_column=start_col + 2)
-    input_col = start_col + 3
-    input_cell = ws.cell(input_row, input_col, "")
-    ws.merge_cells(start_row=input_row, start_column=input_col, end_row=input_row, end_column=input_col + 2)
-    for col in range(input_col, input_col + 3):
-        cell = ws.cell(input_row, col)
-        cell.fill = PatternFill("solid", fgColor=WHITE)
-        cell.border = _thin_border()
-        cell.font = Font(name=FONT_NAME, size=11, color=TEXT)
-    ws.row_dimensions[input_row].height = 20
-    return f"${get_column_letter(input_col)}${input_row}"
-
-
-def _write_search_panel(
-    ws, source_sheet_name: str, index: pd.DataFrame,
-    start_col: int, header_color: str, panel_title: str,
-    panel_header_row: int, column_header_row: int, data_row: int,
-    po_cell_ref: str, invoice_cell_ref: str,
-) -> None:
-    end_col = start_col + len(index.columns) - 1
-    _write_title_band(ws, panel_header_row, start_col, end_col, panel_title, header_color)
-    for offset, header in enumerate(index.columns):
-        ws.cell(column_header_row, start_col + offset, header)
-    _format_header(
-        ws, column_header_row, start_col, end_col, header_color,
-        headers=list(index.columns), amount_columns={"Amount"},
-    )
-
-    if index.empty:
-        ws.cell(data_row, start_col, "No rows to search.")
-        return
-
-    last_source_row = len(index) + 1  # row 1 on the source sheet is its header
-    columns = list(index.columns)
-    po_col_letter = get_column_letter(columns.index("PO") + 1)
-    invoice_col_letter = get_column_letter(columns.index("Invoice") + 1)
-    data_range = (
-        f"'{source_sheet_name}'!A2:{get_column_letter(len(columns))}{last_source_row}"
-    )
-    po_range = f"'{source_sheet_name}'!{po_col_letter}2:{po_col_letter}{last_source_row}"
-    invoice_range = f"'{source_sheet_name}'!{invoice_col_letter}2:{invoice_col_letter}{last_source_row}"
-    criteria = (
-        f"{_search_criteria_formula(po_cell_ref, po_range)}*"
-        f"{_search_criteria_formula(invoice_cell_ref, invoice_range)}"
-    )
-    formula = (
-        f'=IF(AND({po_cell_ref}="",{invoice_cell_ref}=""),'
-        f'"Type a PO or Invoice # above to search",'
-        # FILTER is a post-2016 "future function" -- Excel itself always
-        # stores these internally with an _xlfn. prefix, and a file written
-        # without it (as openpyxl does by default) reads as a malformed
-        # formula, which is exactly what triggers Excel's "we found a
-        # problem with some content" repair prompt on open.
-        f'_xlfn.FILTER({data_range},{criteria},"No matching items found"))'
-    )
-    ws.cell(data_row, start_col, formula)
-    _set_widths(ws, start_col, end_col, panel_header_row, data_row)
-    for offset, header in enumerate(columns):
-        if header in ("Detail",):
-            ws.column_dimensions[get_column_letter(start_col + offset)].width = 46
-        elif header in ("PO", "Invoice"):
-            ws.column_dimensions[get_column_letter(start_col + offset)].width = 22
-
-
-def build_data_search_sheet(wb: Workbook, result: ReconciliationResult) -> None:
-    """A live-search sheet: type a PO or Invoice # once, and matching
-    QuickBooks and Infinium items spill in automatically via Excel's FILTER()
-    dynamic array function -- no manual filtering. Requires Excel 365 or
-    Excel 2021+ (or the free Excel for the web), since FILTER() is a dynamic-
-    array function not available in older desktop Excel.
-    """
-    qb_index, inf_index = build_data_search_indexes(result)
-
-    qb_source_ws = wb.create_sheet("Data Search QB Source")
-    _write_dataframe_values(qb_source_ws, qb_index, 1, 1)
-    qb_source_ws.sheet_state = "hidden"
-
-    inf_source_ws = wb.create_sheet("Data Search INF Source")
-    _write_dataframe_values(inf_source_ws, inf_index, 1, 1)
-    inf_source_ws.sheet_state = "hidden"
-
-    ws = wb.active
-    ws.title = "Data Search"
-
-    qb_cols, inf_cols = len(qb_index.columns), len(inf_index.columns)
-    qb_start, qb_end = 1, qb_cols
-    inf_start = qb_end + 2
-    inf_end = inf_start + inf_cols - 1
-    end_col = inf_end
-
-    _write_title_band(ws, 1, 1, end_col, "DATA SEARCH | TYPE A PO OR INVOICE NUMBER", NAVY)
-    _write_caption_band(
-        ws, 2, 1, end_col,
-        "Type an Invoice # or PO # below (either one, or both to narrow the results) and "
-        "matching QuickBooks and Infinium items appear automatically. Partial text matches "
-        "count, so a few digits are enough. Status shows whether an item is outstanding on the "
-        "accrual list, an error, a duplicate, a fuzzy match, or matched to Infinium; Match Type "
-        "shows how a match was made. Duplicate Group ID is populated even on a duplicate pair's "
-        "retained (accrual) copy, so both members of a pair stay traceable together. Requires "
-        "Excel 365 / Excel 2021+ for the live results (FILTER is a dynamic-array function).",
-        NAVY,
-    )
-
-    invoice_label_row = invoice_input_row = 4
-    po_label_row = po_input_row = 5
-    invoice_cell_ref = _write_search_input(ws, "Enter Invoice #", invoice_label_row, invoice_input_row, 1)
-    po_cell_ref = _write_search_input(ws, "Enter PO #", po_label_row, po_input_row, 1)
-
-    panel_header_row = 7
-    column_header_row = 8
-    data_row = 9
-
-    _write_search_panel(
-        ws, "Data Search QB Source", qb_index, qb_start, NAVY, "QUICKBOOKS ITEMS",
-        panel_header_row, column_header_row, data_row, po_cell_ref, invoice_cell_ref,
-    )
-    _write_search_panel(
-        ws, "Data Search INF Source", inf_index, inf_start, TEAL, "INFINIUM ITEMS",
-        panel_header_row, column_header_row, data_row, po_cell_ref, invoice_cell_ref,
-    )
-    ws.column_dimensions[get_column_letter(qb_end + 1)].width = 3.5
-    ws.freeze_panes = f"A{data_row}"
-    _prepare_sheet(ws)
 
 
 def _add_standard_data_sheet(
