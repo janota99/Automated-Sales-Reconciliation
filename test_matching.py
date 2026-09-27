@@ -820,22 +820,6 @@ def test_weak_basis_review_hold_does_not_block_control_status(qb_mapping, inf_ma
     assert result.metrics["Duplicate QuickBooks Rows"] == 0
 
 
-def test_rules_table_documents_duplicate_handling(qb_mapping, inf_mapping, make_metadata):
-    result = build_reconciliation(
-        pd.DataFrame([{"PO": "PO1", "Invoice": "INV1", "Amount": 1.0, "Qty": 1, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]),
-        pd.DataFrame([{"PO": "PO1", "Invoice": "INV1", "Amount": 1.0, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"}]),
-        qb_mapping, inf_mapping, make_metadata(), 2026,
-    )
-    rule_names = set(result.rules["Rule"])
-    assert (
-        "QuickBooks exact duplicates: excluded before matching; weaker groups decided after (see duplicates.py)"
-        in rule_names
-    )
-    assert "Final QuickBooks disposition and JE population" in rule_names
-    assert "Infinium duplicate-key groups: matched normally, held if unresolved" in rule_names
-    assert "Historical overlap exclusion" in rule_names
-
-
 def test_validate_reconciliation_rejects_duplicate_leaking_into_unresolved(
     qb_mapping, inf_mapping, make_metadata,
 ):

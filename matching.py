@@ -203,7 +203,6 @@ class ReconciliationResult:
     matches: list[MatchGroup]
     paired_rows: list[dict[str, Any]]
     candidates: pd.DataFrame
-    normalization: pd.DataFrame
     assessments: pd.DataFrame
     method_summary: pd.DataFrame
     exception_analysis: pd.DataFrame
@@ -211,10 +210,9 @@ class ReconciliationResult:
     duplicate_analysis: pd.DataFrame
     infinium_duplicate_analysis: pd.DataFrame
     product_summary: pd.DataFrame
+    customer_summary: pd.DataFrame
     controls: pd.DataFrame
     metrics: dict[str, Any]
-    rules: pd.DataFrame
-    config: pd.DataFrame
     qb_mapping: dict[str, Optional[str]]
     inf_mapping: dict[str, Optional[str]]
     metadata: dict[str, Any]
@@ -1220,7 +1218,7 @@ def build_po_reuse_errors(
 
     Zero tolerance is applied (a difference of even one cent is flagged),
     consistent with this application's established "no tolerance" amount
-    policy (see the Amount Variance rule in build_rules_and_config).
+    policy.
     """
     q_indexes = sorted(set(int(idx) for idx in unmatched_qb))
     i_indexes = sorted(set(int(idx) for idx in unmatched_inf))
@@ -3122,45 +3120,6 @@ def build_paired_rows(
     return rows
 
 
-def build_normalization_detail(
-    qb: pd.DataFrame,
-    inf: pd.DataFrame,
-    qb_mapping: dict[str, Optional[str]],
-    inf_mapping: dict[str, Optional[str]],
-) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for source, frame, mapping, id_col in (
-        ("QuickBooks", qb, qb_mapping, QB_ID),
-        ("Infinium", inf, inf_mapping, INF_ID),
-    ):
-        for idx, row in frame.iterrows():
-            record = {
-                "Dataset": source,
-                "Source Row ID": row[id_col],
-                "Original PO": row[mapping["po"]],
-                "Normalized PO": row[NORM_PO],
-                "Original Invoice": row[mapping["invoice"]],
-                "Normalized Invoice": row[NORM_INV],
-                "Original Amount": row[mapping["amount"]],
-                "Normalized Amount": cents_to_float(row[AMOUNT_CENTS])
-                if valid_cents(row[AMOUNT_CENTS]) else None,
-                "Amount Valid": valid_cents(row[AMOUNT_CENTS]),
-            }
-            if source == "QuickBooks":
-                product_col = mapping.get("product")
-                period_col = mapping.get("period")
-                record.update(
-                    {
-                        "Original Product Description": row[product_col] if product_col else None,
-                        "Standardized Product": row[PRODUCT_STANDARD],
-                        "Original Fiscal Period": row[period_col] if period_col else None,
-                        "Fiscal Period Label": row[FISCAL_LABEL],
-                    }
-                )
-            records.append(record)
-    return pd.DataFrame(records)
-
-
 def build_match_assessments(
     matches: list[MatchGroup],
     historical_clearances: pd.DataFrame,
@@ -3485,6 +3444,41 @@ def build_product_summary(
     )
 
 
+def build_customer_summary(
+    qb: pd.DataFrame,
+    mapping: dict[str, Optional[str]],
+    current_fiscal_period: Optional[int] = None,
+    fiscal_year: Optional[int] = None,
+) -> pd.DataFrame:
+    """Sum of quantity and value by QuickBooks Customer, same period scope
+    as build_product_summary -- a plain pivot, not a matching decision
+    view. Customer is an optional mapping (see ingestion.py); with no
+    customer/quantity/amount column mapped, this returns empty."""
+    customer_col = mapping.get("customer")
+    qty_col = mapping.get("quantity")
+    amount_col = mapping.get("amount")
+    columns = ["Customer Name", "Customer Quantity", "Customer Value"]
+    if not customer_col or customer_col not in qb.columns or not qty_col or not amount_col:
+        return pd.DataFrame(columns=columns)
+    customer_names = qb[customer_col].astype("string").str.strip()
+    work = qb[customer_names.notna() & customer_names.ne("")].copy()
+    if current_fiscal_period is not None:
+        expected_label = f"P{int(current_fiscal_period):02d}-{int(fiscal_year or 0)}"
+        work = work.loc[work[FISCAL_LABEL].eq(expected_label)].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+    work["__CUSTOMER"] = customer_names.loc[work.index]
+    work["__QTY"] = pd.to_numeric(work[qty_col], errors="coerce").fillna(0)
+    work["__AMOUNT"] = work[AMOUNT_CENTS].map(cents_to_float)
+    return (
+        work.groupby("__CUSTOMER", as_index=False)
+        .agg(**{"Customer Quantity": ("__QTY", "sum"), "Customer Value": ("__AMOUNT", "sum")})
+        .rename(columns={"__CUSTOMER": "Customer Name"})
+        .sort_values("Customer Name")
+        .reset_index(drop=True)
+    )
+
+
 def _period_sort(label: str) -> tuple[int, int, str]:
     match = re.fullmatch(r"P(\d{2})-(\d{4})", str(label))
     if not match:
@@ -3598,250 +3592,6 @@ def build_exception_analysis(
             }
         )
     return pd.DataFrame(records)
-
-
-def build_rules_and_config(
-    qb_mapping: dict[str, Optional[str]],
-    inf_mapping: dict[str, Optional[str]],
-    metadata: dict[str, Any],
-    qb_secondary_mapping: Optional[dict[str, Optional[str]]] = None,
-    inf_secondary_mapping: Optional[dict[str, Optional[str]]] = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rules = pd.DataFrame(
-        [
-            {"Priority": 1, "Rule": "PO + Invoice + Amount", "Automatic": "Yes",
-             "Requirement": "One unique row per dataset; normalized references and exact signed cents agree."},
-            {"Priority": 2, "Rule": "PO + Amount", "Automatic": "Yes",
-             "Requirement": "One unique remaining row per dataset; normalized PO and exact signed cents agree."},
-            {"Priority": 3, "Rule": "Invoice + Amount", "Automatic": "Yes",
-             "Requirement": "One unique remaining row per dataset; normalized invoice and exact signed cents agree. "
-             "Tagged 'Strong' confidence, the same as Priority 1 -- invoice number is the designated secondary "
-             "reconciliation check, not a lesser one, so a unique match on it is trusted just as much even when "
-             "the PO itself is missing or doesn't agree."},
-            {"Priority": 4, "Rule": "PO + Invoice + Aggregate Amount", "Automatic": "Yes, after one-to-one",
-             "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized PO and invoice and exact signed-cent totals agree."},
-            {"Priority": 5, "Rule": "PO + Aggregate Amount", "Automatic": "Yes, after one-to-one",
-             "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized PO and exact signed-cent totals agree."},
-            {"Priority": 6, "Rule": "Invoice + Aggregate Amount", "Automatic": "Yes, after one-to-one",
-             "Requirement": "One unique remaining one-to-many or many-to-one relationship; every grouped row shares the normalized invoice and exact signed-cent totals agree."},
-            {"Priority": 7, "Rule": "Confirmed Vendor Alias + Amount (see vendor_aliases.py)",
-             "Automatic": "Yes, after every exact pass",
-             "Requirement": (
-                 "Applies only to rows still unresolved after every exact one-to-one and grouped-aggregate "
-                 "pass. Covers PO references that share no text similarity at all (e.g. QuickBooks 'Hopper' "
-                 "vs. Infinium 'David' -- the same dock-sale customer named by surname on one system and "
-                 "first name on the other), where no fuzzy-text rule could ever bridge the gap. Requires a "
-                 "durable, human-confirmed alias record (who confirmed it, when, and why) naming both terms "
-                 "as the same party; the signed amount must still agree exactly, and the same bounded-shape, "
-                 "aggregate-tie-out safeguards as the fuzzy PO pass apply. Because the identity link was "
-                 "already confirmed by a person rather than guessed by the engine, it is tagged 'Confirmed' "
-                 "confidence and posted like an exact match rather than held for review."
-             )},
-            {"Priority": 8, "Rule": "Fuzzy PO + Amount (word match, unique) (see fuzzy_po_matching.py)",
-             "Automatic": "Yes, after every exact pass and the vendor alias pass",
-             "Requirement": (
-                 "Applies only to rows still unresolved after every exact one-to-one and grouped-aggregate "
-                 "pass. The signed amount must still match exactly; the PO comparison is whole-word "
-                 "containment -- every significant word (3+ letters) on the shorter side's PO text must "
-                 "appear on the longer side's -- not a general similarity score. Numbers and short "
-                 "fragments are ignored so a shared product code can never be the sole basis for a match. "
-                 "Accepted only when the match is unique on both sides; ambiguous candidates are left "
-                 "unresolved. Tagged with its own 'Fuzzy' confidence, distinct from every exact-match method."
-             )},
-            {"Priority": 9, "Rule": "Ambiguous or many-to-many groups", "Automatic": "No",
-             "Requirement": "Overlapping combinations, many-to-many relationships, groups over the safety limits, and nonunique solutions remain unresolved."},
-            {"Priority": 10, "Rule": "Amount variance", "Automatic": "No",
-             "Requirement": "Any nonzero cent difference is flagged as an exception; no tolerance is applied."},
-            {"Priority": 11, "Rule": "Fuzzy product classification", "Automatic": "No financial effect",
-             "Requirement": "Used only for Product Aggregate Summary; never determines transaction matching."},
-            {"Priority": 12, "Rule": "Secondary historical clearance", "Automatic": "Yes, second pass",
-             "Requirement": "After primary matching, historical rows may clear unresolved rows from the opposing primary dataset using the same one-to-one-then-controlled-grouped sequence, including the fuzzy PO pass (Priority 8). The vendor alias pass (Priority 7) is not applied here -- see build_historical_clearances."},
-            {"Priority": 13, "Rule": "Unused secondary rows", "Automatic": "Excluded",
-             "Requirement": "Unmatched historical rows remain background data and never become exceptions or reconciliation items."},
-            {"Priority": 14, "Rule": "QuickBooks exact duplicates: excluded before matching; weaker groups decided after (see duplicates.py)", "Automatic": "Yes",
-             "Requirement": (
-                 "A shared normalized PO + normalized invoice + signed-integer-cents key (all present) only "
-                 "IDENTIFIES a duplicate relationship. An excess row is excluded as a CONFIRMED exact duplicate -- "
-                 "BEFORE any matching pass, keeping the earliest source-position row as canonical -- only when it "
-                 "is shown to be a copy of the same underlying LINE: (1) a mapped line-level source ID is shared "
-                 "(trusted only if no shared ID spans rows that differ, otherwise it is treated as invoice/"
-                 "transaction-level and demoted to supporting evidence); or (2) the explicit stable line-level "
-                 "fingerprint (customer, transaction date, item, quantity, rate -- never the fiscal period or any "
-                 "other report/export column) is identical, with at least two identity-grade fields (customer, date, "
-                 "item, rate) present, and any mapped transaction-level ID agreeing. Quantity alone is never "
-                 "enough. Amounts are compared as signed cents, so a reversal is never a duplicate. Rows that "
-                 "share the key without that confirmation -- and weaker PO+amount / invoice+amount groups -- stay "
-                 "active through every matching pass (including the duplicate-cluster pairing after Priorities 1-3). "
-                 "Once matching and historical clearance complete, such a group is decided as a whole: if ANY member "
-                 "matched, every unmatched member is a potential duplicate of it and is HELD FOR REVIEW "
-                 "(REVIEW_HOLD_POTENTIAL_DUPLICATE), out of the proposed JE; if NO member matched, the earliest-listed "
-                 "member stays an exception and every other member is held against it. Insufficient evidence creates "
-                 "a review hold -- never an automatic exclusion and never an automatic additional accrual. The "
-                 "identical standard of evidence applies to every dataset -- QuickBooks primary, Infinium primary, "
-                 "and both historical files -- because any exclusion changes the candidate pool the matching passes see."
-             )},
-            {"Priority": 15, "Rule": "Infinium duplicate-key groups: matched normally, held if unresolved",
-             "Automatic": "Conditional",
-             "Requirement": (
-                 "Infinium carries no accrual effect of its own, so it keeps the original policy: rows "
-                 "with identical signed cents but only a PO or only an invoice are never auto-excluded "
-                 "up front -- they remain fully active and eligible to match through every pass above. A "
-                 "candidate that matches proceeds normally with no exclusion. A candidate that is still "
-                 "unresolved once matching and historical clearance complete is removed from provisional "
-                 "reporting and placed in Duplicate Review Hold pending a documented human disposition. "
-                 "Rows sharing a reference with different amounts are never assumed duplicates and remain "
-                 "eligible for controlled aggregate matching (Priorities 4-6)."
-             )},
-            {"Priority": 16, "Rule": "Historical overlap exclusion", "Automatic": "Yes, before clearance",
-             "Requirement": (
-                 "Historical files are canonicalized within-file first and only then compared with their "
-                 "own primary dataset. Confirmed overlap and every unresolved historical duplicate candidate "
-                 "are excluded from clearance while the primary row remains untouched."
-             )},
-            {"Priority": 17, "Rule": "Posting hard stops", "Automatic": "Yes",
-             "Requirement": (
-                 "Invalid financial amounts, unresolved primary duplicate candidates, and unresolved "
-                 "historical duplicate candidates prevent READY TO POST status. Historical review rows "
-                 "cannot participate in a clearance."
-             )},
-            {"Priority": 18, "Rule": "Reference-matched amount variance review", "Automatic": "Classification only",
-             "Requirement": (
-                 "After primary and historical matching, mutually unique unresolved rows sharing an exact "
-                 "PO and/or invoice but different signed-cent amounts are moved to a separate review hold. "
-                 "The full QuickBooks amount, Infinium amount, and potential difference are displayed, but "
-                 "the engine never infers which system is correct and never automatically posts either value."
-             )},
-            {"Priority": 19, "Rule": "Standardized exception-cause classification", "Automatic": "Reporting only",
-             "Requirement": (
-                 "Every unresolved, duplicate, and amount-variance row receives a controlled cause, confidence, "
-                 "financial treatment, and related-row evidence. Reconciliation Detail retains the actual duplicate PO, "
-                 "invoice, signed amount, group ID, copy-set ID, and canonical row ID for audit inspection."
-             )},
-            {"Priority": 20, "Rule": "Ambiguous duplicate review (see build_ambiguous_duplicate_candidates)",
-             "Automatic": "Classification only",
-             "Requirement": (
-                 "After the amount-variance pass (Priority 18), an unresolved QuickBooks row whose PO and/or "
-                 "invoice is still shared by two or more unresolved Infinium rows has no single traceable "
-                 "correspondence. It is withheld from the accrual and itemized with every candidate Infinium "
-                 "row and amount, rather than assumed to match one of them."
-             )},
-            {"Priority": 21, "Rule": "PO Re-use Error (see build_po_reuse_errors)", "Automatic": "Classification only",
-             "Requirement": (
-                 "A normalized PO reused across two or more rows still remaining in the QuickBooks accrual "
-                 "population is grouped and its total compared, exactly (no tolerance), to the grouped Infinium "
-                 "total for the same PO among the rows still unresolved there. A PO whose grouped totals already "
-                 "tie exactly was already accepted as a real match by Priority 5 and never reaches this "
-                 "classification. A flagged row with Infinium evidence for its PO is HELD for review "
-                 "(REVIEW_HOLD_PO_REUSE) and kept out of the proposed JE; a flagged row with none remains a "
-                 "true unmatched transaction. Either way it is labeled 'PO Re-use Error' with a grouped "
-                 "PO/QuickBooks-total/Infinium-total/difference/row-count detail for review."
-             )},
-            {"Priority": 22, "Rule": "Match references (see assign_match_references)", "Automatic": "Labeling only",
-             "Requirement": (
-                 "After matching and historical clearance are final, every accepted relationship receives one "
-                 "concise reference: M-### for a one-to-one match, G-### for a grouped/aggregate match shared by "
-                 "every record in it (zero-padding widens past 999). Numbering follows the input files' own row "
-                 "order, never any worksheet sort. Unmatched, duplicate, and review-only records carry no accepted "
-                 "match reference; an exception that points at a record an accepted match already consumed shows "
-                 "that match in 'Referenced Match Ref.'. validate_match_references proves each reference is unique, "
-                 "correctly typed, shared by all of its records, and that every cited match exists and contains "
-                 "the record cited. No matching decision, amount, or journal-entry input depends on a reference."
-             )},
-            {"Priority": 23, "Rule": "Final QuickBooks disposition and JE population", "Automatic": "Yes",
-             "Requirement": (
-                 "Exact QuickBooks duplicates (normalized PO + invoice + signed cents, all present) keep one "
-                 "canonical row and exclude every excess copy BEFORE matching. After all matching passes, every "
-                 "QuickBooks source row receives exactly one final disposition: MATCHED, "
-                 "EXACT_QBO_DUPLICATE_EXCLUDED, REVIEW_HOLD, or TRUE_UNMATCHED. A row with reference evidence in "
-                 "Infinium that could not be matched (PO/invoice already represented by a match, amount variance, "
-                 "non-unique exact candidate, ambiguous candidates, unreadable amount) is a REVIEW_HOLD, never a "
-                 "genuine missing transaction. Only TRUE_UNMATCHED rows -- plus the separately documented PO Re-use "
-                 "Error groups -- feed the proposed JE, which is computed from that ledger, never from a generic "
-                 "exception table. Infinium-only exceptions are informational and never offset the QuickBooks JE. "
-                 "Controls prove source rows and dollars tie to their final dispositions."
-             )},
-        ]
-    )
-    config_records = [
-        {"Setting": "Application Version", "Value": APP_VERSION},
-        {"Setting": "Matching Rule Version", "Value": MATCHING_RULE_VERSION},
-        {"Setting": "Duplicate Rule Version", "Value": DUPLICATE_RULE_VERSION},
-        {
-            "Setting": "Duplicate source-report grain validated",
-            "Value": bool(metadata.get("duplicate_source_grain_validated", False)),
-        },
-        {"Setting": "Run ID", "Value": metadata["run_id"]},
-        {"Setting": "Run Timestamp (Central Time)", "Value": metadata["run_timestamp"]},
-        {"Setting": "QuickBooks Filename", "Value": metadata["qb_filename"]},
-        {"Setting": "QuickBooks SHA-256", "Value": metadata["qb_sha256"]},
-        {"Setting": "Infinium Filename", "Value": metadata["inf_filename"]},
-        {"Setting": "Infinium SHA-256", "Value": metadata["inf_sha256"]},
-        {"Setting": "Automatic Amount Tolerance", "Value": "$0.00; automatic matches require exact signed cents"},
-        {"Setting": "Match Cardinality", "Value": "One-to-one first; then unique one-to-many or many-to-one exact aggregates"},
-        {"Setting": "Maximum automatic grouped rows", "Value": MAX_GROUP_SIZE},
-        {"Setting": "Maximum rows evaluated per shared reference", "Value": MAX_GROUP_POOL_ROWS},
-        {"Setting": "Selected Fiscal Year", "Value": metadata["fiscal_year"]},
-        {"Setting": "Selected Fiscal Period", "Value": metadata["fiscal_period"]},
-        {"Setting": "QuickBooks Secondary Filename", "Value": metadata.get("qb_secondary_filename") or "Not provided"},
-        {"Setting": "QuickBooks Secondary SHA-256", "Value": metadata.get("qb_secondary_sha256") or "Not provided"},
-        {"Setting": "Infinium Secondary Filename", "Value": metadata.get("inf_secondary_filename") or "Not provided"},
-        {"Setting": "Infinium Secondary SHA-256", "Value": metadata.get("inf_secondary_sha256") or "Not provided"},
-        {"Setting": "QuickBooks subtotal rows excluded", "Value": metadata.get("qb_subtotal_rows_excluded", 0)},
-        {"Setting": "Source validation warnings", "Value": metadata.get("source_validation_warnings", 0)},
-        {
-            "Setting": "Fiscal Period Treatment",
-            "Value": (
-                "Selected period filters the Product Aggregate Summary and classifies exception urgency. "
-                "Fiscal period never changes strict transaction matching."
-            ),
-        },
-        {
-            "Setting": "Duplicate Treatment",
-            "Value": (
-                "Strong same-file groups retain one deterministic canonical row per payload-confirmed copy "
-                "set and exclude only excess copies. PO-only and invoice-only candidates remain active for "
-                "primary matching but block posting if unresolved. Historical files are screened within-file "
-                "before cross-scope overlap; every unresolved historical review row is withheld from clearance."
-            ),
-        },
-    ]
-    for source_name, audit_key in (
-        ("QuickBooks", "qb_import_audit"),
-        ("Infinium", "inf_import_audit"),
-        ("QuickBooks Secondary", "qb_secondary_import_audit"),
-        ("Infinium Secondary", "inf_secondary_import_audit"),
-    ):
-        audit = metadata.get(audit_key, {}) or {}
-        config_records.extend(
-            [
-                {
-                    "Setting": f"{source_name} blank columns removed",
-                    "Value": len(audit.get("blank_columns_removed", [])),
-                },
-                {
-                    "Setting": f"{source_name} repeated header rows removed",
-                    "Value": int(audit.get("repeated_header_rows_removed", 0) or 0),
-                },
-                {
-                    "Setting": f"{source_name} duplicate headers renamed",
-                    "Value": len(audit.get("duplicate_headers_renamed", [])),
-                },
-            ]
-        )
-    for source, mapping in (("QuickBooks", qb_mapping), ("Infinium", inf_mapping)):
-        for field_name, column_name in mapping.items():
-            config_records.append(
-                {"Setting": f"{source} mapping - {field_name}", "Value": column_name or "Not mapped"}
-            )
-    for source, mapping in (
-        ("QuickBooks Secondary", qb_secondary_mapping),
-        ("Infinium Secondary", inf_secondary_mapping),
-    ):
-        for field_name, column_name in (mapping or {}).items():
-            config_records.append(
-                {"Setting": f"{source} mapping - {field_name}", "Value": column_name or "Not mapped"}
-            )
-    return rules, pd.DataFrame(config_records)
 
 
 def build_fiscal_exception_summary(result: ReconciliationResult) -> pd.DataFrame:
@@ -4387,7 +4137,6 @@ def build_reconciliation(
     qb_dispositions = build_qb_dispositions(
         paired_rows, qb, set(po_reuse_error_qb_index_map(po_reuse_errors)), match_register,
     )
-    normalization = build_normalization_detail(qb, inf, qb_mapping, inf_mapping)
     assessments = build_match_assessments(
         matches, historical_clearances, unmatched_qb, qb, inf, candidates,
         amount_variance_analysis,
@@ -4444,6 +4193,12 @@ def build_reconciliation(
         metadata.get("fiscal_period"),
         fiscal_year,
     )
+    customer_summary = build_customer_summary(
+        qb,
+        qb_mapping,
+        metadata.get("fiscal_period"),
+        fiscal_year,
+    )
     controls = build_controls(
         qb, inf, matches, historical_clearances, unmatched_qb, unmatched_inf,
         duplicate_qb_rows_final, inf_screen.duplicate_rows,
@@ -4453,13 +4208,6 @@ def build_reconciliation(
         fuzzy_match_review_hold_qb, fuzzy_match_review_hold_inf,
         reference_hold_qb,
         qb_dispositions,
-    )
-    rules, config = build_rules_and_config(
-        qb_mapping,
-        inf_mapping,
-        metadata,
-        qb_secondary_mapping,
-        inf_secondary_mapping,
     )
 
     matched_q = _matched_row_indexes(matches, "QB")
@@ -4666,7 +4414,6 @@ def build_reconciliation(
         matches=matches,
         paired_rows=paired_rows,
         candidates=candidates,
-        normalization=normalization,
         assessments=assessments,
         method_summary=method_summary,
         exception_analysis=exception_analysis,
@@ -4674,10 +4421,9 @@ def build_reconciliation(
         duplicate_analysis=duplicate_analysis,
         infinium_duplicate_analysis=infinium_duplicate_analysis,
         product_summary=product_summary,
+        customer_summary=customer_summary,
         controls=controls,
         metrics=metrics,
-        rules=rules,
-        config=config,
         qb_mapping=qb_mapping,
         inf_mapping=inf_mapping,
         metadata=metadata,

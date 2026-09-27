@@ -30,7 +30,7 @@ EXPECTED_PRIMARY_SHEETS = [
     "Posting Summary",
     "Reconciliation Detail",
     "Unresolved Exceptions",
-    "Product Aggregates",
+    "Aggregates",
     "Raw Data",
 ]
 
@@ -1197,12 +1197,12 @@ def test_every_reference_shown_in_any_workbook_exists_in_the_match_register(
 def test_product_and_raw_data_sheets_carry_no_match_references(
     qb_mapping, inf_mapping, make_metadata,
 ):
-    """Product Aggregates and Raw Data are plain source-level views with no
+    """Aggregates and Raw Data are plain source-level views with no
     match-level records to trace, unlike Reconciliation Detail and
     Unresolved Exceptions."""
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
     primary = load_workbook(io.BytesIO(build_primary_workbook(result)))
-    for name in ("Product Aggregates", "Raw Data"):
+    for name in ("Aggregates", "Raw Data"):
         assert not any(
             isinstance(c.value, str) and "Match Ref." in c.value
             for row in primary[name].iter_rows() for c in row
@@ -1825,7 +1825,7 @@ def test_product_aggregates_sums_quantity_and_value_by_product(
     assert juniors["Product Quantity"] == pytest.approx(1)
     assert juniors["Product Value"] == pytest.approx(30.00)
 
-    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregates"]
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Aggregates"]
     text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
     assert "JE SUPPORT" not in text and "REVIEW HOLD" not in text and "Matched %" not in text
     header_row = next(row for row in ws.iter_rows(max_row=5) if any(c.value == "Product Name" for c in row))
@@ -1844,10 +1844,59 @@ def test_product_aggregates_falls_back_cleanly_with_no_product_mapping(
     """No product column mapped: the plain fallback view renders without error."""
     result = _reference_result(qb_mapping, inf_mapping, make_metadata)
     assert result.product_summary.empty
-    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Product Aggregates"]
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Aggregates"]
     text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
     assert "PRODUCT AGGREGATE SUMMARY" in text
     assert "not mapped" in text.lower() or "no product breakdown" in text.lower()
+
+
+def test_customer_aggregates_sums_quantity_and_value_by_customer_for_the_selected_period(
+    qb_mapping, inf_mapping, make_metadata,
+):
+    """The Customer Aggregate Summary table on the Aggregates sheet must sum
+    quantity and value per QuickBooks Customer, scoped to the selected
+    fiscal period exactly like the product table above it -- a plain
+    pivot, not a matching decision view."""
+    qb_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Qty": 3, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO2", "Invoice": "INV2", "Amount": 50.00, "Qty": 2, "Period": "1",
+         "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Qty": 1, "Period": "1",
+         "Customer": "Beta Co", "Date": "2026-01-05"},
+        # A different period's row for Acme must not be counted -- period 1 is selected.
+        {"PO": "PO4", "Invoice": "INV4", "Amount": 999.00, "Qty": 99, "Period": "2",
+         "Customer": "Acme", "Date": "2026-02-05"},
+    ]
+    inf_rows = [
+        {"PO": "PO1", "Invoice": "INV1", "Amount": 100.00, "Period": "1", "Customer": "Acme", "Date": "2026-01-05"},
+        {"PO": "PO3", "Invoice": "INV3", "Amount": 30.00, "Period": "1", "Customer": "Beta Co", "Date": "2026-01-05"},
+        {"PO": "PO4", "Invoice": "INV4", "Amount": 999.00, "Period": "2", "Customer": "Acme", "Date": "2026-02-05"},
+    ]
+    result = build_reconciliation(
+        pd.DataFrame(qb_rows), pd.DataFrame(inf_rows), qb_mapping, inf_mapping,
+        make_metadata(fiscal_period=1), 2026,
+    )
+    frame = result.customer_summary
+    assert list(frame.columns) == ["Customer Name", "Customer Quantity", "Customer Value"]
+    acme = frame.set_index("Customer Name").loc["Acme"]
+    assert acme["Customer Quantity"] == pytest.approx(5)      # 3 + 2, period 2's 99 excluded
+    assert acme["Customer Value"] == pytest.approx(150.00)    # 100 + 50, period 2's 999 excluded
+    beta = frame.set_index("Customer Name").loc["Beta Co"]
+    assert beta["Customer Quantity"] == pytest.approx(1)
+    assert beta["Customer Value"] == pytest.approx(30.00)
+
+    ws = load_workbook(io.BytesIO(build_primary_workbook(result)))["Aggregates"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+    assert "CUSTOMER AGGREGATE SUMMARY" in text
+    header_row = next(row for row in ws.iter_rows() if any(c.value == "Customer Name" for c in row))
+    headers = [c.value for c in header_row]
+    assert headers == ["Customer Name", "Customer Quantity", "Customer Value"]
+    data_rows = {
+        row[headers.index("Customer Name")].value: row
+        for row in ws.iter_rows(min_row=header_row[0].row + 1) if row[0].value and "TOTAL" not in str(row[0].value)
+    }
+    assert data_rows["Acme"][headers.index("Customer Value")].value == pytest.approx(150.00)
 
 # ---------------------------------------------------------------------------
 # The journal-entry bridge: the engine's Final Disposition is immutable;

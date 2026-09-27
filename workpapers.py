@@ -2723,7 +2723,7 @@ def build_legacy_workbook(result: ReconciliationResult) -> bytes:
     )
     build_legacy_reconciliation_sheet(wb, result)
     build_legacy_exceptions_sheet(wb, result)
-    build_product_sheet(wb, result)
+    build_aggregates_sheet(wb, result)
     _apply_workbook_run_metadata(wb, result)
     # Legacy Reconciliation and Exceptions set their own deliberate,
     # type-appropriate column widths (see _standardize_legacy_widths) --
@@ -2736,59 +2736,83 @@ def build_legacy_workbook(result: ReconciliationResult) -> bytes:
     )
 
 
-def build_product_sheet(
+def _write_aggregate_table(
+    ws, start_row: int, frame: pd.DataFrame, *,
+    title: str, populated_caption: str, empty_caption: str,
+    color: str, quantity_header: str, value_header: str,
+) -> int:
+    """Write one plain totals table (title band, caption, header, body,
+    total row) starting at start_row. Returns the row number of the blank
+    spacer row immediately after it, so the caller can chain another table
+    beneath it on the same sheet."""
+    headers = list(frame.columns)
+    end_col = len(headers)
+    caption_row = start_row + 1
+    header_row = caption_row + 1
+    data_row = header_row + 1
+    _write_title_band(ws, start_row, 1, end_col, title, color)
+    _write_caption_band(
+        ws, caption_row, 1, end_col,
+        populated_caption if len(frame) else empty_caption,
+        color,
+    )
+    _write_dataframe_values(ws, frame, header_row, 1)
+    _format_header(
+        ws, header_row, 1, end_col, color, headers=headers,
+        amount_columns={value_header}, quantity_columns={quantity_header},
+    )
+    last_row = header_row + len(frame)
+    if len(frame):
+        _format_body_block(ws, data_row, last_row, 1, end_col, NAVY_LIGHT)
+        _apply_number_formats(ws, headers, data_row, last_row, 1, {value_header}, {quantity_header})
+    total_row = last_row + 1
+    totals = {
+        quantity_header: float(frame[quantity_header].sum()),
+        value_header: float(frame[value_header].sum()),
+    } if len(frame) else {}
+    _write_total_row(ws, total_row, 1, end_col, totals, headers)
+    _set_widths(ws, 1, end_col, header_row, total_row)
+    ws.column_dimensions["A"].width = 34
+    if len(frame):
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(end_col)}{last_row}"
+    return total_row + 2
+
+
+def build_aggregates_sheet(
     wb: Workbook, result: ReconciliationResult, *, sheet_title: str = "Product Aggregate Summary",
 ) -> None:
-    """Plain quantity and value totals by product -- used for bottle-count
-    reconciliation, not a matching decision view, so it deliberately does
-    not compute match rates or JE Support/Review Hold breakdowns by
-    product (see build_product_summary in matching.py).
+    """Plain quantity and value totals by product, and by QuickBooks
+    Customer -- used for bottle-count and customer-volume reconciliation,
+    not a matching decision view, so it deliberately does not compute
+    match rates or JE Support/Review Hold breakdowns (see
+    build_product_summary / build_customer_summary in matching.py).
 
     sheet_title defaults to the Legacy workbook's tab name; the primary
-    workbook passes its own shorter "Product Aggregates" tab name."""
+    workbook passes its own shorter "Aggregates" tab name."""
     ws = wb.create_sheet(sheet_title)
-    frame = result.product_summary
     selected_period = result.metadata.get("fiscal_period")
     period_scope = (
         f"Only primary QuickBooks rows from Period {int(selected_period):02d} are included."
         if selected_period is not None
         else "All primary QuickBooks fiscal periods are included."
     )
-    headers = list(frame.columns)
-    end_col = len(headers)
-    _write_title_band(ws, 1, 1, end_col, "PRODUCT AGGREGATE SUMMARY", NAVY)
-    _write_caption_band(
-        ws, 2, 1, end_col,
-        (
-            f"Sum of quantity and value by product, for bottle-count reconciliation. {period_scope}"
-            if len(frame)
-            else "A QuickBooks quantity column, an amount column, and a recognizable product "
-            "description are not all mapped, so no product breakdown is available."
-        ),
-        NAVY,
+    next_row = _write_aggregate_table(
+        ws, 1, result.product_summary,
+        title="PRODUCT AGGREGATE SUMMARY",
+        populated_caption=f"Sum of quantity and value by product, for bottle-count reconciliation. {period_scope}",
+        empty_caption="A QuickBooks quantity column, an amount column, and a recognizable product "
+        "description are not all mapped, so no product breakdown is available.",
+        color=NAVY, quantity_header="Product Quantity", value_header="Product Value",
     )
-    _write_dataframe_values(ws, frame, 3, 1)
-    _format_header(
-        ws, 3, 1, end_col, NAVY, headers=headers,
-        amount_columns={"Product Value"}, quantity_columns={"Product Quantity"},
+    _write_aggregate_table(
+        ws, next_row, result.customer_summary,
+        title="CUSTOMER AGGREGATE SUMMARY",
+        populated_caption=f"Sum of quantity and value by QuickBooks Customer. {period_scope}",
+        empty_caption="A QuickBooks quantity column, an amount column, and a Customer column are "
+        "not all mapped, so no customer breakdown is available.",
+        color=TEAL, quantity_header="Customer Quantity", value_header="Customer Value",
     )
-    last_row = 3 + len(frame)
-    if len(frame):
-        _format_body_block(ws, 4, last_row, 1, end_col, NAVY_LIGHT)
-        _apply_number_formats(
-            ws, headers, 4, last_row, 1, {"Product Value"}, {"Product Quantity"},
-        )
-    total_row = last_row + 1
-    totals = {
-        "Product Quantity": float(frame["Product Quantity"].sum()),
-        "Product Value": float(frame["Product Value"].sum()),
-    } if len(frame) else {}
-    _write_total_row(ws, total_row, 1, end_col, totals, headers)
-    _set_widths(ws, 1, end_col, 3, total_row)
-    ws.column_dimensions["A"].width = 34
     ws.freeze_panes = "A4"
-    if len(frame):
-        ws.auto_filter.ref = f"A3:{get_column_letter(end_col)}{last_row}"
     _prepare_sheet(ws, landscape=False)
 
 
@@ -2895,7 +2919,7 @@ _FIXED_ROW_HEIGHTS = {
 
 def _controlled_row_two_height(sheet_title: str) -> int:
     """Fixed row-2 caption-band height per sheet, overriding autofit."""
-    if sheet_title in ("Product Aggregate Summary", "Product Aggregates"):
+    if sheet_title in ("Product Aggregate Summary", "Product Aggregates", "Aggregates"):
         return 60
     if sheet_title == "Legacy Reconciliation":
         return 30
@@ -3280,11 +3304,11 @@ def build_primary_workbook(result: ReconciliationResult) -> bytes:
     wb.properties.description = "Accounting workpaper generated from one controlled reconciliation run."
     # Creation order doubles as the final tab order (aside from Posting
     # Summary, moved to the front below): Reconciliation Detail, Unresolved
-    # Exceptions, Product Aggregates, Raw Data.
+    # Exceptions, Aggregates, Raw Data.
     build_reconciliation_detail_sheet(wb, result)
     build_unresolved_sheet(wb, result)
     _link_reconciled_data_to_unresolved_exceptions(wb, result)
-    build_product_sheet(wb, result, sheet_title="Product Aggregates")
+    build_aggregates_sheet(wb, result, sheet_title="Aggregates")
     build_raw_data_sheet(wb, result)
     build_posting_summary_sheet(wb, result)
     # The landing page: moved to the very front now that every other sheet exists.

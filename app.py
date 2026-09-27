@@ -21,7 +21,7 @@ The app produces one accounting workpaper from one controlled reconciliation
 run, plus an optional simplified export:
     1. Sales_Reconciliation_<run>.xlsx
        Posting Summary, Reconciliation Detail, Unresolved Exceptions,
-       Product Aggregates, and Raw Data.
+       Aggregates, and Raw Data.
     2. Sales_Reconciliation_Legacy_<run>.xlsx (optional)
        A simplified accountant's legacy-format export.
 """
